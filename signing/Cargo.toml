@@ -1,0 +1,18 @@
+[package]
+name = "atri_qq_signing"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+prost = "0.14"
+md-5 = { version = "0.11", default-features = false }
+rc4 = { version = "0.1", default-features = false }
+chacha20 = { version = "0.9", default-features = false }
+crc32fast = "1"
+rand_core = { version = "0.9", default-features = false }
+rand_chacha = { version = "0.9", default-features = false }
+
+[build-dependencies]
+prost-build = "0.14"
+protoc-bin-vendored = "3"

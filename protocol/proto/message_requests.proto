@@ -1,0 +1,56 @@
+syntax = "proto3";
+package atri.qq.messages;
+import "messages.proto";
+message SendPeer { optional uint64 uin = 1; string uid = 2; }
+message SendGroup { uint64 uin = 1; }
+message SendRoute { SendPeer friend = 1; SendGroup group = 2; }
+message SendContentHead { optional uint64 package_count = 1; optional uint64 package_index = 2; optional uint64 division_sequence = 3; optional uint64 auto_reply = 4; }
+message SendMessageRequest { SendRoute route = 1; SendContentHead head = 2; bytes body = 3; uint64 client_sequence = 4; optional uint64 random = 5; }
+message SendMessageResponse { int64 code = 1; optional string error = 2; optional uint64 time = 3; optional uint64 sequence = 11; optional uint64 client_sequence = 14; }
+message C2cHistoryRequest { string peer_uid = 2; optional uint64 start_sequence = 3; optional uint64 end_sequence = 4; }
+message MessageListResponse { int64 code = 1; optional string error = 2; repeated bytes messages = 7; }
+message GroupHistoryRange { uint64 group_uin = 1; optional uint64 start_sequence = 2; optional uint64 end_sequence = 3; }
+message GroupHistoryRequest { GroupHistoryRange range = 1; uint64 flag = 2; }
+message GroupHistoryBody {
+  int64 code = 1;
+  optional string error = 2;
+  optional uint32 group_uin = 3;
+  optional uint64 start_sequence = 4;
+  optional uint64 end_sequence = 5;
+  repeated bytes messages = 6;
+}
+message GroupHistoryResponse { int64 code = 1; optional string error = 2; GroupHistoryBody body = 3; }
+message RoamRequest { string peer_uid = 1; optional uint64 time = 2; optional uint64 random = 3; uint64 count = 4; uint64 direction = 5; }
+message RoamResponse { int64 code = 1; optional string error = 2; optional string peer_uid = 3; bool complete = 4; uint64 time = 5; uint64 random = 6; repeated bytes messages = 7; }
+message GroupRecallIdentity { optional uint64 sequence = 1; optional uint32 random = 2; optional uint64 flag = 3; }
+message GroupRecallOptions { optional uint64 flag = 1; }
+message GroupRecallRequest { uint64 kind = 1; optional uint64 group_uin = 2; GroupRecallIdentity identity = 3; GroupRecallOptions options = 4; }
+// Private recall: field 1 is the sender client sequence, field 6 the server sequence.
+message C2cRecallIdentity { optional uint64 sequence = 1; optional uint64 random = 2; uint64 message_id = 3; optional uint64 time = 4; optional uint64 flag = 5; optional uint64 client_sequence = 6; }
+message C2cRecallOptions { optional uint64 first = 1; optional uint64 second = 2; }
+message C2cRecallRequest { uint64 kind = 1; string peer_uid = 3; C2cRecallIdentity identity = 4; C2cRecallOptions options = 5; optional uint64 flag = 6; }
+message EssenceIdentity { optional uint64 group_uin = 1; optional uint64 sequence = 2; optional uint64 random = 3; }
+message EssenceRequest { uint64 command = 1; uint64 service = 2; EssenceIdentity body = 4; optional uint64 flag = 12; }
+message EssenceResult { optional string error = 1; int64 code = 10; }
+message EssenceResponse { int64 code = 3; EssenceResult body = 4; optional string error = 5; }
+message ForwardMessages { repeated bytes messages = 1; }
+message ForwardItem { string name = 1; ForwardMessages body = 2; }
+message ForwardTransmit { repeated bytes messages = 1; repeated ForwardItem items = 2; }
+message LongPeer { string uid = 2; }
+message LongSend { uint64 kind = 1; LongPeer peer = 2; optional uint64 group_uin = 3; bytes payload = 4; }
+message LongReceive { LongPeer peer = 1; string resource_id = 2; uint64 kind = 3; }
+message LongAttributes { uint64 command = 1; uint64 version = 2; uint64 platform = 3; optional uint64 flag = 4; }
+message LongSendRequest { LongSend send = 2; LongAttributes attributes = 15; }
+message LongReceiveRequest { LongReceive receive = 1; LongAttributes attributes = 15; }
+message LongSendResult { string resource_id = 3; }
+message LongSendResponse { LongSendResult send = 2; }
+message LongReceiveResult { optional bytes payload = 4; }
+message LongReceiveResponse { LongReceiveResult receive = 1; }
+// File-feed acknowledgement exchange used when sending a group file message.
+message GroupFileFeedRequest { GroupFileFeedBody body = 4; }
+message GroupFileFeedBody { GroupFileFeedOperation operation = 5; }
+message GroupFileFeedOperation { GroupFileFeedIdentity identity = 3; }
+message GroupFileFeedIdentity { uint64 random = 3; }
+message GroupFileFeedResponse { GroupFileFeedResponseBody body = 4; }
+message GroupFileFeedResponseBody { GroupFileFeedResult result = 5; }
+message GroupFileFeedResult {}

@@ -1,0 +1,150 @@
+syntax = "proto2";
+package atri.qq.media;
+
+import "media.proto";
+
+message MediaFileType {
+  optional uint32 kind = 1;
+  optional uint32 image_format = 2;
+  optional uint32 video_format = 3;
+  optional uint32 voice_format = 4;
+}
+message MediaFileInfo {
+  optional uint64 size = 1;
+  optional bytes md5 = 2;
+  optional bytes sha1 = 3;
+  optional bytes name = 4;
+  optional MediaFileType media_type = 5;
+  optional uint32 width = 6;
+  optional uint32 height = 7;
+  optional uint32 duration = 8;
+  optional uint32 original = 9;
+}
+message MediaIndex {
+  optional MediaFileInfo file = 1;
+  optional bytes uuid = 2;
+  optional uint32 subtype = 6;
+}
+// Raw message and index boundaries retain unknown metadata when forwarded.
+message MediaMessageInfo {
+  repeated bytes bodies = 1;
+}
+message MediaMessageInfoBody {
+  optional bytes index = 1;
+}
+message MediaUploadFile {
+  optional MediaFileInfo file = 1;
+  optional uint32 subfile_type = 2;
+}
+message MediaPictureClientReserve {
+  optional uint32 flag = 1;
+  optional bytes text = 2;
+  optional uint32 type = 3;
+  optional uint32 subtype = 4;
+  optional uint32 source = 5;
+  optional bytes extension = 7;
+}
+message MediaPictureReserve {
+  optional uint32 flag = 1;
+  optional uint32 type = 3;
+  optional uint32 subtype = 4;
+  optional bytes friend_extension = 8;
+  optional bytes group_extension = 9;
+  optional uint32 source = 10;
+  optional bytes extension = 12;
+  optional bytes text = 18;
+  optional bytes metadata = 19;
+  optional MediaPictureClientReserve friend_client = 20;
+  optional MediaPictureClientReserve group_client = 21;
+}
+message MediaVideoReserve {
+  optional uint32 flag = 16;
+}
+message MediaVoiceReserve {
+  optional uint32 flag = 1;
+  optional uint32 source = 7;
+}
+message MediaVoiceFormat {
+  optional uint32 codec = 1;
+  optional bytes parameters = 2;
+}
+message MediaVoiceGeneralFlags {
+  optional MediaVoiceFormat format = 53;
+}
+message MediaVoiceGeneralReserve {
+  optional MediaVoiceGeneralFlags flags = 19;
+}
+message MediaPictureBusinessInfo {
+  optional uint32 biz_type = 1;
+  optional bytes summary = 2;
+  optional MediaPictureReserve reserve = 11;
+}
+message MediaVideoBusinessInfo {
+  optional MediaVideoReserve reserve = 3;
+}
+message MediaVoiceBusinessInfo {
+  optional MediaVoiceReserve friend_reserve = 11;
+  optional MediaVoiceReserve group_reserve = 12;
+  optional MediaVoiceGeneralReserve general_reserve = 13;
+}
+message MediaUploadBusinessInfo {
+  optional MediaPictureBusinessInfo picture = 1;
+  optional MediaVideoBusinessInfo video = 2;
+  optional MediaVoiceBusinessInfo voice = 3;
+}
+message MediaRichUpload {
+  repeated MediaUploadFile files = 1;
+  optional uint32 try_fast_upload = 2;
+  optional uint32 server_send = 3;
+  optional uint32 client_random_id = 4;
+  optional uint32 compatibility_scene = 5;
+  optional MediaUploadBusinessInfo business_info = 6;
+  optional uint32 client_sequence = 7;
+  optional uint32 no_compatibility_message = 8;
+}
+message MediaRichUploadRequest {
+  optional MediaRequestHead head = 1;
+  optional MediaRichUpload upload = 2;
+}
+message MediaUploadAddress {
+  optional uint64 ipv4 = 1;
+  optional uint64 port = 2;
+}
+message MediaUploadSubfile {
+  optional uint32 subfile_type = 1;
+  optional bytes upload_key = 2;
+  repeated MediaUploadAddress addresses = 4;
+}
+message MediaUploadNegotiation {
+  optional bytes upload_key = 1;
+  repeated MediaUploadAddress addresses = 3;
+  optional bytes message_info = 6;
+  optional bytes compatibility = 8;
+  repeated MediaUploadSubfile subfiles = 10;
+}
+message MediaRichUploadResponse {
+  optional MediaRichResponseHead head = 1;
+  optional MediaUploadNegotiation negotiation = 2;
+}
+message MediaHighwayHost {
+  optional uint32 type = 1;
+  optional bytes address = 2;
+}
+message MediaHighwayEndpoint {
+  optional MediaHighwayHost host = 1;
+  optional uint64 port = 2;
+}
+message MediaHighwayNetwork {
+  repeated MediaHighwayEndpoint endpoints = 1;
+}
+message MediaHighwayHashes {
+  repeated bytes sha1 = 1;
+}
+message MediaHighwayRichExtension {
+  optional bytes uuid = 1;
+  optional bytes upload_key = 2;
+  optional MediaHighwayNetwork network = 5;
+  repeated bytes bodies = 6;
+  optional uint32 block_size = 10;
+  optional MediaHighwayHashes hashes = 11;
+}

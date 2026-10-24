@@ -1,0 +1,44 @@
+[package]
+name = "atri_qq_protocol"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+async-trait = "0.1"
+bytes = { version = "1", features = ["serde"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+futures-util = { version = "0.3", features = ["sink"] }
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+serde_json = "1"
+ciborium = "0.2"
+thiserror = "2"
+prost = "0.14"
+prost-reflect = "0.16.5"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-no-provider", "stream", "json", "multipart"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+webpki-roots = "1"
+rand = "0.8"
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+aes-gcm = "0.10"
+openssl = { version = "0.10", features = ["vendored"] }
+hex = "0.4"
+base64 = "0.22"
+quick-xml = "0.38"
+tracing = "0.1"
+signing = { package = "atri_qq_signing", path = "../signing" }
+atri_qq_silk = { path = "../silk" }
+mp4 = "0.14"
+jce = { path = "../crates/jce" }
+
+[build-dependencies]
+prost-build = "0.14"
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

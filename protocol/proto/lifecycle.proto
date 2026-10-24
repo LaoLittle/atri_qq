@@ -1,0 +1,108 @@
+syntax = "proto3";
+package atri.qq.lifecycle;
+
+message ClubFlagRequest {
+  optional uint32 field1 = 1;
+  optional uint32 platform = 2;
+  optional string version = 3;
+  optional uint64 uin = 4;
+  repeated string paths = 7;
+  optional uint32 field9 = 9;
+  optional uint32 field10 = 10;
+  optional bytes field11 = 11;
+  optional uint32 mode = 12;
+  optional uint32 field14 = 14;
+  optional uint32 field15 = 15;
+  optional uint32 field16 = 16;
+  optional bytes field17 = 17;
+  optional uint32 field18 = 18;
+  optional uint32 field19 = 19;
+  optional uint32 field21 = 21;
+  optional uint32 field23 = 23;
+  optional bytes field24 = 24;
+}
+message ClubFlagItem {
+  optional uint64 id = 1;
+  optional bytes business_json = 5;
+  optional string path = 6;
+  optional string mission = 8;
+  optional uint64 position = 9;
+  optional uint64 position_variant = 10;
+  optional bytes extra_json = 19;
+  optional uint64 remaining = 20;
+  optional string hash = 26;
+}
+message ClubFlagResponse {
+  optional int32 code = 1;
+  optional string error = 2;
+  repeated ClubFlagItem items = 4;
+  optional uint64 uin = 5;
+  optional uint32 field8 = 8;
+  optional uint32 poll_seconds = 9;
+}
+message StringPair { optional string key = 1; optional string value = 2; }
+message RedTouchRequest {
+  optional uint64 uin = 1;
+  optional uint32 platform = 2;
+  optional string version = 3;
+  optional string platform_version = 4;
+  optional uint64 item_id = 5;
+  repeated string missions = 6;
+  optional bytes business_json = 7;
+  repeated StringPair attributes = 8;
+  repeated uint64 message_ids = 9 [packed = false];
+  optional uint32 command = 10;
+  optional bool heba_flag = 11;
+  optional bytes extra_json = 12;
+}
+message RedTouchResponse { optional int32 code = 1; optional string error = 2; }
+
+message ConfigRequest {
+  optional ConfigOrigin origin = 1;
+  optional ConfigIdentity identity = 3;
+  optional ConfigCache cache = 5;
+  repeated ConfigTarget targets = 7;
+  optional ConfigContinuation continuation = 8;
+  optional int32 fetch_type = 9;
+  optional ConfigVersion client = 10;
+  optional string config_snapshot = 11;
+  optional ConfigFlags flags = 12;
+}
+message ConfigOrigin {
+  optional uint32 scene_id = 1;
+  optional int32 model_type = 2;
+  optional int32 trigger_type = 3;
+  optional uint32 trigger_interval = 4;
+}
+message ConfigIdentity {
+  optional string brand = 1;
+  optional string model = 2;
+  optional ConfigPlatform platform = 3;
+}
+message ConfigPlatform { optional uint32 kind = 1; optional string kernel = 2; }
+message ConfigCache {
+  optional bytes cookies = 1;
+  optional string environment = 3;
+  optional uint64 config_sequence = 4;
+  optional string no_login_snapshot = 5;
+  optional bytes inc_cookies = 6;
+  optional bytes inc_nologin_cookies = 7;
+}
+message ConfigTarget { optional string id = 1; }
+message ConfigContinuation { optional int32 last_index = 1; }
+message ConfigVersion { optional string version = 2; }
+message ConfigFlags { optional uint32 group_id = 1; optional uint32 new_version = 2; }
+message ConfigResponse {
+  optional ConfigServerState state = 4;
+  optional bool enable_config_snapshot = 6;
+  optional uint32 resource_report_denominator = 9;
+}
+message ConfigServerState {
+  optional uint32 update_interval = 6;
+  repeated bytes mute_durations = 7;
+  optional uint64 config_sequence = 8;
+  repeated bytes qps_limited_groups = 9;
+  optional int32 next_fetch_type = 10;
+  optional bytes inc_cookies = 11;
+  optional bytes inc_nologin_cookies = 12;
+}

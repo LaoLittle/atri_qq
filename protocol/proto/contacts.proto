@@ -1,0 +1,71 @@
+syntax = "proto2";
+package atri.qq.contacts;
+
+message OidbEnvelope { optional uint32 command = 1; optional uint32 service = 2; optional uint64 code = 3; optional bytes body = 4; optional string message = 5; optional uint32 reserved = 12; }
+message Empty {}
+message NumberProperty { optional uint64 key = 1; optional uint64 value = 2; }
+message BytesProperty { optional uint64 key = 1; optional bytes value = 2; }
+message Properties { repeated NumberProperty numbers = 1; repeated BytesProperty bytes = 2; }
+message PropertyKeys { repeated uint64 keys = 1; }
+message FriendPropertySelection { optional uint64 kind = 1; optional PropertyKeys keys = 2; }
+// Each business kind has its own payload schema; only kind 1 is a profile.
+message FriendBusiness { optional uint64 kind = 1; optional bytes properties = 2; }
+message FriendProfileProperties { repeated NumberProperty numbers = 1; repeated BytesProperty bytes = 2; }
+message FriendListRequest { optional uint64 count = 2; optional uint64 time = 3; optional uint64 local_sequence = 4; optional bytes cookie = 5; optional uint64 flags = 6; optional uint64 proxy_sequence = 7; repeated FriendPropertySelection selections = 10001; repeated uint64 keys = 10002; repeated uint64 extra_keys = 10003; }
+message FriendRecord { optional string uid = 1; optional uint64 category_id = 2; optional uint64 uin = 3; repeated FriendBusiness business = 10001; }
+message CategoryRecord { optional uint64 id = 1; optional string name = 2; optional uint64 member_count = 3; optional uint64 sort_id = 4; }
+message FriendListResponse { optional bytes cookie = 2; optional uint64 finished = 3; repeated FriendRecord friends = 101; repeated CategoryRecord categories = 102; }
+message UserIdentity { optional string uid = 2; optional uint64 uin = 4; }
+message GroupOwner { optional string uid = 2; }
+message GroupInfo { optional GroupOwner owner = 1; optional uint64 created_time = 2; optional uint64 max_member_count = 3; optional uint64 member_count = 4; optional string name = 5; optional string description = 18; optional string question = 19; optional string announcement = 30; }
+message GroupCustom { optional uint64 last_speak_time = 1; optional string remark = 3; optional uint64 latest_sequence = 5; }
+message GroupRecord { optional uint64 uin = 3; optional GroupInfo info = 4; optional GroupCustom custom = 5; }
+message GroupInfoMask {
+ optional uint64 owner = 1; optional uint64 created_time = 2; optional uint64 capacity = 3; optional uint64 count = 4; optional uint64 name = 5;
+ optional uint64 field8 = 8; optional uint64 field9 = 9; optional uint64 field10 = 10; optional uint64 field11 = 11; optional uint64 field12 = 12; optional uint64 field13 = 13; optional uint64 field14 = 14; optional uint64 field15 = 15; optional uint64 field16 = 16; optional uint64 field17 = 17; optional uint64 description = 18; optional uint64 question = 19; optional uint64 field20 = 20; optional uint64 field22 = 22; optional uint64 field23 = 23; optional uint64 field24 = 24; optional uint64 field25 = 25; optional uint64 field26 = 26; optional uint64 field27 = 27; optional uint64 field28 = 28; optional uint64 field29 = 29; optional uint64 announcement = 30; optional uint64 field31 = 31; optional uint64 field32 = 32; optional uint64 field5001 = 5001; optional uint64 field5002 = 5002; optional uint64 field5003 = 5003;
+}
+message GroupCustomMask { optional uint64 last_speak_time = 1; optional uint64 field2 = 2; optional uint64 remark = 3; optional uint64 field4 = 4; optional uint64 latest_sequence = 5; optional uint64 field6 = 6; optional uint64 field7 = 7; optional uint64 field8 = 8; }
+message GroupExtraMask { optional uint64 field5 = 5; optional uint64 field6 = 6; }
+message GroupListSelection { optional GroupInfoMask info = 1; optional GroupCustomMask custom = 2; optional GroupExtraMask extra = 3; }
+message GroupListRequest { optional GroupListSelection selection = 1; }
+message GroupListResponse { repeated GroupRecord groups = 2; }
+message MemberMask { optional uint64 nickname = 10; optional uint64 card = 11; optional uint64 level = 12; optional uint64 field13 = 13; optional uint64 field16 = 16; optional uint64 title = 17; optional uint64 field18 = 18; optional uint64 field20 = 20; optional uint64 field21 = 21; optional uint64 join_time = 100; optional uint64 last_message_time = 101; optional uint64 mute_until = 102; optional uint64 field103 = 103; optional uint64 field104 = 104; optional uint64 field105 = 105; optional uint64 field106 = 106; optional uint64 permission = 107; optional uint64 field200 = 200; optional uint64 field201 = 201; }
+message MemberListRequest { optional uint64 group_uin = 1; optional uint64 count = 2; optional uint64 version = 3; optional MemberMask fields = 4; optional bytes cookie = 15; }
+message MemberLevel { optional uint64 level = 2; }
+message MemberCard { optional bool rich = 1; optional bytes card = 2; }
+message RichMemberCard { repeated RichMemberCardElement elements = 1; }
+message RichMemberCardElement { optional bytes control = 1; optional string text = 2; }
+message MemberRecord { optional UserIdentity identity = 1; optional string nickname = 10; optional MemberCard card = 11; optional MemberLevel level = 12; optional string special_title = 17; optional uint64 join_time = 100; optional uint64 last_message_time = 101; optional uint64 mute_until = 102; optional uint64 permission = 107; }
+message MemberListResponse { optional uint64 group_uin = 1; repeated MemberRecord members = 2; optional bytes cookie = 15; }
+message StrangerKeys { repeated uint64 keys = 1; }
+message StrangerUinRequest { optional uint64 uin = 1; optional StrangerKeys keys = 3; }
+message StrangerUidRequest { optional string uid = 1; optional StrangerKeys keys = 3; }
+message StrangerBody { optional Properties properties = 2; optional uint64 uin = 3; }
+message StrangerResponse { optional StrangerBody body = 1; }
+message GroupDetailMask { optional uint64 created_time = 2; optional uint64 max_member_count = 5; optional uint64 member_count = 6; optional bytes name = 15; optional uint64 uin = 21; optional uint64 latest_sequence = 22; }
+message GroupDetailQuery { optional uint64 group_uin = 1; optional GroupDetailMask fields = 2; }
+message GroupDetailRequest { optional uint64 random = 1; optional GroupDetailQuery query = 2; }
+message GroupDetailInfo { optional uint64 created_time = 2; optional uint64 max_member_count = 5; optional uint64 member_count = 6; optional string name = 15; optional uint64 uin = 21; optional uint64 latest_sequence = 22; }
+message GroupDetailResult { optional uint64 group_uin = 1; optional uint64 code = 2; optional GroupDetailInfo info = 3; }
+message GroupDetailResponse { repeated GroupDetailResult results = 1; optional string message = 2; }
+message NotificationUser { optional string uid = 1; }
+message NotificationGroup { optional uint64 uin = 1; }
+message NotificationRecord { optional uint64 sequence = 1; optional uint64 type = 2; optional uint64 state = 3; optional NotificationGroup group = 4; optional NotificationUser target = 5; optional NotificationUser inviter = 6; optional NotificationUser operator = 7; optional string comment = 10; }
+message NotificationListRequest { optional uint64 count = 1; optional uint64 start = 2; }
+message NotificationListResponse { repeated NotificationRecord notifications = 1; }
+message FriendRequestsRequest { optional uint64 mode = 1; optional fixed32 sequence = 2; optional uint64 type = 3; optional string uid = 4; optional uint64 index = 5; optional uint64 count = 6; optional uint64 version = 8; optional uint64 flags = 9; optional uint64 field12 = 12; optional uint64 field22 = 22; }
+message FriendRequestRecord { optional string target_uid = 1; optional string source_uid = 2; optional uint64 state = 3; optional uint64 time = 4; optional string comment = 5; optional string add_source = 6; optional uint64 source_id = 7; optional uint64 source_sub_id = 8; optional uint64 is_initiator = 20; }
+message FriendRequestsSuccess { optional fixed32 sequence = 1; optional uint64 finished = 2; optional uint64 total = 3; repeated FriendRequestRecord requests = 7; }
+message FriendRequestsError { optional string message = 1; }
+message FriendRequestsResponse { optional uint64 code = 2; optional FriendRequestsSuccess success = 3; optional FriendRequestsError error = 4; }
+message CookiesRequest { repeated string domains = 1; }
+message CookieRecord {
+  optional string domain = 1;
+  optional string value = 2;
+  optional uint64 expires_at = 3;
+}
+message CookiesResponse { repeated CookieRecord cookies = 1; }
+message ClientKeyResponse { optional string key = 3; optional uint64 expiration = 4; }
+message CustomStatus { optional uint64 face_id = 1; optional string text = 2; optional uint64 enabled = 3; }
+message StatusRequest { optional uint64 status = 1; optional uint64 extended_status = 2; optional uint64 battery = 3; optional CustomStatus custom = 4; }
+message StatusResponse { optional uint64 code = 1; optional string message = 2; }

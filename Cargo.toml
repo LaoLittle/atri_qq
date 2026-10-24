@@ -1,0 +1,35 @@
+[workspace]
+members = ["api", "protocol", "signing", "silk", "crates/jce", "crates/jce-derive"]
+resolver = "2"
+
+[package]
+name = "atri_qq"
+version = "1.0.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["extension"]
+extension = ["dep:atri_core", "dep:atri_extensions", "dep:atri_qq_api", "dep:async-trait"]
+
+[dependencies]
+atri_qq_silk = { path = "silk", version = "0.1.0" }
+atri_core = { path = "../atri_bot/crates/atri_core", optional = true }
+atri_extensions = { path = "../atri_bot/crates/atri_extensions", optional = true }
+atri_qq_api = { path = "api", optional = true }
+atri_qq_protocol = { path = "protocol" }
+signing = { package = "atri_qq_signing", path = "signing" }
+async-trait = { version = "0.1", optional = true }
+serde = { version = "1", features = ["derive"] }
+rand = "0.8"
+tokio = { version = "1", features = ["sync", "macros"] }
+
+[dev-dependencies]
+prost = "0.14"
+
+[profile.release]
+debug = 1
+strip = false

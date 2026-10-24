@@ -1,0 +1,85 @@
+syntax = "proto3";
+package atri.qq.messages;
+import "messages.proto";
+
+// Common message bytes are retained verbatim for invitation events.
+message MessagePush { bytes common_message = 1; }
+message MembershipPush {
+  uint64 group_uin = 1;
+  string member_uid = 3;
+  uint32 change_type = 4;
+  optional bytes operator = 5;
+}
+message MembershipOperator { MembershipOperatorIdentity identity = 1; }
+message MembershipOperatorIdentity { optional string uid = 1; }
+message GroupJoinRequestPush {
+  uint64 group_uin = 1;
+  uint64 request_type = 2;
+  string target_uid = 3;
+  string comment = 5;
+}
+message InvitationPush { uint64 type = 1; InvitationPushBody body = 2; }
+message InvitationPushBody { InvitationPushInfo info = 1; }
+message InvitationPushInfo {
+  uint64 group_uin = 1;
+  string target_uid = 5;
+  string inviter_uid = 6;
+}
+message DirectRecallPush { DirectRecallInfo info = 1; }
+message DirectRecallInfo {
+  string sender_uid = 1;
+  string recipient_uid = 2;
+  optional uint64 client_sequence = 3;
+  optional uint64 message_id = 4;
+  optional uint32 random = 6;
+  PushTip tip = 13;
+  uint64 sequence = 20;
+}
+message PushTip { string text = 2; }
+message FriendRequestPush { FriendRequestInfo info = 1; }
+message FriendRequestInfo {
+  string target_uid = 1;
+  string source_uid = 2;
+  string message = 10;
+  string source = 11;
+}
+message GroupNotificationPush {
+  optional uint64 group_uin = 4;
+  GroupRecallPush recall = 11;
+  uint64 type = 13;
+  GrayTipPush gray_tip = 26;
+  EssencePush essence = 33;
+  ReactionPush reaction = 44;
+}
+message GroupRecallPush {
+  optional string operator_uid = 1;
+  repeated GroupRecallMessage messages = 3;
+  PushTip tip = 9;
+}
+message GroupRecallMessage {
+  uint64 sequence = 1;
+  uint32 time = 2;
+  uint32 random = 3;
+  string author_uid = 6;
+}
+message GrayTipPush { uint64 type = 1; repeated GrayTipParameter parameters = 7; }
+message GrayTipParameter { optional string key = 1; string value = 2; }
+message ReactionPush { ReactionPushLevel1 body = 1; }
+message ReactionPushLevel1 { ReactionPushLevel2 body = 1; }
+message ReactionPushLevel2 { ReactionTarget target = 2; ReactionInfo reaction = 3; }
+message ReactionTarget { uint64 sequence = 1; }
+message ReactionInfo {
+  string code = 1;
+  uint32 count = 3;
+  string operator_uid = 4;
+  uint64 operation = 5;
+}
+message EssencePush {
+  optional uint64 group_uin = 1;
+  uint64 sequence = 2;
+  uint32 random = 3;
+  uint64 operation = 4;
+  uint64 author_uin = 5;
+  uint64 operator_uin = 6;
+  uint32 time = 7;
+}

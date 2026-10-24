@@ -1,0 +1,43 @@
+syntax = "proto2";
+package atri.qq.admin;
+
+message Empty {}
+message GroupInfoUpdate { optional string name = 3; optional uint64 mute_duration = 17; }
+message GroupInfoRequest { optional uint64 group_uin = 1; optional GroupInfoUpdate info = 2; }
+message GroupRemark { optional uint64 group_uin = 1; optional string remark = 3; }
+message GroupRemarkRequest { optional GroupRemark info = 1; }
+message GroupRemarkResult { optional uint64 code = 3; }
+message GroupRemarkResponse { optional GroupRemarkResult result = 1; }
+message MemberMute { optional string uid = 1; optional uint64 duration = 2; }
+message MemberMuteRequest { optional uint64 group_uin = 1; optional uint64 operation = 2; optional MemberMute member = 3; }
+message MemberText { optional string uid = 1; optional string special_title = 5; optional string name = 8; }
+message MemberTextRequest { optional uint64 group_uin = 1; optional MemberText member = 3; }
+message KickMemberRequest { optional uint64 group_uin = 1; optional string uid = 3; optional bool reject_add_request = 4; optional string reason = 5; }
+message GroupTransferRequest { optional uint64 group_uin = 1; optional uint64 owner_uin = 2; optional uint64 target_uin = 3; }
+message GroupTransferResponse { optional uint64 code = 4; optional string message = 5; }
+message AtAllQuotaRequest { optional uint64 operation = 1; optional uint64 version = 2; optional uint64 query = 3; optional uint64 user_uin = 4; optional uint64 group_uin = 5; }
+message AtAllQuotaResponse { optional bool can_at_all = 1; optional uint32 remaining_for_user = 2; optional uint32 remaining_for_group = 3; optional bytes user_prompt = 4; optional bytes group_prompt = 5; optional bool show_label = 6; }
+message GroupQuitRequest { optional uint64 group_uin = 1; }
+message GroupReactionRequest { optional uint64 group_uin = 2; optional uint64 sequence = 3; optional string code = 4; optional uint64 reaction_type = 5; }
+message NudgeRequest { optional uint64 target_uin = 1; optional uint64 group_uin = 2; optional uint64 peer_uin = 5; }
+message RecallPokeInfo { optional uint64 peer_uin = 1; optional uint64 message_type = 2; optional uint64 sequence = 3; optional uint64 time = 4; optional uint64 uid = 5; optional uint64 group_uid = 6; }
+message RecallPokeTips { optional uint64 message_type = 1; optional uint64 sequence_id = 2; }
+message RecallPokeRequest { optional RecallPokeInfo friend = 1; optional RecallPokeInfo group = 2; optional RecallPokeTips tips = 3; }
+message PinItem { optional uint64 key = 1; optional bytes timestamp = 2; }
+message PinUpdate { optional string uid = 1; optional uint64 group_uin = 2; optional PinItem item = 400; }
+message PinRequest { optional uint64 operation = 1; optional PinUpdate update = 2; optional uint64 contact_type = 3; }
+message GroupNotificationInfo { optional uint64 sequence = 1; optional uint64 notification_type = 2; optional uint64 group_uin = 3; optional string message = 4; }
+message GroupNotificationRequest { optional uint64 action = 1; optional GroupNotificationInfo info = 2; }
+message SetGroupTodoRequest { optional uint64 group_uin = 1; optional uint64 sequence = 2; }
+message GetGroupTodoRequest { optional uint64 group_uin = 1; }
+message FinishGroupTodoRequest { optional uint64 group_uin = 1; }
+message RemoveGroupTodoRequest { optional uint64 group_uin = 1; }
+message GroupTodoInfo { optional uint64 group_uin = 1; optional uint64 sequence = 2; optional uint32 random = 3; optional uint64 creator_uin = 4; optional string creator_nickname = 5; optional string title = 6; optional string jump_url = 7; optional string icon_url = 8; optional uint32 created_time = 9; optional string app_name = 10; optional uint64 app_id = 11; optional int32 message_type = 12; }
+message GroupTodoUser { optional uint64 group_uin = 1; optional uint64 sequence = 2; optional uint32 status = 3; }
+message GetGroupTodoResponse { optional GroupTodoInfo info = 1; repeated GroupTodoUser users = 2; optional uint32 expiration_time = 3; }
+message ClockInInfo { optional string user_uin = 1; optional string group_uin = 2; optional string version = 3; }
+message ClockInRequest { optional ClockInInfo info = 2; }
+message ClockInStatus { optional uint64 code = 1; optional string message = 2; }
+message ClockInDetails { optional string title = 1; optional string keep_day_text = 2; repeated string words = 3; optional string detail_url = 4; }
+message ClockInWrite { optional ClockInStatus result = 1; optional ClockInDetails details = 2; }
+message ClockInResponse { optional ClockInWrite write = 2; }

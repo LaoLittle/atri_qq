@@ -1,0 +1,1118 @@
+use crate::{
+    Error, Result,
+    client::Client,
+    crypto,
+    models::*,
+    proto::{self, auth},
+    wire::{Reader, malformed},
+};
+use base64::Engine;
+use bytes::Bytes;
+use prost::Message;
+use serde::Deserialize;
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use tokio::sync::oneshot;
+mod nt;
+mod wt;
+use nt::{NtLogin, NtResponseKind, NtResult};
+
+#[cfg(test)]
+mod risk_tests;
+use wt::{Tlv, WtLogin};
+
+pub(crate) struct LoginCodecs {
+    wt: WtLogin,
+    nt: NtLogin,
+    registered_session: bool,
+}
+impl LoginCodecs {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            wt: WtLogin::new()?,
+            nt: NtLogin::new()?,
+            registered_session: false,
+        })
+    }
+}
+pub(super) fn unix_seconds() -> u32 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as u32)
+}
+struct LoginGuard<'a> {
+    client: &'a Client,
+    armed: bool,
+}
+impl Drop for LoginGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.client
+                .terminate("Desktop login canceled or failed".into())
+        }
+    }
+}
+
+pub(crate) async fn login(client: &Arc<Client>) -> Result<UserInfo> {
+    let _gate = client
+        .login_gate
+        .try_lock()
+        .map_err(|_| Error::Authentication("Login or ticket refresh is already running".into()))?;
+    let state = client.snapshot().await;
+    if state.online {
+        return Ok(UserInfo::from(&state.keystore));
+    }
+    let mut guard = LoginGuard {
+        client,
+        armed: true,
+    };
+    client.connect().await?;
+    client.begin_signing_login()?;
+    client.start_alive();
+    let mut codecs = client.codecs.lock().await;
+    if codecs.is_none() {
+        *codecs = Some(LoginCodecs::new()?)
+    }
+    let codecs = codecs.as_mut().unwrap();
+    let result = run_login(client, codecs).await;
+    match result {
+        Ok(()) => {
+            codecs.registered_session = true;
+            guard.armed = false;
+            Ok(UserInfo::from(&client.snapshot().await.keystore))
+        }
+        Err(error) => {
+            guard.armed = false;
+            client
+                .close_transport(format!("Desktop login failed: {error}"))
+                .await;
+            Err(error)
+        }
+    }
+}
+async fn run_login(client: &Arc<Client>, codecs: &mut LoginCodecs) -> Result<()> {
+    // Restored tickets are not proof of a live, previously registered session.
+    let reconnect = std::mem::replace(&mut codecs.registered_session, false);
+    let state = client.snapshot().await;
+    if reconnect && !state.keystore.d2.is_empty() && !state.keystore.a2.is_empty() {
+        client.mark_signing_ticket_complete()?;
+        if online(client, true).await? {
+            return Ok(());
+        }
+        client.begin_signing_login()?;
+    }
+    let state = client.snapshot().await;
+    if !state.keystore.a1.is_empty() {
+        let original_a1 = Bytes::from(state.keystore.a1);
+        key_exchange(client, &mut codecs.nt).await?;
+        let result = nt_call(
+            client,
+            &codecs.nt,
+            "SsoNTLoginEasyLogin",
+            &auth::NtLoginBody {
+                a1: Some(original_a1.clone()),
+                captcha: None,
+            },
+            NtResponseKind::Easy,
+        )
+        .await?;
+        if result.code == 0 {
+            return require_online(client).await;
+        }
+        tracing::info!(target: "atri_qq_protocol::login",
+            stage = "easy", code = result.code,
+            device_verification = result.code == 140022011,
+            next_step = if result.code == 140022011 {
+                "unusual_device_qr"
+            } else if client.config.password.as_deref().is_some_and(|v| !v.is_empty()) {
+                "password_login"
+            } else {
+                "normal_qr_login"
+            },
+            "Cached easy login rejected; starting another authentication step");
+        if result.code == 140022011 {
+            let unusual = result
+                .unusual_signature
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| malformed("Unusual-device protection signature missing"))?;
+            qr_login(
+                client,
+                codecs,
+                QrLoginMode::Verification {
+                    kind: QrVerification::Easy,
+                    signature: unusual,
+                    a1: original_a1,
+                },
+            )
+            .await?;
+            return require_online(client).await;
+        }
+    }
+    if let Some(password) = client.config.password.as_deref().filter(|v| !v.is_empty()) {
+        password_login(client, codecs, password).await?
+    } else {
+        qr_login(client, codecs, QrLoginMode::Normal).await?
+    }
+    require_online(client).await
+}
+pub(crate) async fn refresh_tickets(client: &Arc<Client>) -> Result<()> {
+    let _gate = client
+        .login_gate
+        .try_lock()
+        .map_err(|_| Error::Authentication("Login or ticket refresh is already running".into()))?;
+    let state = client.snapshot().await;
+    if !state.online || state.keystore.a1.is_empty() {
+        return Err(Error::Authentication(
+            "Online A1 session required for ticket refresh".into(),
+        ));
+    }
+    let mut codecs = client.codecs.lock().await;
+    if codecs.is_none() {
+        *codecs = Some(LoginCodecs::new()?)
+    }
+    let codecs = codecs.as_mut().unwrap();
+    key_exchange(client, &mut codecs.nt).await?;
+    nt_call(
+        client,
+        &codecs.nt,
+        "SsoNTLoginEasyLogin",
+        &auth::NtLoginBody {
+            a1: Some(Bytes::copy_from_slice(&state.keystore.a1)),
+            captcha: None,
+        },
+        NtResponseKind::Easy,
+    )
+    .await?
+    .require_success()
+}
+async fn key_exchange(client: &Client, codec: &mut NtLogin) -> Result<()> {
+    let state = client.snapshot().await;
+    let request = codec.key_exchange(&state)?;
+    let response = client
+        .call(
+            "trpc.login.ecdh.EcdhService.SsoKeyExchange",
+            request,
+            Encryption::Empty,
+        )
+        .await?;
+    let (ticket, key) = codec.decode_key_exchange(response)?;
+    let mut state = client.snapshot().await;
+    state.keystore.key_exchange_ticket = ticket;
+    state.keystore.key_exchange_key = key;
+    // Cookies belong to an NT authentication attempt, not restored tickets.
+    state.keystore.login_cookie.clear();
+    client.replace_state(state).await;
+    Ok(())
+}
+async fn nt_call(
+    client: &Client,
+    codec: &NtLogin,
+    method: &str,
+    body: &impl Message,
+    kind: NtResponseKind,
+) -> Result<NtResult> {
+    let state = client.snapshot().await;
+    let requested_uin = state.keystore.uin;
+    let request = codec.encode(body, &state)?;
+    let response = client
+        .call(
+            &format!("trpc.login.ecdh.EcdhService.{method}"),
+            request,
+            Encryption::Empty,
+        )
+        .await?;
+    let mut state = client.snapshot().await;
+    let result = codec.decode(response, &mut state.keystore, kind)?;
+    let cached_a1_invalidated = state.keystore.uin == requested_uin
+        && !state.keystore.a1.is_empty()
+        && result.code != 0
+        && !matches!(
+            result.code,
+            140022002 | 140022008 | 140022010 | 140022011 | 140022019
+        );
+    if cached_a1_invalidated {
+        state.keystore.a1.clear();
+    }
+    client.replace_state(state).await;
+    if result.code == 0 {
+        client.mark_signing_ticket_complete()?;
+    } else {
+        // Keep the server's reason even if the caller starts a fresh login.
+        // URLs, cookies and signatures are authentication material: log only
+        // their presence/length, never their contents.
+        tracing::warn!(target: "atri_qq_protocol::login",
+            method, code = result.code,
+            server_title = %redact_login_urls(&result.title),
+            server_message = %redact_login_urls(&result.message),
+            server_jump_word = %redact_login_urls(&result.jump_word),
+            jump_url_present = !result.jump_url.is_empty(),
+            unusual_signature_length = result.unusual_signature.as_ref().map_or(0, |v| v.len()),
+            captcha_url_present = result.captcha_url.as_ref().is_some_and(|v| !v.is_empty()),
+            cached_a1_invalidated,
+            "NT login returned an authentication error");
+    }
+    Ok(result)
+}
+
+fn redact_login_urls(text: &str) -> std::borrow::Cow<'_, str> {
+    let first_url = |value: &str| {
+        [
+            value
+                .as_bytes()
+                .windows(8)
+                .position(|bytes| bytes.eq_ignore_ascii_case(b"https://")),
+            value
+                .as_bytes()
+                .windows(7)
+                .position(|bytes| bytes.eq_ignore_ascii_case(b"http://")),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    };
+    let Some(mut start) = first_url(text) else {
+        return std::borrow::Cow::Borrowed(text);
+    };
+    let mut remaining = text;
+    let mut redacted = String::with_capacity(text.len());
+    loop {
+        redacted.push_str(&remaining[..start]);
+        redacted.push_str("[redacted URL]");
+        let end = remaining[start..]
+            .find(char::is_whitespace)
+            .map_or(remaining.len(), |end| start + end);
+        remaining = &remaining[end..];
+        match first_url(remaining) {
+            Some(next) => start = next,
+            None => {
+                redacted.push_str(remaining);
+                return std::borrow::Cow::Owned(redacted);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    #[test]
+    fn authentication_links_are_redacted_without_losing_the_error_context() {
+        let reason = "client-risk HTTPS://verify.invalid/?ticket=secret-one continue http://verify.invalid/?proof=secret-two retry";
+        let safe = super::redact_login_urls(reason);
+        assert!(!safe.contains("secret-one"));
+        assert!(!safe.contains("secret-two"));
+        assert!(safe.starts_with("client-risk "));
+        assert!(safe.contains(" continue "));
+        assert!(safe.ends_with(" retry"));
+    }
+}
+// No Debug implementation: these values are login credentials.
+#[derive(Clone, Copy)]
+enum QrVerification {
+    Easy,
+    Password,
+}
+
+enum QrLoginMode {
+    Normal,
+    Verification {
+        kind: QrVerification,
+        signature: Bytes,
+        a1: Bytes,
+    },
+}
+
+enum QrConfirmation {
+    Normal {
+        uin: u64,
+        tgtgt_key: Bytes,
+        no_pic_sig: Bytes,
+        a1: Bytes,
+    },
+    Verification {
+        kind: QrVerification,
+        uin: u64,
+        a1: Bytes,
+        one_click_succeed_sig: Bytes,
+    },
+}
+
+fn decode_qr_confirmation(
+    r: &mut Reader,
+    cached: &Keystore,
+    mode: &QrLoginMode,
+) -> Result<QrConfirmation> {
+    use std::fmt::Write;
+    let uin = r.u64()?;
+    r.skip(4)?;
+    let mut tlvs = Tlv::decode(r)?;
+    let failure = if uin == 0 {
+        Some("QR confirmation UIN is zero")
+    } else {
+        match mode {
+            QrLoginMode::Normal if !tlvs.contains_key(&0x1e) => {
+                Some("QR TGTGT key missing (TLV 0x001e absent)")
+            }
+            QrLoginMode::Normal if tlvs[&0x1e].len() != 16 => {
+                Some("QR TGTGT key has invalid length (TLV 0x001e must contain 16 bytes)")
+            }
+            QrLoginMode::Normal if !tlvs.contains_key(&0x19) => {
+                Some("QR no-picture signature missing (TLV 0x0019 absent)")
+            }
+            QrLoginMode::Normal if tlvs.get(&0x18).is_none_or(|v| v.is_empty()) => {
+                Some("QR A1 ticket missing or empty (TLV 0x0018)")
+            }
+            QrLoginMode::Verification { .. } if tlvs.get(&0x3f).is_none_or(|v| v.is_empty()) => {
+                Some("QR one-click success signature missing or empty (TLV 0x003f)")
+            }
+            _ => None,
+        }
+    };
+    if let Some(failure) = failure {
+        let mode_name = match mode {
+            QrLoginMode::Normal => "normal",
+            QrLoginMode::Verification {
+                kind: QrVerification::Easy,
+                ..
+            } => "easy_verification",
+            QrLoginMode::Verification {
+                kind: QrVerification::Password,
+                ..
+            } => "password_verification",
+        };
+        let mut detail = format!("{failure}; mode={mode_name}; tlv_lengths=[");
+        for (index, (tag, value)) in tlvs.iter().enumerate() {
+            if index != 0 {
+                detail.push_str(", ");
+            }
+            write!(detail, "0x{tag:04x}:{}", value.len()).expect("writing to String cannot fail");
+        }
+        write!(
+            detail,
+            "]; trailing_bytes={}; cached_tgtgt_length={}; cached_account_matches={}",
+            r.remaining(),
+            cached.tgtgt_key.len(),
+            uin != 0 && uin == cached.uin
+        )
+        .expect("writing to String cannot fail");
+        return Err(malformed(detail));
+    }
+    Ok(match mode {
+        QrLoginMode::Normal => QrConfirmation::Normal {
+            uin,
+            tgtgt_key: tlvs.remove(&0x1e).unwrap(),
+            no_pic_sig: tlvs.remove(&0x19).unwrap(),
+            a1: tlvs.remove(&0x18).unwrap(),
+        },
+        QrLoginMode::Verification { kind, a1, .. } => QrConfirmation::Verification {
+            kind: *kind,
+            uin,
+            // Verification continues the retained credential, not QR TLV 0x18.
+            a1: a1.clone(),
+            one_click_succeed_sig: tlvs.remove(&0x3f).unwrap(),
+        },
+    })
+}
+
+async fn qr_login(client: &Client, codecs: &mut LoginCodecs, mode: QrLoginMode) -> Result<()> {
+    let mut state = client.snapshot().await;
+    let unusual = match &mode {
+        QrLoginMode::Normal => None,
+        QrLoginMode::Verification { signature, .. } => Some(signature.as_ref()),
+    };
+    let request = codecs.wt.qr(0x31, unusual, &state)?;
+    let response = client
+        .call("wtlogin.trans_emp", request, Encryption::Empty)
+        .await?;
+    let (command, decoded) = codecs.wt.decode_qr(response, &state.keystore)?;
+    if command != 0x31 {
+        return Err(malformed("QR acquisition command mismatch"));
+    }
+    let mut r = Reader::new(decoded);
+    r.skip(6)?;
+    let code = r.u8()?;
+    if code != 0 {
+        return Err(Error::Server {
+            code: code.into(),
+            message: "QR acquisition rejected".into(),
+        });
+    }
+    let signature = r.p16()?;
+    let tlvs = Tlv::decode(&mut r)?;
+    let ext = tlvs
+        .get(&0xd1)
+        .ok_or_else(|| malformed("QR URL extension missing"))?;
+    let image = tlvs
+        .get(&0x17)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| malformed("QR image missing"))?;
+    let url = proto::decode::<auth::QrResponseExtension>(ext.clone())?
+        .url
+        .ok_or_else(|| malformed("QR URL missing"))?;
+    reqwest::Url::parse(&url).map_err(|_| malformed("Invalid QR URL"))?;
+    state.keystore.qr_sig = signature.to_vec();
+    client.replace_state(state).await;
+    client.emit(LoginEvent::QrCode {
+        url,
+        image: image.to_vec(),
+    });
+    loop {
+        state = client.snapshot().await;
+        let query = codecs.wt.qr(0x12, None, &state)?;
+        let response = client
+            .call("wtlogin.trans_emp", query, Encryption::Empty)
+            .await?;
+        let (command, decoded) = codecs.wt.decode_qr(response, &state.keystore)?;
+        if command != 0x12 {
+            return Err(malformed("QR query command mismatch"));
+        }
+        let mut r = Reader::new(decoded);
+        r.skip(6)?;
+        let qr_state = QrState::try_from(r.u8()?)?;
+        client.emit(LoginEvent::QrState(qr_state));
+        match qr_state {
+            QrState::Confirmed => {
+                let confirmation = decode_qr_confirmation(&mut r, &state.keystore, &mode)?;
+                state = client.snapshot().await;
+                match confirmation {
+                    QrConfirmation::Normal {
+                        uin,
+                        tgtgt_key,
+                        no_pic_sig,
+                        a1,
+                    } => {
+                        state.keystore.uin = uin;
+                        state.keystore.tgtgt_key = tgtgt_key.to_vec();
+                        state.keystore.no_pic_sig = no_pic_sig.to_vec();
+                        state.keystore.a1 = a1.to_vec();
+                        client.replace_state(state).await;
+                        wt_login(client, &mut codecs.wt).await?;
+                    }
+                    QrConfirmation::Verification {
+                        kind,
+                        uin,
+                        a1,
+                        one_click_succeed_sig,
+                    } => {
+                        state.keystore.uin = uin;
+                        client.replace_state(state).await;
+                        let (method, response_kind) = match kind {
+                            QrVerification::Easy => {
+                                ("SsoNTLoginEasyLoginUnusualDevice", NtResponseKind::Easy)
+                            }
+                            QrVerification::Password => (
+                                "SsoNTLoginPasswordLoginUnusualDevice",
+                                NtResponseKind::PasswordVerification,
+                            ),
+                        };
+                        nt_call(
+                            client,
+                            &codecs.nt,
+                            method,
+                            &auth::NtUnusualLoginBody {
+                                a1: Some(a1),
+                                one_click_succeed_sig: Some(one_click_succeed_sig),
+                            },
+                            response_kind,
+                        )
+                        .await?
+                        .require_success()?;
+                    }
+                }
+                return Ok(());
+            }
+            QrState::Waiting | QrState::Scanned => client.pause(Duration::from_secs(2)).await?,
+            _ => {
+                return Err(Error::Authentication(format!(
+                    "QR login ended: {qr_state:?}"
+                )));
+            }
+        }
+    }
+}
+async fn wt_login(client: &Client, codec: &mut WtLogin) -> Result<()> {
+    let state = client.snapshot().await;
+    let request = codec.login(&state)?;
+    let response = client
+        .call("wtlogin.login", request, Encryption::Empty)
+        .await?;
+    let (command, decoded) = codec.decode(response, &state.keystore)?;
+    if command != 0x810 {
+        return Err(malformed("WT login command mismatch"));
+    }
+    let mut r = Reader::new(decoded);
+    r.skip(2)?;
+    let result = r.u8()?;
+    let mut t = Tlv::decode(&mut r)?;
+    wt::decode_login_error(result, &t)?;
+    if let Some(encrypted) = t.get(&0x119) {
+        let mut r = Reader::new(crypto::tea_decrypt(encrypted, &state.keystore.tgtgt_key)?);
+        t = Tlv::decode(&mut r)?;
+    }
+    let mut state = client.snapshot().await;
+    wt::apply_tickets(&t, &mut state.keystore)?;
+    client.replace_state(state).await;
+    client.mark_signing_ticket_complete()?;
+    Ok(())
+}
+async fn password_login(client: &Client, codecs: &mut LoginCodecs, password: &str) -> Result<()> {
+    let mut state = client.snapshot().await;
+    if client.config.uin > 0 {
+        state.keystore.uin = client.config.uin
+    }
+    if state.keystore.uin == 0 {
+        return Err(Error::Authentication(
+            "Desktop password login requires a numeric UIN".into(),
+        ));
+    }
+    state.keystore.login_cookie.clear();
+    let needs_exchange = state.keystore.key_exchange_ticket.is_empty();
+    client.replace_state(state).await;
+    if needs_exchange {
+        key_exchange(client, &mut codecs.nt).await?
+    }
+    let password_digest = crypto::md5(password.as_bytes());
+    let mut captcha: Option<(String, String, String)> = None;
+    loop {
+        let a1 = NtLogin::password_a1(&password_digest, &client.snapshot().await)?;
+        let body = auth::NtLoginBody {
+            a1: Some(a1.clone()),
+            captcha: captcha
+                .as_ref()
+                .map(|(ticket, random, sid)| auth::NtCaptcha {
+                    ticket: Some(ticket.clone()),
+                    random: Some(random.clone()),
+                    sid: Some(sid.clone()),
+                }),
+        };
+        let result = nt_call(
+            client,
+            &codecs.nt,
+            "SsoNTLoginPasswordLogin",
+            &body,
+            NtResponseKind::Password,
+        )
+        .await?;
+        match result.code {
+            0 => return Ok(()),
+            140022008 => {
+                let url = result
+                    .captcha_url
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or(result.jump_url);
+                let parsed =
+                    reqwest::Url::parse(&url).map_err(|_| malformed("Captcha URL invalid"))?;
+                let sid = parsed
+                    .query_pairs()
+                    .find(|(key, _)| key == "sid")
+                    .map(|(_, v)| v.into_owned())
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| malformed("Captcha URL has no SID"))?;
+                let (tx, rx) = oneshot::channel();
+                *client.captcha.lock().unwrap() = Some(tx);
+                client.emit(LoginEvent::Challenge(LoginChallenge::Captcha { url }));
+                let cancel = client.cancellation();
+                let (ticket, random) = tokio::select! {_ = cancel.cancelled()=>return Err(Error::Disconnected),answer=rx=>answer.map_err(|_|Error::Disconnected)?};
+                captcha = Some((ticket, random, sid));
+            }
+            140022010 => return new_device_login(client, &codecs.nt, &result.jump_url).await,
+            140022011 => {
+                let signature = result
+                    .unusual_signature
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| malformed("Password unusual-device signature missing"))?;
+                return qr_login(
+                    client,
+                    codecs,
+                    QrLoginMode::Verification {
+                        kind: QrVerification::Password,
+                        signature,
+                        a1,
+                    },
+                )
+                .await;
+            }
+            _ => result.require_success()?,
+        }
+    }
+}
+async fn require_online(client: &Arc<Client>) -> Result<()> {
+    if online(client, false).await? {
+        Ok(())
+    } else {
+        Err(Error::Authentication(
+            "InfoSync did not confirm register success".into(),
+        ))
+    }
+}
+async fn online(client: &Arc<Client>, reconnect: bool) -> Result<bool> {
+    let generation = client.connection_generation();
+    let state = client.snapshot().await;
+    let response = match client
+        .call(
+            "trpc.msg.register_proxy.RegisterProxy.SsoInfoSync",
+            info_sync(&state, reconnect),
+            Encryption::D2,
+        )
+        .await
+    {
+        Ok(p) => p,
+        Err(Error::Server { .. }) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let response: auth::InfoSyncResponse = proto::decode(response)?;
+    if !registration_confirmed(&response) {
+        return Ok(false);
+    }
+    client.confirm_online(generation)?;
+    let registration = response.register.as_ref().unwrap();
+    client.start_heartbeat(
+        registration.server_time.unwrap_or(0),
+        registration.heartbeat_interval_seconds.unwrap_or(360),
+    );
+    client.start_maintenance(generation)?;
+    Ok(true)
+}
+fn registration_confirmed(response: &auth::InfoSyncResponse) -> bool {
+    response
+        .register
+        .as_ref()
+        .and_then(|p| p.message.as_deref())
+        == Some("register success")
+}
+fn info_sync(state: &SessionState, reconnect: bool) -> Bytes {
+    auth::InfoSyncRequest {
+        sync_flag: Some(1759),
+        request_random: Some(rand::random::<u32>() % (i32::MAX as u32)),
+        current_active_status: Some(2),
+        group_last_message_time: Some(0),
+        sync: Some(auth::SyncState {
+            current_cookie: Some(auth::SyncCursor { timestamp: None }),
+            last_message_time: Some(0),
+            previous_cookie: Some(auth::SyncCursor { timestamp: None }),
+        }),
+        cookie: Some(Bytes::new()),
+        register: Some(auth::RegisterInfo {
+            guid: Some(hex::encode(&state.keystore.guid)),
+            kick_pc: Some(0),
+            version: Some(state.profile.version.clone()),
+            first_register: Some(u32::from(reconnect)),
+            locale: Some(2052),
+            device: Some(auth::RegisterDevice {
+                name: Some(state.keystore.device_name.clone()),
+                kernel: Some(state.profile.kernel.clone()),
+                os_version: Some(String::new()),
+                brand: Some(String::new()),
+                os: Some(state.profile.os.clone()),
+            }),
+            mute: Some(0),
+            vendor_type: Some(0),
+            registration_type: Some(u32::from(!reconnect)),
+            business: Some(auth::RegisterBusiness {
+                notify_switch: Some(0),
+                message_switch: Some(0),
+            }),
+            battery_status: Some(0),
+            set_status: Some(1),
+            flags: Some(auth::RegisterFlags {
+                field1: Some(0),
+                field2: Some(0),
+            }),
+            field16: Some(if reconnect { 4 } else { 7 }),
+            field17: Some(0),
+            field18: Some(0),
+        }),
+        business: Some(auth::OnlineBusiness {
+            version: Some(if reconnect { 2 } else { 0 }),
+            state: Some(auth::OnlineBusinessState { field1: Some(0) }),
+        }),
+        app: Some(auth::AppState {
+            foreground: Some(0),
+            full_screen: Some(0),
+            background: Some(0),
+        }),
+        extension: Some(Bytes::new()),
+    }
+    .encode_to_vec()
+    .into()
+}
+
+#[derive(Deserialize)]
+struct NewDeviceResponse {
+    #[serde(rename = "str_url")]
+    url: Option<String>,
+    #[serde(rename = "ActionStatus")]
+    action: Option<String>,
+    #[serde(rename = "str_nt_succ_token")]
+    token: Option<String>,
+    #[serde(rename = "ErrorCode")]
+    error_code: Option<i64>,
+    #[serde(rename = "ErrorInfo")]
+    error_info: Option<String>,
+}
+async fn new_device_request(
+    client: &Client,
+    http: &reqwest::Client,
+    url: &reqwest::Url,
+    payload: serde_json::Value,
+) -> Result<NewDeviceResponse> {
+    let cancel = client.cancellation();
+    let request = async {
+        let mut response =
+            crate::diagnostics::send_http(http.post(url.clone()).json(&payload)).await?;
+        if response.content_length().is_some_and(|n| n > 1024 * 1024) {
+            return Err(malformed("New-device HTTP response exceeds limit"));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            crate::diagnostics::trace_http_chunk(&response, bytes.len(), &chunk);
+            if chunk.len() > 1024 * 1024 - bytes.len() {
+                return Err(malformed("New-device HTTP response exceeds limit"));
+            }
+            bytes.extend_from_slice(&chunk)
+        }
+        response.error_for_status_ref()?;
+        let result: NewDeviceResponse = serde_json::from_slice(&bytes)
+            .map_err(|e| malformed(format!("New-device response JSON: {e}")))?;
+        if let Some(code) = result.error_code.filter(|v| *v != 0) {
+            return Err(Error::Server {
+                code: code as i32,
+                message: result
+                    .error_info
+                    .unwrap_or_else(|| "New-device authorization rejected".into()),
+            });
+        }
+        Ok(result)
+    };
+    tokio::select! {_ = cancel.cancelled()=>Err(Error::Disconnected),result=request=>result}
+}
+async fn new_device_login(client: &Client, codec: &NtLogin, jump: &str) -> Result<()> {
+    let state = client.snapshot().await;
+    let jump = reqwest::Url::parse(jump)
+        .or_else(|_| reqwest::Url::parse(&format!("https://qq.com/?{jump}")))
+        .map_err(|_| malformed("New-device jump URL"))?;
+    let params: std::collections::BTreeMap<_, _> = jump
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    let sig = params
+        .get("sig")
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| malformed("New-device signature missing"))?;
+    let uin_token = params
+        .get("uin-token")
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| malformed("New-device UIN token missing"))?;
+    let endpoint=reqwest::Url::parse(&format!("https://oidb.tim.qq.com/v3/oidbinterface/oidb_0xc9e_8?uid={}&getqrcode=1&sdkappid=39998&actype=2",state.keystore.uin)).map_err(|e|malformed(e.to_string()))?;
+    let http = crate::http::client_builder()
+        .timeout(client.config.timeout)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()?;
+    let acquired=new_device_request(client,&http,&endpoint,serde_json::json!({"str_dev_auth_token":sig,"str_uin_token":uin_token,"str_dev_type":state.profile.os,"str_dev_name":state.keystore.device_name,"uint32_flag":1,"uint32_url_type":0})).await?;
+    let url = acquired
+        .url
+        .ok_or_else(|| malformed("New-device QR URL missing"))?;
+    let parsed = reqwest::Url::parse(&url).map_err(|_| malformed("New-device QR URL invalid"))?;
+    let token_url = parsed
+        .query_pairs()
+        .find(|(key, _)| key == "str_url")
+        .map(|(_, v)| v.into_owned())
+        .ok_or_else(|| malformed("New-device QR token missing"))?;
+    client.emit(LoginEvent::Challenge(LoginChallenge::NewDevice { url }));
+    let normalized = token_url
+        .replace('*', "+")
+        .replace('-', "/")
+        .replace("==", "");
+    let token = base64::engine::general_purpose::STANDARD.encode(normalized.as_bytes());
+    loop {
+        let response = new_device_request(
+            client,
+            &http,
+            &endpoint,
+            serde_json::json!({"bytes_token":&token,"uint32_flag":0}),
+        )
+        .await?;
+        if response.action.as_deref() == Some("OK") {
+            if let Some(success) = response.token.filter(|v| !v.is_empty()) {
+                return nt_call(
+                    client,
+                    codec,
+                    "SsoNTLoginPasswordLoginNewDevice",
+                    &auth::NtNewDeviceBody {
+                        success_token: Some(success),
+                    },
+                    NtResponseKind::NewDevice,
+                )
+                .await?
+                .require_success();
+            }
+        }
+        client.pause(Duration::from_secs(2)).await?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn login_diagnostics_redact_urls_without_changing_the_server_context() {
+        let original =
+            "请验证 https://example.invalid/?secret=private 后重试 http://example.invalid/private";
+        let diagnostic = redact_login_urls(original);
+        assert_eq!(diagnostic, "请验证 [redacted URL] 后重试 [redacted URL]");
+        assert!(!diagnostic.contains("private"));
+        assert!(original.contains("secret=private"));
+        assert!(matches!(
+            redact_login_urls("登录失败"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+    #[test]
+    fn only_exact_infosync_registration_sets_online() {
+        assert!(!registration_confirmed(&auth::InfoSyncResponse::default()));
+        assert!(!registration_confirmed(&auth::InfoSyncResponse {
+            register: Some(auth::InfoSyncRegisterResponse {
+                message: Some("register failed".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        assert!(registration_confirmed(&auth::InfoSyncResponse {
+            register: Some(auth::InfoSyncRegisterResponse {
+                message: Some("register success".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        // A success string outside the registration field must not set the session online.
+        let unrelated = auth::StatusResponse {
+            message: Some("register success".into()),
+        }
+        .encode_to_vec();
+        assert!(!registration_confirmed(
+            &proto::decode(Bytes::from(unrelated)).unwrap()
+        ));
+    }
+    #[test]
+    fn infosync_success_allows_unrelated_response_metadata() {
+        let mut response = auth::InfoSyncResponse {
+            request_random: Some(123),
+            register: Some(auth::InfoSyncRegisterResponse {
+                message: Some("register success".into()),
+                server_time: Some(100),
+                heartbeat_interval_seconds: Some(360),
+                field5: Some(40),
+            }),
+        }
+        .encode_to_vec();
+        response.extend_from_slice(&[0x20, 3, 0x30, 52, 0x48, 33, 0x80, 0x01, 1, 0x8a, 0x01, 0]);
+        let response: auth::InfoSyncResponse = proto::decode(response.as_slice()).unwrap();
+        assert!(registration_confirmed(&response));
+        assert_eq!(response.request_random, Some(123));
+        let register = response.register.unwrap();
+        assert_eq!(register.server_time, Some(100));
+        assert_eq!(register.heartbeat_interval_seconds, Some(360));
+        assert_eq!(register.field5, Some(40));
+    }
+    #[test]
+    fn infosync_profile_and_uid_are_not_legacy_android() {
+        let state = SessionState {
+            profile: Profile::linux(),
+            keystore: Keystore::default(),
+            machine_id: "explicit".into(),
+            online: false,
+        };
+        let sync: auth::InfoSyncRequest = proto::decode(info_sync(&state, false)).unwrap();
+        assert_eq!(sync.sync_flag, Some(1759));
+        assert_eq!(sync.current_active_status, Some(2));
+        assert_eq!(sync.group_last_message_time, Some(0));
+        assert_eq!(sync.cookie, Some(Bytes::new()));
+        let cursors = sync.sync.unwrap();
+        assert_eq!(cursors.last_message_time, Some(0));
+        assert_eq!(cursors.current_cookie.unwrap().timestamp, None);
+        assert_eq!(cursors.previous_cookie.unwrap().timestamp, None);
+        let register = sync.register.unwrap();
+        assert_eq!(register.version.as_deref(), Some("3.2.34-53644"));
+        assert_eq!(register.vendor_type, Some(0));
+        assert_eq!(register.kick_pc, Some(0));
+        assert_eq!(register.mute, Some(0));
+        assert_eq!(register.registration_type, Some(1));
+        assert_eq!(register.battery_status, Some(0));
+        assert_eq!(register.first_register, Some(0));
+        assert_eq!(register.field16, Some(7));
+        assert_eq!(register.device.unwrap().os.as_deref(), Some("Linux"));
+    }
+    #[test]
+    fn infosync_reconnect_uses_distinct_registration_mode() {
+        let state = SessionState {
+            profile: Profile::linux(),
+            keystore: Keystore::default(),
+            machine_id: "synthetic-machine".into(),
+            online: false,
+        };
+        let sync: auth::InfoSyncRequest = proto::decode(info_sync(&state, true)).unwrap();
+        assert_eq!(sync.extension, Some(Bytes::new()));
+        let business = sync.business.unwrap();
+        assert_eq!(business.version, Some(2));
+        assert_eq!(business.state.unwrap().field1, Some(0));
+        let register = sync.register.unwrap();
+        assert_eq!(register.guid, Some(hex::encode(&state.keystore.guid)));
+        assert_eq!(register.first_register, Some(1));
+        assert_eq!(register.registration_type, Some(0));
+        assert_eq!(register.field16, Some(4));
+        let flags = register.flags.unwrap();
+        assert_eq!(flags.field1, Some(0));
+        assert_eq!(flags.field2, Some(0));
+        let business = register.business.unwrap();
+        assert_eq!(business.notify_switch, Some(0));
+        assert_eq!(business.message_switch, Some(0));
+    }
+
+    #[test]
+    fn heartbeat_carries_previous_server_time_not_battery_status() {
+        let request = auth::HeartbeatRequest {
+            r#type: Some(1),
+            state: Some(auth::HeartbeatState {
+                status: Some(0),
+                field2: Some(0),
+            }),
+            local_silence: Some(0),
+            server_time: Some(4_000_000_001),
+        };
+        assert_eq!(
+            request.encode_to_vec(),
+            [
+                0x08, 1, 0x12, 4, 0x08, 0, 0x10, 0, 0x18, 0, 0x20, 0x81, 0xd0, 0xac, 0xf3, 0x0e
+            ],
+        );
+        let response: auth::HeartbeatResponse =
+            proto::decode(Bytes::from_static(&[0x18, 0xe8, 0x02])).unwrap();
+        assert_eq!(response.interval_seconds, Some(360));
+    }
+
+    fn qr_confirmation_payload(key: Option<&[u8]>) -> Bytes {
+        use crate::wire::Writer;
+        let mut body = Writer::new();
+        body.u64(123456);
+        body.u32(0);
+        let mut tlvs = Tlv::default();
+        tlvs.add(0x18, b"synthetic-A1-ticket");
+        tlvs.add(0x19, b"synthetic-no-picture-signature");
+        if let Some(key) = key {
+            tlvs.add(0x1e, key);
+        }
+        body.bytes(tlvs.encode(None).unwrap());
+        body.data.into()
+    }
+
+    #[test]
+    fn qr_confirmation_checks_the_key_boundary_without_accepting_a_partial_collection() {
+        let cached = Keystore::default();
+        let payload = qr_confirmation_payload(Some(&[0x61; 16]));
+        let confirmation = decode_qr_confirmation(
+            &mut Reader::new(payload.clone()),
+            &cached,
+            &QrLoginMode::Normal,
+        )
+        .unwrap();
+        assert!(matches!(confirmation,
+            QrConfirmation::Normal { uin: 123456, tgtgt_key, .. } if tgtgt_key.len() == 16));
+        for length in [0, 15, 17] {
+            assert!(
+                decode_qr_confirmation(
+                    &mut Reader::new(qr_confirmation_payload(Some(&vec![0x61; length]))),
+                    &cached,
+                    &QrLoginMode::Normal,
+                )
+                .is_err()
+            );
+        }
+        for length in 0..payload.len() {
+            assert!(
+                decode_qr_confirmation(
+                    &mut Reader::new(payload.slice(..length)),
+                    &cached,
+                    &QrLoginMode::Normal,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn qr_failure_diagnostics_never_expose_returned_or_cached_credentials() {
+        let secret = b"private-session-material";
+        let mut cached = Keystore::default();
+        cached.uin = 123456;
+        cached.tgtgt_key = secret.to_vec();
+        for key in [None, Some(secret.as_slice())] {
+            let error = decode_qr_confirmation(
+                &mut Reader::new(qr_confirmation_payload(key)),
+                &cached,
+                &QrLoginMode::Normal,
+            )
+            .err()
+            .expect("invalid confirmation must be rejected");
+            let text = error.to_string();
+            assert!(!text.contains(std::str::from_utf8(secret).unwrap()));
+            assert!(!text.contains(&hex::encode(secret)));
+            assert!(!text.contains("123456"));
+            assert!(!text.contains("synthetic-A1-ticket"));
+        }
+    }
+
+    #[test]
+    fn unusual_easy_confirmation_uses_the_initial_a1_and_tag_3f_without_wt_tickets() {
+        use crate::wire::Writer;
+        let mode = QrLoginMode::Verification {
+            kind: QrVerification::Easy,
+            signature: Bytes::from_static(b"verification"),
+            a1: Bytes::from_static(b"initial-easy-credential"),
+        };
+        for include_other_tickets in [false, true] {
+            let mut tlvs = Tlv::default();
+            tlvs.add(0x3f, b"fresh-one-click-signature");
+            if include_other_tickets {
+                tlvs.add(0x18, b"different-QR-A1");
+                tlvs.add(0x65, b"different-TGT-QR");
+                tlvs.add(0x1e, b"unused-key-with-invalid-length");
+            }
+            let mut body = Writer::new();
+            body.u64(123456);
+            body.u32(0);
+            body.bytes(tlvs.encode(None).unwrap());
+            let confirmation =
+                decode_qr_confirmation(&mut Reader::new(body.data), &Keystore::default(), &mode)
+                    .unwrap();
+            match confirmation {
+                QrConfirmation::Verification {
+                    kind: QrVerification::Easy,
+                    uin,
+                    a1,
+                    one_click_succeed_sig,
+                } => {
+                    assert_eq!(uin, 123456);
+                    assert_eq!(a1.as_ref(), b"initial-easy-credential");
+                    assert_eq!(one_click_succeed_sig.as_ref(), b"fresh-one-click-signature");
+                }
+                _ => panic!("incorrect QR continuation"),
+            }
+        }
+        for signature in [None, Some(b"".as_slice())] {
+            let mut tlvs = Tlv::default();
+            tlvs.add(0x65, b"TGT-QR-is-not-one-click-proof");
+            if let Some(signature) = signature {
+                tlvs.add(0x3f, signature);
+            }
+            let mut body = Writer::new();
+            body.u64(123456);
+            body.u32(0);
+            body.bytes(tlvs.encode(None).unwrap());
+            assert!(
+                decode_qr_confirmation(&mut Reader::new(body.data), &Keystore::default(), &mode,)
+                    .is_err()
+            );
+        }
+    }
+}

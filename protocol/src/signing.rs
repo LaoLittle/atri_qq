@@ -1,0 +1,836 @@
+//! Session signing state and device resources.
+use crate::{
+    Error, Result,
+    models::{SessionState, random_bytes},
+    o3,
+};
+use ::signing::{
+    self as signing_engine, Context, SecureInfo, SignResources, Signer,
+    extra::ExtraEntropy,
+    metadata::{EntropyRead, MetadataResources},
+    token::{
+        AcquisitionMode, DeviceProperties, ReportDelivery, ReportResponse, TokenError,
+        TokenResources, XwidAcquisition,
+    },
+};
+use rand::RngCore;
+use std::{
+    collections::VecDeque,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+mod commands {
+    include!("signed_commands.rs");
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SigningReport {
+    pub method: String,
+    pub account: Vec<u8>,
+    pub body: Vec<u8>,
+    /// Captured lifecycle generation; stale asynchronous replies must be rejected.
+    pub generation: u64,
+    /// Inventory snapshot version; only SsoReport depends on this resource.
+    pub report_resources_generation: u64,
+}
+struct LocalDeviceIdentity {
+    machine_id: String,
+    guid: [u8; 16],
+    device_name: String,
+}
+
+/// Trusted external observations override the whole local map, never merge with it.
+/// None clears the override and restores the session's conservative local defaults.
+#[derive(Default)]
+pub struct SigningResources {
+    pub properties: Option<DeviceProperties>,
+    pub persistent_xwid_switch: Option<Vec<u8>>,
+    pub report_module_paths: Option<Vec<String>>,
+    report_resources_generation: u64,
+    reports: VecDeque<SigningReport>,
+    local_properties: Option<DeviceProperties>,
+    local_identity: Option<LocalDeviceIdentity>,
+    generation: u64,
+}
+impl ExtraEntropy for SigningResources {
+    type Error = Error;
+    fn clock_ns(&mut self) -> Result<u64> {
+        let elapsed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| Error::Crypto(e.to_string()))?;
+        u64::try_from(elapsed.as_nanos())
+            .map_err(|_| Error::Crypto("Wall clock exceeds u64 nanoseconds".into()))
+    }
+    fn random_u32(&mut self) -> Result<u32> {
+        Ok(rand::rngs::OsRng.next_u32())
+    }
+}
+impl TokenResources for SigningResources {
+    fn unix_seconds(&mut self) -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs().min(i64::MAX as u64) as i64)
+    }
+    fn persistent_xwid_switch(&mut self) -> std::result::Result<Option<&[u8]>, TokenError> {
+        Ok(self.persistent_xwid_switch.as_deref())
+    }
+    fn acquire_xwid(
+        &mut self,
+        _mode: AcquisitionMode,
+    ) -> std::result::Result<Option<XwidAcquisition>, TokenError> {
+        Ok(Some(XwidAcquisition::native_default(
+            self.unix_seconds(),
+            0,
+        )))
+    }
+    fn collect_properties(&mut self) -> std::result::Result<DeviceProperties, TokenError> {
+        let properties = self
+            .properties
+            .as_ref()
+            .or(self.local_properties.as_ref())
+            .ok_or_else(|| TokenError::Resource {
+                operation: "collect_properties",
+                message: "O3 session device resources have not been initialized".into(),
+            })?;
+        o3::validate_properties(properties)?;
+        Ok(properties.clone())
+    }
+    fn send_report(
+        &mut self,
+        method: &str,
+        account: &[u8],
+        packet: &[u8],
+    ) -> std::result::Result<ReportDelivery, TokenError> {
+        if self.reports.len() >= 64 {
+            return Err(TokenError::Resource {
+                operation: "send_report",
+                message: "Pending O3 report queue is full".into(),
+            });
+        }
+        self.reports.push_back(SigningReport {
+            method: method.into(),
+            account: account.into(),
+            body: packet.into(),
+            generation: self.generation,
+            report_resources_generation: self.report_resources_generation,
+        });
+        Ok(ReportDelivery::Pending)
+    }
+}
+impl SignResources for SigningResources {
+    fn metadata_resources(&mut self, needs_entropy: bool) -> Result<MetadataResources> {
+        let entropy_read = if needs_entropy {
+            let mut bytes = [0; 16];
+            rand::rngs::OsRng.fill_bytes(&mut bytes);
+            EntropyRead::Complete(bytes)
+        } else {
+            EntropyRead::Unavailable
+        };
+        let checksum_seconds = self.unix_seconds() as u32;
+        let trailer_seconds = self.unix_seconds() as u32;
+        Ok(MetadataResources {
+            checksum_seconds,
+            trailer_seconds,
+            entropy_read,
+        })
+    }
+}
+pub struct SessionSigner {
+    signer: Signer,
+    resources: SigningResources,
+    account: Option<u64>,
+    empty_token_reported: bool,
+    verify_file_reported: bool,
+}
+impl Default for SessionSigner {
+    fn default() -> Self {
+        Self {
+            signer: Signer::default(),
+            resources: SigningResources::default(),
+            account: None,
+            empty_token_reported: false,
+            verify_file_reported: false,
+        }
+    }
+}
+impl SessionSigner {
+    pub fn requires_signature(command: &str) -> bool {
+        commands::SIGNED_COMMANDS.contains(&command)
+    }
+    pub fn initialize(&mut self, state: &SessionState) -> Result<()> {
+        let local_identity_changed =
+            self.resources
+                .local_identity
+                .as_ref()
+                .is_none_or(|identity| {
+                    identity.machine_id != state.machine_id
+                        || identity.guid.as_slice() != state.keystore.guid.as_slice()
+                        || identity.device_name != state.keystore.device_name
+                });
+        if local_identity_changed {
+            let properties = o3::local_device_properties(state)?;
+            let guid = state.keystore.guid.as_slice().try_into().map_err(|_| {
+                Error::Malformed(
+                    "O3 local application UUID requires a sixteen-byte device GUID".into(),
+                )
+            })?;
+            self.resources.local_properties = Some(properties);
+            self.resources.local_identity = Some(LocalDeviceIdentity {
+                machine_id: state.machine_id.clone(),
+                guid,
+                device_name: state.keystore.device_name.clone(),
+            });
+        }
+        if self.resources.persistent_xwid_switch.is_none() {
+            if let Some(value) = state.keystore.o3_xwid_switch {
+                self.resources.persistent_xwid_switch = Some(value.to_string().into_bytes());
+            }
+        }
+        let account = self.account.unwrap_or(0);
+        if self.account.is_none()
+            || self.signer.context().qua != state.profile.qua.as_bytes()
+            || self.signer.context().machine_id != state.machine_id.as_bytes()
+        {
+            self.initialize_account(account, state)?;
+        }
+        Ok(())
+    }
+    fn initialize_account(&mut self, account: u64, state: &SessionState) -> Result<()> {
+        if self.account != Some(account) {
+            self.resources.generation = self.resources.generation.wrapping_add(1);
+            self.verify_file_reported = false;
+        }
+        self.signer
+            .initialize(
+                Context::new(
+                    account.to_string().into_bytes(),
+                    state.profile.qua.as_bytes().to_vec(),
+                    state.machine_id.as_bytes().to_vec(),
+                ),
+                &mut self.resources,
+            )
+            .map_err(|e| Error::Crypto(format!("Signer initialization: {e:?}")))?;
+        self.account = Some(account);
+        let generation = self.resources.generation;
+        let account = &self.signer.context().uin;
+        self.resources
+            .reports
+            .retain(|report| report.generation == generation && report.account == *account);
+        Ok(())
+    }
+
+    pub fn begin_login(&mut self, state: &SessionState) -> Result<()> {
+        self.initialize(state)?;
+        self.resources.generation = self.resources.generation.wrapping_add(1);
+        self.empty_token_reported = false;
+        self.verify_file_reported = false;
+        self.initialize_account(0, state)
+    }
+    /// Invoke after real login tickets are available, before establishing O3's
+    /// channel. QR confirmation alone is too early (wtlogin.login still uses 0).
+    pub fn ticket_complete(&mut self, state: &SessionState) -> Result<()> {
+        if state.keystore.uin == 0 {
+            return Err(Error::Malformed(
+                "Cannot bind O3 signer to anonymous login tickets".into(),
+            ));
+        }
+        self.initialize(state)?;
+        if self.account != Some(state.keystore.uin) {
+            self.empty_token_reported = false;
+            self.initialize_account(state.keystore.uin, state)?;
+        }
+        let account = state.keystore.uin.to_string().into_bytes();
+        let has_token = self
+            .signer
+            .tokens
+            .account_token(&account)
+            .is_some_and(|token| {
+                !token.bytes.is_empty() && token.expires_at > self.resources.unix_seconds()
+            });
+        if !has_token && !self.empty_token_reported {
+            if self.resources.reports.len() >= 64 {
+                return Err(Error::Crypto("Pending O3 report queue is full".into()));
+            }
+            self.resources.reports.push_back(SigningReport {
+                method: o3::REPORT_COMMAND.into(),
+                account,
+                body: o3::empty_token_telemetry(state),
+                generation: self.resources.generation,
+                report_resources_generation: self.resources.report_resources_generation,
+            });
+            self.empty_token_reported = true;
+        }
+        Ok(())
+    }
+    /// Queue synthetic file telemetry only after successful online registration.
+    /// Retries within one login must not replay it or create account tokens.
+    pub(crate) fn registration_complete(&mut self, state: &SessionState) -> Result<()> {
+        if state.keystore.uin == 0 || self.account != Some(state.keystore.uin) {
+            return Err(Error::Malformed(
+                "Cannot report file telemetry before signer ticket binding".into(),
+            ));
+        }
+        if self.verify_file_reported {
+            return Ok(());
+        }
+        if self.resources.reports.len() >= 64 {
+            return Err(Error::Crypto("Pending O3 report queue is full".into()));
+        }
+        self.resources.reports.push_back(SigningReport {
+            method: o3::REPORT_COMMAND.into(),
+            account: state.keystore.uin.to_string().into_bytes(),
+            body: o3::verify_file_telemetry(state, self.resources.report_module_paths.as_deref()),
+            generation: self.resources.generation,
+            report_resources_generation: self.resources.report_resources_generation,
+        });
+        self.verify_file_reported = true;
+        Ok(())
+    }
+    pub fn generation(&self) -> u64 {
+        self.resources.generation
+    }
+    pub fn report_is_current(&self, report: &SigningReport) -> bool {
+        report.generation == self.resources.generation
+            && self.signer.context().uin == report.account
+            && (report.method != o3::REPORT_COMMAND
+                || report.report_resources_generation == self.resources.report_resources_generation)
+    }
+    pub fn sign(
+        &mut self,
+        command: &str,
+        sequence: i32,
+        body: &[u8],
+        state: &SessionState,
+        randomize_for_testing: bool,
+    ) -> Result<Option<SecureInfo>> {
+        if !Self::requires_signature(command) {
+            return Ok(None);
+        }
+        self.initialize(state)?;
+        let mut signature = self
+            .signer
+            .sign(command, sequence, body, &mut self.resources)
+            .map_err(|e| Error::Crypto(format!("Native signer: {e:?}")))?;
+        if randomize_for_testing {
+            signature.sign = match signature.sign {
+                signing_engine::Signature::Empty => signing_engine::Signature::Empty,
+                signing_engine::Signature::Sequence(_) => {
+                    signing_engine::Signature::Sequence(random_bytes(16).try_into().unwrap())
+                }
+                signing_engine::Signature::Full(_) => {
+                    signing_engine::Signature::Full(random_bytes(48).try_into().unwrap())
+                }
+            };
+            rand::rngs::OsRng.fill_bytes(&mut signature.token);
+        }
+        Ok(Some(signature))
+    }
+    /// Replace explicit session resources. Inventory updates invalidate outstanding
+    /// telemetry snapshots, not getToken transport or its pending state. They do
+    /// not replay an already emitted event; the next login uses the new inventory.
+    pub fn set_resources(
+        &mut self,
+        properties: Option<DeviceProperties>,
+        persistent_xwid_switch: Option<Vec<u8>>,
+        report_module_paths: Option<Vec<String>>,
+    ) -> Result<()> {
+        if let Some(paths) = &report_module_paths {
+            o3::validate_report_module_paths(paths)?;
+        }
+        if self.resources.report_module_paths != report_module_paths {
+            self.resources.report_resources_generation =
+                self.resources.report_resources_generation.wrapping_add(1);
+            self.resources
+                .reports
+                .retain(|report| report.method != o3::REPORT_COMMAND);
+        }
+        self.resources.properties = properties;
+        self.resources.persistent_xwid_switch = persistent_xwid_switch;
+        self.resources.report_module_paths = report_module_paths;
+        Ok(())
+    }
+    pub(crate) fn poll_token(&mut self) -> Result<()> {
+        if self.account.unwrap_or_default() == 0 {
+            return Ok(());
+        }
+        self.signer
+            .poll_token(&mut self.resources)
+            .map_err(|error| Error::Crypto(format!("O3 token refresh: {error:?}")))
+    }
+
+    pub(crate) fn cancel_token_reports(&mut self) {
+        self.resources
+            .reports
+            .retain(|report| report.method != "getToken");
+        if self.signer.tokens.report_pending() {
+            let _ = self.signer.tokens.complete_report(
+                &[],
+                ReportResponse {
+                    bytes: Vec::new(),
+                    transport_succeeded: false,
+                    error_code: 999,
+                },
+            );
+        }
+    }
+
+    pub(crate) fn refresh_token_task(&mut self) -> Result<()> {
+        self.signer
+            .tokens
+            .refresh_active_account(&mut self.resources)
+            .map_err(|error| Error::Crypto(format!("O3 background token task: {error:?}")))
+    }
+
+    pub(crate) fn channel_report(&self, method: &str, body: Vec<u8>) -> SigningReport {
+        SigningReport {
+            method: method.into(),
+            account: self.signer.context().uin.clone(),
+            body,
+            generation: self.resources.generation,
+            report_resources_generation: self.resources.report_resources_generation,
+        }
+    }
+
+    pub(crate) fn apply_channel_config(&mut self, config: &crate::proto::o3::ChannelConfig) {
+        self.signer.sign_enabled = config.option2 != 0;
+        self.signer.tokens.set_xwid_selector(config.option6 as i32);
+        self.resources.persistent_xwid_switch = Some(config.option6.to_string().into_bytes());
+    }
+
+    pub(crate) fn drain_token_reports(&mut self) -> Vec<SigningReport> {
+        let mut reports = Vec::new();
+        for _ in 0..self.resources.reports.len() {
+            let report = self.resources.reports.pop_front().unwrap();
+            if report.method == "getToken" {
+                reports.push(report);
+            } else {
+                self.resources.reports.push_back(report);
+            }
+        }
+        reports
+    }
+
+    pub fn drain_reports(&mut self) -> Vec<SigningReport> {
+        self.resources.reports.drain(..).collect()
+    }
+    /// Drain only sendable telemetry. Raw getToken payloads remain available to
+    /// the trusted encrypted-channel adapter; they are not SsoReport bodies.
+    pub fn drain_telemetry_reports(&mut self) -> Vec<SigningReport> {
+        let mut telemetry = Vec::new();
+        for _ in 0..self.resources.reports.len() {
+            let report = self.resources.reports.pop_front().unwrap();
+            if report.method == o3::REPORT_COMMAND {
+                telemetry.push(report);
+            } else {
+                self.resources.reports.push_back(report);
+            }
+        }
+        telemetry
+    }
+    pub fn complete_report(
+        &mut self,
+        report: &SigningReport,
+        response: ReportResponse,
+    ) -> Result<()> {
+        if !self.report_is_current(report) {
+            return Err(Error::Crypto(
+                "Stale O3 report account or lifecycle generation".into(),
+            ));
+        }
+        if report.method == o3::REPORT_COMMAND {
+            return o3::complete_telemetry(&response);
+        }
+        if report.method != "getToken" {
+            return Err(Error::Malformed("Unknown O3 report method".into()));
+        }
+        self.signer
+            .tokens
+            .complete_report(&report.account, response)
+            .map_err(|e| Error::Crypto(format!("O3 report: {e:?}")))
+    }
+    pub fn complete_xwid(&mut self, acquisition: XwidAcquisition) {
+        self.signer.tokens.complete_xwid(acquisition)
+    }
+    pub fn take_token_error(&mut self) -> Option<TokenError> {
+        self.signer.take_token_error()
+    }
+    pub fn set_footer_seed(&mut self, seed: &[u8; 48]) {
+        self.signer.set_footer_seed(seed)
+    }
+    pub fn answer_property_challenge(&mut self, requested: &[u8]) -> Result<Vec<u8>> {
+        self.signer
+            .tokens
+            .answer_property_challenge(requested, &mut self.resources)
+            .map_err(|e| Error::Crypto(format!("O3 properties: {e:?}")))
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{Keystore, Profile};
+    fn state(uin: u64) -> SessionState {
+        SessionState {
+            profile: Profile::linux(),
+            keystore: Keystore {
+                uin,
+                ..Default::default()
+            },
+            machine_id: "explicit-machine-id".into(),
+            online: false,
+        }
+    }
+    #[test]
+    fn anonymous_signer_does_not_bind_to_qr_account_until_tickets_complete() {
+        let mut signer = SessionSigner::default();
+        let state = state(12345678);
+        signer
+            .sign("wtlogin.login", 17, b"request", &state, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(signer.signer.context().uin, b"0");
+        assert!(signer.take_token_error().is_none());
+        assert!(signer.drain_reports().is_empty());
+        let counter = signer.signer.command_policy.counter();
+        signer.ticket_complete(&state).unwrap();
+        assert_eq!(
+            signer.signer.context().uin,
+            state.keystore.uin.to_string().as_bytes()
+        );
+        assert_eq!(signer.signer.command_policy.counter(), counter);
+        let reports = signer.drain_reports();
+        assert_eq!(reports.len(), 2);
+        assert!(
+            reports
+                .iter()
+                .all(|report| signer.report_is_current(report))
+        );
+        assert_eq!(reports[0].method, "getToken");
+        assert_eq!(reports[1].method, o3::REPORT_COMMAND);
+        signer.ticket_complete(&state).unwrap();
+        assert!(signer.drain_reports().is_empty());
+    }
+    #[test]
+    fn file_telemetry_is_once_per_login_and_old_replies_are_rejected() {
+        let mut signer = SessionSigner::default();
+        let state = state(1234);
+        assert!(signer.registration_complete(&state).is_err());
+        signer.ticket_complete(&state).unwrap();
+        signer.drain_reports();
+        signer.registration_complete(&state).unwrap();
+        let first = signer.drain_reports().pop().unwrap();
+        signer.registration_complete(&state).unwrap();
+        assert!(signer.drain_reports().is_empty());
+        signer.begin_login(&state).unwrap();
+        assert!(!signer.report_is_current(&first));
+        assert!(
+            signer
+                .complete_report(
+                    &first,
+                    ReportResponse {
+                        bytes: vec![],
+                        transport_succeeded: true,
+                        error_code: 0,
+                    }
+                )
+                .is_err()
+        );
+        assert!(signer.registration_complete(&state).is_err());
+        signer.ticket_complete(&state).unwrap();
+        signer.drain_reports();
+        signer.registration_complete(&state).unwrap();
+        let current = signer.drain_reports().pop().unwrap();
+        assert!(signer.report_is_current(&current));
+        assert_ne!(first.generation, current.generation);
+        assert!(signer.signer.tokens.account_token(b"1234").is_none());
+    }
+    #[test]
+    fn inventory_snapshots_replace_per_session_and_bind_pending_telemetry_only() {
+        use prost::Message;
+        let mut a = SessionSigner::default();
+        let mut b = SessionSigner::default();
+        let state = state(1234);
+        let inventory = vec![
+            "/trusted/modules/z.js".into(),
+            "/trusted/modules/a.js".into(),
+        ];
+        a.set_resources(None, None, Some(inventory.clone()))
+            .unwrap();
+        a.ticket_complete(&state).unwrap();
+        let pending = a.drain_reports();
+        let token = pending
+            .iter()
+            .find(|report| report.method == "getToken")
+            .unwrap();
+        let telemetry = pending
+            .iter()
+            .find(|report| report.method == o3::REPORT_COMMAND)
+            .unwrap();
+        a.registration_complete(&state).unwrap();
+        let first = a.drain_reports().pop().unwrap();
+        let decode_paths = |report: &SigningReport| -> Vec<String> {
+            let report = crate::proto::o3::TelemetryReport::decode(report.body.as_slice()).unwrap();
+            serde_json::from_str(&report.data[0].values[4]).unwrap()
+        };
+        assert_eq!(decode_paths(&first), inventory);
+        a.set_resources(None, None, Some(vec![])).unwrap();
+        assert!(!a.report_is_current(telemetry));
+        assert!(!a.report_is_current(&first));
+        assert!(
+            a.complete_report(
+                &first,
+                ReportResponse {
+                    bytes: vec![],
+                    transport_succeeded: true,
+                    error_code: 0
+                },
+            )
+            .is_err()
+        );
+        assert!(a.report_is_current(token));
+        assert!(a.signer.tokens.report_pending());
+        a.registration_complete(&state).unwrap();
+        assert!(
+            a.drain_reports().is_empty(),
+            "resource changes must not replay events"
+        );
+        a.begin_login(&state).unwrap();
+        a.ticket_complete(&state).unwrap();
+        a.drain_reports();
+        a.registration_complete(&state).unwrap();
+        assert!(decode_paths(&a.drain_reports().pop().unwrap()).is_empty());
+        b.ticket_complete(&state).unwrap();
+        b.drain_reports();
+        b.registration_complete(&state).unwrap();
+        let defaults = decode_paths(&b.drain_reports().pop().unwrap());
+        assert_ne!(defaults, inventory);
+        assert!(!defaults.is_empty());
+        a.set_resources(None, None, None).unwrap();
+        a.begin_login(&state).unwrap();
+        a.ticket_complete(&state).unwrap();
+        a.drain_reports();
+        a.registration_complete(&state).unwrap();
+        assert_eq!(decode_paths(&a.drain_reports().pop().unwrap()), defaults);
+    }
+    #[test]
+    fn invalid_inventory_is_atomic_and_identical_inventory_keeps_pending_binding() {
+        let mut signer = SessionSigner::default();
+        let state = state(1234);
+        let inventory = Some(vec!["/trusted/module.js".into()]);
+        let properties = DeviceProperties::from([(7, b"original".to_vec())]);
+        signer
+            .set_resources(Some(properties.clone()), None, inventory.clone())
+            .unwrap();
+        signer.ticket_complete(&state).unwrap();
+        signer.drain_reports();
+        signer.registration_complete(&state).unwrap();
+        let report = signer.drain_reports().pop().unwrap();
+        signer
+            .set_resources(Some(properties.clone()), None, inventory)
+            .unwrap();
+        assert!(signer.report_is_current(&report));
+        for paths in [
+            vec![String::new()],
+            vec!["/trusted/\0module".into()],
+            vec!["x".repeat(1024 * 1024 + 1)],
+            vec!["x".into(); 4097],
+        ] {
+            assert!(
+                signer
+                    .set_resources(Some(DeviceProperties::new()), None, Some(paths))
+                    .is_err()
+            );
+            assert_eq!(signer.resources.collect_properties().unwrap(), properties);
+            assert!(signer.report_is_current(&report));
+        }
+        signer.registration_complete(&state).unwrap();
+        assert!(signer.drain_reports().is_empty());
+    }
+    #[test]
+    fn independent_bots_do_not_share_native_signing_state() {
+        let mut a = SessionSigner::default();
+        let mut b = SessionSigner::default();
+        a.sign("wtlogin.login", 1, b"a", &state(1234), false)
+            .unwrap();
+        b.sign("wtlogin.login", 2, b"b", &state(5678), false)
+            .unwrap();
+        a.sign("wtlogin.login", 3, b"c", &state(1234), false)
+            .unwrap();
+        assert_eq!(a.signer.command_policy.counter(), 2);
+        assert_eq!(b.signer.command_policy.counter(), 1);
+    }
+    #[test]
+    fn explicit_overrides_replace_defaults_and_none_restores_local_identity() {
+        let mut signer = SessionSigner::default();
+        let state = state(1234);
+        signer.initialize(&state).unwrap();
+        let defaults = signer.resources.collect_properties().unwrap();
+        let overrides = DeviceProperties::from([(999, b"external-observation".to_vec())]);
+        signer
+            .set_resources(Some(overrides.clone()), None, None)
+            .unwrap();
+        assert_eq!(signer.resources.collect_properties().unwrap(), overrides);
+        signer
+            .set_resources(Some(DeviceProperties::new()), None, None)
+            .unwrap();
+        assert!(signer.resources.collect_properties().unwrap().is_empty());
+        // None resets only the external override, not the session's local identity.
+        signer.set_resources(None, None, None).unwrap();
+        signer.initialize(&state).unwrap();
+        assert_eq!(signer.resources.collect_properties().unwrap(), defaults);
+    }
+    #[test]
+    fn local_property_challenges_follow_device_identity_updates() {
+        use prost::Message;
+
+        fn property(signer: &mut SessionSigner, id: i16) -> Vec<u8> {
+            let answer = signer.answer_property_challenge(&id.to_be_bytes()).unwrap();
+            signing_engine::proto::TokenReport::decode(answer.as_slice())
+                .unwrap()
+                .properties
+                .remove(0)
+                .value
+        }
+
+        let mut signer = SessionSigner::default();
+        let mut state = state(1234);
+        signer.initialize(&state).unwrap();
+        state.machine_id = "updated-device-id".into();
+        signer.initialize(&state).unwrap();
+        assert_eq!(property(&mut signer, 16), b"updated-device-id");
+        state.keystore.guid.fill(0x22);
+        signer.initialize(&state).unwrap();
+        assert_eq!(
+            property(&mut signer, 39),
+            b"22222222-2222-2222-2222-222222222222"
+        );
+        state.keystore.device_name = "updated-device-name".into();
+        signer.initialize(&state).unwrap();
+        assert_eq!(property(&mut signer, 41), b"updated-device-name");
+        signer
+            .set_resources(
+                Some(DeviceProperties::from([(
+                    16,
+                    b"trusted-device-id".to_vec(),
+                )])),
+                None,
+                None,
+            )
+            .unwrap();
+        state.machine_id = "latest-device-id".into();
+        signer.initialize(&state).unwrap();
+        assert_eq!(property(&mut signer, 16), b"trusted-device-id");
+        signer.set_resources(None, None, None).unwrap();
+        assert_eq!(property(&mut signer, 16), b"latest-device-id");
+    }
+
+    #[test]
+    fn delayed_reports_cannot_publish_into_another_login_generation() {
+        let mut signer = SessionSigner::default();
+        let state = state(1234);
+        signer.ticket_complete(&state).unwrap();
+        let report = signer
+            .drain_reports()
+            .into_iter()
+            .find(|report| report.method == "getToken")
+            .unwrap();
+        signer.begin_login(&state).unwrap();
+        signer.ticket_complete(&state).unwrap();
+        assert!(!signer.report_is_current(&report));
+        assert!(
+            signer
+                .complete_report(
+                    &report,
+                    ReportResponse {
+                        bytes: vec![],
+                        transport_succeeded: true,
+                        error_code: 0,
+                    }
+                )
+                .is_err()
+        );
+        assert!(
+            signer
+                .signer
+                .tokens
+                .account_token(&report.account)
+                .is_none()
+        );
+    }
+    #[test]
+    fn local_challenges_reuse_wrapper_property_serialization() {
+        use prost::Message;
+        let mut signer = SessionSigner::default();
+        let state = state(1234);
+        signer.initialize(&state).unwrap();
+        let answer = signer
+            .answer_property_challenge(&[0, 16, 0, 41, 0, 99])
+            .unwrap();
+        let decoded = signing_engine::proto::TokenReport::decode(answer.as_slice()).unwrap();
+        assert_eq!(decoded.properties.len(), 3);
+        assert_eq!(decoded.properties[0].id, 16);
+        assert_eq!(decoded.properties[0].value, state.machine_id.as_bytes());
+        assert_eq!(decoded.properties[2].id, 99);
+        assert_eq!(decoded.properties[2].value, b"-1");
+        assert!(signer.answer_property_challenge(&[0]).is_err());
+    }
+    #[test]
+    fn empty_telemetry_completion_does_not_clear_token_report_pending() {
+        let mut signer = SessionSigner::default();
+        signer.ticket_complete(&state(1234)).unwrap();
+        let telemetry = signer
+            .drain_reports()
+            .into_iter()
+            .find(|report| report.method == o3::REPORT_COMMAND)
+            .unwrap();
+        assert!(signer.signer.tokens.report_pending());
+        signer
+            .complete_report(
+                &telemetry,
+                ReportResponse {
+                    bytes: vec![],
+                    transport_succeeded: true,
+                    error_code: 0,
+                },
+            )
+            .unwrap();
+        assert!(signer.signer.tokens.report_pending());
+        assert!(signer.signer.tokens.account_token(b"1234").is_none());
+    }
+    #[test]
+    fn repeated_login_attempts_release_stale_report_capacity() {
+        let mut signer = SessionSigner::default();
+        let state = state(1234);
+        for _ in 0..80 {
+            signer.begin_login(&state).unwrap();
+            signer.ticket_complete(&state).unwrap();
+        }
+        let reports = signer.drain_reports();
+        assert!(
+            reports
+                .iter()
+                .all(|report| signer.report_is_current(report))
+        );
+        let current = reports
+            .into_iter()
+            .find(|report| report.method == "getToken")
+            .unwrap();
+        use prost::Message;
+        signer
+            .complete_report(
+                &current,
+                ReportResponse {
+                    bytes: signing_engine::proto::IssuedTokenReply {
+                        token: b"current-attempt".to_vec(),
+                        expires_at: 4_000_000_000,
+                    }
+                    .encode_to_vec(),
+                    transport_succeeded: true,
+                    error_code: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            signer.signer.tokens.account_token(b"1234").unwrap().bytes,
+            b"current-attempt"
+        );
+    }
+}

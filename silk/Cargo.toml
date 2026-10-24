@@ -1,0 +1,10 @@
+[package]
+name = "atri_qq_silk"
+version = "0.1.0"
+edition = "2024"
+description = "Pure Rust SILK_V3 voice encoding and decoding for QQ"
+license = "MIT AND BSD-3-Clause AND BSD-3-Clause-Clear"
+
+[dependencies]
+thiserror = "2"
+opus-rs = "=0.1.39"

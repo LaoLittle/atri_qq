@@ -1,0 +1,10 @@
+[package]
+name = "atri_qq_api"
+version = "1.0.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+atri_core = { path = "../../atri_bot/crates/atri_core" }
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"

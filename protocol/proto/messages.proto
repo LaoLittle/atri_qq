@@ -1,0 +1,108 @@
+syntax = "proto3";
+package atri.qq.messages;
+
+// Common transport boundaries retain original nested payloads for unknown-field preservation.
+message CommonMessage {
+  RoutingHead routing_head = 1;
+  ContentHead content_head = 2;
+  bytes message_body = 3;
+}
+message CommonEnvelope {
+  bytes routing_head = 1;
+  bytes content_head = 2;
+  bytes message_body = 3;
+}
+message RoutingHead {
+  optional uint64 sender_uin = 1;
+  string sender_uid = 2;
+  optional uint32 sender_app_id = 3;
+  optional uint32 sender_instance_id = 4;
+  optional uint64 recipient_uin = 5;
+  string recipient_uid = 6;
+  CommonC2c c2c = 7;
+  CommonGroup group = 8;
+}
+message CommonC2c { optional int64 source = 4; string sender_name = 6; }
+message CommonGroup {
+  optional uint64 uin = 1;
+  optional uint32 group_type = 2;
+  optional uint64 info_sequence = 3;
+  string sender_name = 4;
+  optional uint64 card_type = 5;
+  optional uint32 level = 6;
+  optional bytes name = 7;
+  optional bytes extended_key_info = 8;
+  optional uint32 message_flag = 9;
+}
+message ContentHead {
+  optional uint64 message_type = 1;
+  optional uint64 sub_type = 2;
+  optional uint32 c2c_command = 3;
+  optional uint64 random = 4;
+  // Group server sequence; private sender's client sequence.
+  optional uint64 sequence = 5;
+  optional uint64 time = 6;
+  optional uint32 package_count = 7;
+  optional uint32 package_index = 8;
+  optional uint32 division_sequence = 9;
+  optional uint32 auto_reply = 10;
+  // Private server sequence (NT message sequence).
+  optional uint64 client_sequence = 11;
+  optional uint64 message_id = 12;
+}
+message MessageBody { bytes rich_text = 1; optional bytes content = 2; optional bytes encrypted_content = 3; }
+message RichText {
+  repeated bytes attr = 1;
+  repeated bytes elems = 2;
+  repeated bytes file = 3;
+  repeated bytes voice = 4;
+}
+message Elem {
+  // Repeated raw submessage boundaries retain duplicates and unsupported nested fields.
+  // Every interpreted payload below is decoded using its generated semantic message type.
+  repeated bytes text = 1;
+  repeated bytes friend_image = 4;
+  repeated bytes trans = 5;
+  repeated bytes group_image = 8;
+  repeated bytes flags2 = 9;
+  repeated bytes rich_msg = 12;
+  repeated bytes extra_info = 16;
+  repeated bytes video = 19;
+  repeated bytes general_flags = 37;
+  repeated bytes source_msg = 45;
+  repeated bytes light_app = 51;
+  repeated bytes common = 53;
+}
+message Text { optional string text = 1; bytes reserve = 12; }
+message MentionReserve { optional uint64 kind = 3; optional uint64 uin = 4; optional uint64 zero = 5; string uid = 9; }
+message SourceMsg {
+  repeated uint64 sequences = 1;
+  optional uint64 sender_uin = 2;
+  optional uint32 time = 3;
+  optional uint64 has_elements = 4;
+  repeated bytes elements = 5;
+  SourceReserve reserve = 8;
+}
+message SourceReserve { optional uint64 kind = 2; optional uint64 message_id = 3; string sender_uid = 6; optional uint64 friend_sequence = 8; }
+message SourceEnvelope { bytes reserve = 8; }
+message LightApp { bytes data = 1; }
+message RichMsg { bytes data = 1; optional uint64 service_id = 2; }
+message CommonElem { optional uint64 service_type = 1; bytes payload = 2; optional uint64 business_type = 3; }
+message TransElem { optional uint64 kind = 1; bytes data = 2; }
+message FileEnvelope { bytes file = 1; }
+message FileReference {
+  optional string uuid = 3;
+  bytes md5 = 4;
+  optional string name = 5;
+  optional uint64 size = 6;
+  optional string crc = 57;
+}
+message GroupFileEnvelope { GroupFileBody body = 7; }
+message GroupFileBody { GroupFileInfo info = 2; }
+message GroupFileInfo {
+  optional uint32 business_id = 1;
+  string file_id = 2;
+  optional uint64 size = 3;
+  string name = 4;
+  string md5 = 8;
+}

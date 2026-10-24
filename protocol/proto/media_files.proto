@@ -1,0 +1,375 @@
+syntax = "proto2";
+package atri.qq.media;
+
+message FriendFileRequest {
+  optional uint64 command = 1;
+  optional uint64 sequence = 2;
+  optional FriendFileDownloadRequest download = 14;
+  optional FriendFileUploadRequest upload = 19;
+  optional uint64 business_id = 101;
+  optional uint64 client_type = 102;
+  optional uint64 request_flag = 200;
+  optional bytes extension = 99999;
+}
+message FriendFileResponse {
+  optional FriendFileDownloadResponse download = 14;
+  optional FriendFileUploadResponse upload = 19;
+}
+message FriendFileUploadRequest {
+  optional string sender_uid = 10;
+  optional string receiver_uid = 20;
+  optional uint64 size = 30;
+  optional string name = 40;
+  optional bytes md5_10m = 50;
+  optional bytes sha1 = 60;
+  optional string parent_directory = 70;
+  optional bytes md5 = 110;
+  optional bytes tri_sha1 = 120;
+}
+message FriendFileUploadResponse {
+  optional uint64 result_code = 10;
+  optional bytes result_message = 20;
+  optional bytes file_id = 90;
+  optional uint64 exists = 110;
+  optional bytes file_id_crc = 200;
+  repeated FriendFileUploadAddress addresses = 210;
+  optional bytes upload_key = 220;
+}
+message FriendFileUploadAddress {
+  optional uint64 ipv4 = 3;
+  optional uint64 port = 4;
+}
+message FriendFileDownloadRequest {
+  optional string receiver_uid = 10;
+  optional string file_id = 20;
+  optional uint64 url_type = 30;
+  optional string md5_hex = 60;
+  optional uint64 download_flag = 601;
+}
+message FriendFileDownloadResponse {
+  optional uint64 result_code = 10;
+  optional bytes result_message = 20;
+  optional FriendFileDownloadLocation location = 30;
+}
+message FriendFileDownloadLocation {
+  optional bytes host = 20;
+  optional uint64 port = 40;
+  optional bytes path = 50;
+}
+message OfflineFileCompatibility {
+  optional uint64 file_type = 1;
+  optional bytes file_uuid = 3;
+  optional bytes md5 = 4;
+  optional bytes name = 5;
+  optional uint64 size = 6;
+  optional uint64 subcommand = 9;
+  optional uint64 danger_level = 50;
+  optional uint64 expiry_time = 55;
+  optional bytes file_id_crc = 57;
+}
+message FriendFileSendRequest {
+  optional FriendFileRoute route = 1;
+  optional FriendFileContentHead content_head = 2;
+  optional FriendFileSendBody body = 3;
+  optional uint64 sequence = 4;
+  optional uint64 random = 5;
+}
+message FriendFileRoute { optional FriendFilePeer peer = 15; }
+message FriendFilePeer {
+  optional uint64 uin = 1;
+  optional uint64 command = 2;
+  optional string uid = 8;
+}
+message FriendFileContentHead {
+  optional uint64 packages = 1;
+  optional uint64 package_index = 2;
+  optional uint64 division_sequence = 3;
+  optional uint64 auto_reply = 4;
+}
+message FriendFileSendBody { optional FriendFileRawContent content = 2; }
+message FriendFileRawContent { optional bytes offline_file = 1; }
+message FriendFileSendResponse {
+  optional uint64 result_code = 1;
+  optional bytes result_message = 2;
+  optional uint64 time = 3;
+  optional uint64 sequence = 11;
+  optional uint64 client_sequence = 14;
+}
+message GroupFileCommandRequest {
+  optional GroupFileUploadRequest upload = 1;
+  optional GroupFileDownloadRequest download = 3;
+  optional GroupFileDeleteRequest delete = 4;
+  optional GroupFileRenameRequest rename = 5;
+  optional GroupFileMoveRequest move = 6;
+}
+message GroupFileCommandResponse {
+  optional GroupFileUploadResponse upload = 1;
+  optional GroupFileDownloadResponse download = 3;
+  optional GroupFileMutationResult delete = 4;
+  optional GroupFileMutationResult rename = 5;
+  optional GroupFileMutationResult move = 6;
+}
+message GroupFileUploadRequest {
+  optional uint64 group_uin = 1;
+  optional uint64 app_id = 2;
+  optional uint64 bus_id = 3;
+  optional uint64 entrance = 4;
+  optional string parent_directory = 5;
+  optional string name = 6;
+  optional string local_path = 7;
+  optional uint64 size = 8;
+  optional bytes sha1 = 9;
+  optional bytes tri_sha1 = 10;
+  optional bytes md5 = 11;
+}
+message GroupFileUploadResponse {
+  optional uint64 result_code = 1;
+  optional bytes result_message = 2;
+  optional bytes host = 4;
+  optional bytes file_id = 7;
+  optional bytes checksum = 8;
+  optional bytes upload_key = 9;
+  optional uint64 exists = 10;
+  optional uint64 port = 14;
+}
+message GroupFileDownloadRequest {
+  optional uint64 group_uin = 1;
+  optional uint64 app_id = 2;
+  optional uint64 bus_id = 3;
+  optional string file_id = 4;
+}
+message GroupFileDownloadResponse {
+  optional uint64 result_code = 1;
+  optional bytes result_message = 2;
+  optional bytes host = 5;
+  optional bytes key = 6;
+}
+message GroupFileDeleteRequest {
+  optional uint64 group_uin = 1;
+  optional uint64 app_id = 2;
+  optional uint64 bus_id = 3;
+  optional string parent_directory = 4;
+  optional string file_id = 5;
+}
+message GroupFileRenameRequest {
+  optional uint64 group_uin = 1;
+  optional uint64 app_id = 2;
+  optional uint64 bus_id = 3;
+  optional string file_id = 4;
+  optional string parent_directory = 5;
+  optional string name = 6;
+}
+message GroupFileMoveRequest {
+  optional uint64 group_uin = 1;
+  optional uint64 app_id = 2;
+  optional uint64 bus_id = 3;
+  optional string file_id = 4;
+  optional string parent_directory = 5;
+  optional string destination_directory = 6;
+}
+message GroupFileMutationResult {
+  optional uint64 result_code = 1;
+  optional bytes result_message = 2;
+}
+message GroupFileFeedRequest { optional GroupFileFeedBody body = 5; }
+message GroupFileFeedBody {
+  optional uint64 group_uin = 1;
+  optional uint64 app_id = 2;
+  optional GroupFileFeed file = 3;
+}
+message GroupFileFeed {
+  optional uint64 bus_id = 1;
+  optional string file_id = 2;
+  optional uint64 random = 3;
+  optional uint64 send_flag = 5;
+}
+message GroupFileFeedResponse { optional GroupFileFeedResult result = 5; }
+message GroupFileFeedResult {
+  optional uint64 result_code = 1;
+  optional bytes result_message = 2;
+  repeated GroupFileMutationResult files = 4;
+}
+message FileUploadExtension {
+  optional uint64 command = 1;
+  optional uint64 version = 2;
+  optional FileUploadEntry entry = 100;
+  optional uint64 friend_flag = 200;
+}
+message FileUploadEntry {
+  optional FileUploadBusiness business = 100;
+  optional FileUploadMetadata file = 200;
+  optional FileUploadClient client = 300;
+  optional FileUploadName name = 400;
+  optional FileUploadHosts hosts = 500;
+}
+message FileUploadBusiness {
+  optional uint64 sender_uin = 100;
+  optional uint64 group_uin = 200;
+  optional uint64 receiver_uin = 400;
+}
+message FileUploadMetadata {
+  optional uint64 size = 100;
+  optional bytes md5 = 200;
+  optional bytes checksum = 300;
+  optional bytes md5_10m = 400;
+  optional bytes tri_sha1 = 500;
+  optional string file_id = 600;
+  optional bytes upload_key = 700;
+}
+message FileUploadClient {
+  optional uint64 client_type = 100;
+  optional string app_id = 200;
+  optional uint64 terminal_type = 300;
+  optional string version = 400;
+  optional uint64 protocol_version = 600;
+}
+message FileUploadName { optional string name = 100; }
+message FileUploadHosts { repeated FileUploadHost hosts = 200; }
+message FileUploadHost {
+  optional FileUploadAddress address = 1;
+  optional uint64 port = 2;
+}
+message FileUploadAddress {
+  optional uint64 address_type = 1;
+  optional string host = 2;
+}
+message GroupFsRequest {
+  optional GroupFsInfoRequest info = 1;
+  optional GroupFsListRequest list = 2;
+  optional GroupFsCountRequest count = 3;
+  optional GroupFsSpaceRequest space = 4;
+}
+message GroupFsResponse {
+  optional GroupFsInfoResponse info = 1;
+  optional GroupFsListResponse list = 2;
+  optional GroupFsCountResponse count = 3;
+  optional GroupFsSpaceResponse space = 4;
+}
+message GroupFsInfoRequest {
+  optional uint64 group_uin = 1;
+  optional uint64 app_id = 2;
+  optional uint64 bus_id = 3;
+  optional string file_id = 4;
+  optional uint64 field_mask = 5;
+}
+message GroupFsInfoResponse {
+  optional uint64 result_code = 1;
+  optional bytes result_message = 2;
+  optional GroupFsFile file = 4;
+}
+message GroupFsListRequest {
+  optional uint64 group_uin = 1;
+  optional uint64 app_id = 2;
+  optional string directory = 3;
+  optional uint64 count = 5;
+  optional uint64 sort_order = 9;
+  optional uint64 field_mask = 12;
+  optional uint64 start_index = 13;
+  optional bytes context = 14;
+  optional uint64 client_type = 17;
+  optional uint64 list_flag = 18;
+}
+message GroupFsListResponse {
+  optional uint64 result_code = 1;
+  optional bytes result_message = 2;
+  optional uint64 is_end = 4;
+  repeated GroupFsEntry entries = 5;
+  optional uint64 next_index = 13;
+  optional bytes context = 14;
+}
+message GroupFsEntry {
+  optional uint64 entry_type = 1;
+  optional GroupFsFolder folder = 2;
+  optional GroupFsFile file = 3;
+}
+message GroupFsFile {
+  optional bytes id = 1;
+  optional bytes name = 2;
+  optional uint64 size = 3;
+  optional uint64 bus_id = 4;
+  optional uint64 uploaded_size = 5;
+  optional uint64 upload_time = 6;
+  optional uint64 expiry_time = 7;
+  optional uint64 modify_time = 8;
+  optional uint64 download_count = 9;
+  optional bytes sha1 = 10;
+  optional bytes tri_sha1 = 11;
+  optional bytes md5 = 12;
+  optional bytes uploader_name = 14;
+  optional uint64 uploader_uin = 15;
+  optional bytes parent_id = 16;
+}
+message GroupFsFolder {
+  optional bytes id = 1;
+  optional bytes parent_id = 2;
+  optional bytes name = 3;
+  optional uint64 create_time = 4;
+  optional uint64 modify_time = 5;
+  optional uint64 creator_uin = 6;
+  optional bytes creator_name = 7;
+  optional uint64 file_count = 8;
+  optional uint64 used_space = 11;
+}
+message GroupFsCountRequest {
+  optional uint64 group_uin = 1;
+  optional uint64 app_id = 2;
+  optional uint64 bus_id = 3;
+}
+message GroupFsCountResponse {
+  optional uint64 result_code = 1;
+  optional bytes result_message = 2;
+  optional uint64 count = 4;
+  optional uint64 limit = 6;
+  optional uint64 is_full = 7;
+}
+message GroupFsSpaceRequest {
+  optional uint64 group_uin = 1;
+  optional uint64 app_id = 2;
+}
+message GroupFsSpaceResponse {
+  optional uint64 result_code = 1;
+  optional bytes result_message = 2;
+  optional uint64 total = 4;
+  optional uint64 used = 5;
+}
+message GroupDirectoryRequest {
+  optional GroupDirectoryCreateRequest create = 1;
+  optional GroupDirectoryDeleteRequest delete = 2;
+  optional GroupDirectoryRenameRequest rename = 3;
+  optional GroupDirectoryMoveRequest move = 4;
+}
+message GroupDirectoryResponse {
+  optional GroupDirectoryResult create = 1;
+  optional GroupDirectoryResult delete = 2;
+  optional GroupDirectoryResult rename = 3;
+  optional GroupDirectoryResult move = 4;
+}
+message GroupDirectoryCreateRequest {
+  optional uint64 group_uin = 1;
+  optional uint64 app_id = 2;
+  optional string parent_directory = 3;
+  optional string name = 4;
+}
+message GroupDirectoryDeleteRequest {
+  optional uint64 group_uin = 1;
+  optional uint64 app_id = 2;
+  optional string folder_id = 3;
+}
+message GroupDirectoryRenameRequest {
+  optional uint64 group_uin = 1;
+  optional uint64 app_id = 2;
+  optional string folder_id = 3;
+  optional string name = 4;
+}
+message GroupDirectoryMoveRequest {
+  optional uint64 group_uin = 1;
+  optional uint64 app_id = 2;
+  optional string folder_id = 3;
+  optional string parent_directory = 4;
+  optional string destination_directory = 5;
+}
+message GroupDirectoryResult {
+  optional uint64 result_code = 1;
+  optional bytes result_message = 2;
+  optional GroupFsFolder folder = 4;
+}

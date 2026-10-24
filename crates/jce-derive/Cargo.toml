@@ -1,0 +1,24 @@
+[package]
+name = "jce-derive"
+version = "0.1.1"
+edition = "2021"
+authors = ["LaoLittle"]
+description = "Jce implementation in Rust"
+publish = false
+keywords = ["jce", "serialization", "encoding"]
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/LaoLittle/rust-jce"
+repository = "https://github.com/LaoLittle/rust-jce"
+
+[package.metadata.upstream]
+repository = "https://github.com/LaoLittle/rust-jce"
+revision = "37363944a2003ea1fc0848464eed90b7c13d9adc"
+local-changes = "Required fields, checked struct boundaries, attribute diagnostics, and exact encoded lengths"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "1.0.3", features = [ "extra-traits" ] }

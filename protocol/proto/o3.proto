@@ -1,0 +1,97 @@
+syntax = "proto3";
+package atri.qq.o3;
+
+message TelemetryValues {
+  repeated string values = 1;
+}
+message TelemetryReport {
+  string report_id = 1;
+  repeated TelemetryValues data = 2;
+}
+
+message EstablishShareKeyRequest {
+  bytes method = 1;
+  bytes client_public_key = 2;
+  bytes key_identifier = 4;
+  bytes encrypted_body = 5;
+  bytes channel_uuid = 6;
+}
+message EstablishShareKeyResponse {
+  repeated bytes encrypted_body = 1;
+  optional uint32 status = 2;
+}
+message SecureAccessRequest {
+  bytes method = 1;
+  bytes encrypted_body = 2;
+  bytes channel_uuid = 3;
+}
+message SecureAccessResponse {
+  repeated bytes encrypted_body = 1;
+  optional uint32 status = 2;
+}
+
+message ChannelPlaintext {
+  uint64 parameter = 1;
+  bytes body = 2;
+  bytes uuid = 3;
+}
+
+message EstablishInnerResponse {
+  repeated bytes material = 1;
+  uint64 parameter = 2;
+  uint64 channel_time = 3;
+  repeated bytes business_response = 4;
+  ChannelConfig config = 5;
+}
+
+message ChannelConfig {
+  uint32 option1 = 1;
+  uint32 option2 = 2;
+  uint32 option3 = 3;
+  uint32 option4 = 4;
+  uint32 option5 = 5;
+  uint32 option6 = 6;
+  uint32 option7 = 7;
+}
+
+message HeartbeatHeader {
+  uint32 field1 = 1;
+  bytes account = 2;
+  bytes machine_id = 3;
+  bytes identifier = 6;
+  uint32 kind = 7;
+  bytes qua = 8;
+}
+
+message HeartbeatRequest {
+  HeartbeatHeader header = 1;
+  uint64 sequence = 2;
+  uint32 interval_seconds = 3;
+}
+
+message HeartbeatTask {
+  uint32 kind = 1;
+  bytes identifier = 2;
+  bytes payload = 3;
+}
+
+message HeartbeatResponse {
+  bytes identifier = 1;
+  repeated HeartbeatTask tasks = 2;
+}
+
+message TaskAckRequest {
+  HeartbeatHeader header = 1;
+  bytes identifier = 2;
+}
+
+message TaskResult {
+  bytes identifier = 1;
+  bytes body = 2;
+}
+
+message TaskReportRequest {
+  HeartbeatHeader header = 1;
+  bytes identifier = 2;
+  repeated TaskResult results = 10;
+}

@@ -1,0 +1,199 @@
+syntax = "proto2";
+package atri.qq.media;
+
+// OIDB and nested protobuf payloads remain byte boundaries so unrecognized
+// server metadata survives forwarding without a decode/re-encode cycle.
+message MediaOidbEnvelope {
+  optional uint64 command = 1;
+  optional uint64 service = 2;
+  optional uint64 result = 3;
+  optional bytes body = 4;
+  optional bytes message = 5;
+  optional uint64 reserved = 12;
+}
+message MediaRequestHead {
+  optional MediaCommonRequestHead common = 1;
+  optional MediaSceneInfo scene = 2;
+  optional MediaClientMeta client = 3;
+}
+message MediaCommonRequestHead {
+  optional uint64 request_id = 1;
+  optional uint64 command = 2;
+}
+message MediaSceneInfo {
+  optional uint64 request_type = 101;
+  optional uint64 business_type = 102;
+  optional uint64 reserved_103 = 103;
+  optional uint64 scene_type = 200;
+  optional MediaDirectPeer direct_peer = 201;
+  optional MediaGroupPeer group_peer = 202;
+}
+message MediaDirectPeer {
+  optional uint64 account_type = 1;
+  optional string uid = 2;
+}
+message MediaGroupPeer { optional uint64 uin = 1; }
+message MediaClientMeta { optional uint64 agent_type = 1; }
+message MediaRichResponseHead {
+  optional uint64 code = 2;
+  optional bytes message = 3;
+}
+message MediaDownloadRequest {
+  optional MediaRequestHead head = 1;
+  optional MediaDownloadInfo request = 3;
+}
+message MediaDownloadInfo {
+  optional bytes index = 1;
+  optional bytes ext = 2;
+  optional uint32 reserved_3 = 3;
+}
+message MediaDownloadExtension {
+  optional MediaVideoDownloadExtension video = 2;
+  optional MediaDownloadReserved4 reserved_4 = 4;
+}
+message MediaVideoDownloadExtension {
+  optional uint32 business_type = 1;
+  optional uint32 scene_type = 2;
+  optional uint32 sub_business_type = 3;
+  optional uint32 reserved_5 = 5;
+  optional MediaDownloadReserved6 reserved_6 = 6;
+}
+message MediaDownloadReserved4 { optional uint32 reserved_1 = 1; }
+message MediaDownloadReserved6 {
+  optional uint32 reserved_1 = 1;
+  optional bytes file_md5 = 2;
+  optional bytes file_sha1 = 3;
+  optional uint64 file_size = 4;
+}
+message MediaDownloadResponse {
+  optional MediaRichResponseHead head = 1;
+  optional MediaDownloadResult download = 3;
+}
+message MediaDownloadResult {
+  optional bytes query = 1;
+  optional MediaDownloadLocation location = 3;
+}
+message MediaDownloadLocation {
+  optional bytes domain = 1;
+  optional bytes path = 2;
+  optional uint64 port = 3;
+}
+message HighwaySessionRequest { optional HighwaySessionApply apply = 1281; }
+message HighwaySessionApply {
+  optional uint64 net_type = 1;
+  optional uint64 subcommand = 2;
+  optional uint64 idc_id = 3;
+  optional uint64 request_ip = 4;
+  optional bytes ticket = 5;
+  optional uint64 app_id = 6;
+  repeated uint32 service_types = 7 [packed = false];
+  optional uint64 uin_type = 9;
+  optional uint64 protocol_type = 10;
+  optional uint64 terminal_type = 11;
+  optional string version = 15;
+}
+message HighwaySessionResponse { optional HighwaySessionResult result = 1281; }
+message HighwaySessionResult {
+  optional bytes ticket = 1;
+  repeated HighwayServer servers = 3;
+}
+message HighwayServer {
+  optional uint64 service_type = 1;
+  repeated HighwayAddress addresses = 2;
+}
+message HighwayAddress {
+  optional fixed32 ip = 2;
+  optional uint64 port = 3;
+}
+message HighwayUploadHeader {
+  optional HighwayBaseHeader base = 1;
+  optional HighwaySegmentHeader segment = 2;
+  optional bytes extension = 3;
+  optional uint64 timestamp = 4;
+  optional HighwayLoginSignature login = 5;
+}
+message HighwayBaseHeader {
+  optional uint64 version = 1;
+  optional string uin = 2;
+  optional string command = 3;
+  optional uint64 sequence = 4;
+  optional uint64 app_id = 6;
+  optional uint64 data_flag = 7;
+  optional uint64 command_id = 8;
+}
+message HighwaySegmentHeader {
+  optional uint64 total_size = 2;
+  optional uint64 offset = 3;
+  optional uint64 length = 4;
+  optional bytes service_ticket = 6;
+  optional bytes chunk_md5 = 8;
+  optional bytes file_md5 = 9;
+}
+message HighwayLoginSignature {
+  optional uint64 type = 1;
+  optional bytes signature = 2;
+  optional uint64 app_id = 3;
+}
+message HighwayAcknowledgement {
+  optional HighwaySegmentAcknowledgement segment = 2;
+  optional uint64 result = 3;
+  optional bytes message = 7;
+}
+message HighwaySegmentAcknowledgement { optional uint64 result = 5; }
+
+message MediaElement {
+  optional bytes direct_image = 4;
+  optional bytes group_image = 8;
+  optional bytes video = 19;
+  optional MediaCommonElement common = 53;
+}
+message MediaCommonElement {
+  optional uint64 service_type = 1;
+  optional bytes payload = 2;
+  optional uint64 business_type = 3;
+}
+
+message NotOnlineImage {
+  optional bytes name = 1;
+  optional uint64 size = 2;
+  optional bytes uuid = 3;
+  optional bytes md5 = 7;
+  optional uint64 height = 8;
+  optional uint64 width = 9;
+  optional bytes original_url = 15;
+}
+message CustomFace {
+  optional bytes name = 2;
+  optional bytes md5 = 13;
+  optional bytes original_url = 16;
+  optional uint64 width = 22;
+  optional uint64 height = 23;
+  optional uint64 size = 25;
+}
+message VideoFile {
+  optional bytes uuid = 1;
+  optional bytes md5 = 2;
+  optional bytes name = 3;
+  optional uint32 format = 4;
+  optional uint64 duration = 5;
+  optional uint64 size = 6;
+  optional uint32 thumbnail_width = 7;
+  optional uint32 thumbnail_height = 8;
+  optional bytes thumbnail_md5 = 9;
+  optional uint64 thumbnail_size = 11;
+  optional uint32 width = 16;
+  optional uint32 height = 17;
+  repeated bytes thumbnail_urls = 20;
+  repeated bytes urls = 21;
+}
+message Ptt {
+  optional bytes uuid = 3;
+  optional bytes md5 = 4;
+  optional bytes name = 5;
+  optional uint64 size = 6;
+  optional bytes file_key = 14;
+  optional bytes url = 17;
+  optional bytes group_file_key = 18;
+  optional uint64 duration = 19;
+  repeated bytes urls = 31;
+}
