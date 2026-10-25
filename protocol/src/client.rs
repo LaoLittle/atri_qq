@@ -44,6 +44,13 @@ struct Pending {
     reply: oneshot::Sender<Result<Bytes>>,
     cancel: CancellationToken,
 }
+enum RequestBinding<'a> {
+    Online(u64),
+    SigningReport {
+        generation: u64,
+        report: &'a SigningReport,
+    },
+}
 struct Outgoing {
     command: String,
     sequence: i32,
@@ -84,6 +91,7 @@ struct Inner {
 }
 pub struct Client {
     pub(crate) config: ClientConfig,
+    pub(crate) guild_session: Arc<crate::guild::Session>,
     inner: Mutex<Inner>,
     connect_gate: tokio::sync::Mutex<()>,
     pub(crate) login_gate: tokio::sync::Mutex<()>,
@@ -137,6 +145,7 @@ impl Client {
         signer.initialize(&state)?;
         Ok(Arc::new_cyclic(|weak| Self {
             config,
+            guild_session: Arc::new(crate::guild::Session::default()),
             inner: Mutex::new(Inner {
                 state,
                 signer,
@@ -197,6 +206,7 @@ impl Client {
         if account_changed || tickets_changed || (inner.state.online && !state.online) {
             inner.credentials.invalidate(account_changed);
             if account_changed || !state.online {
+                self.guild_session.close(inner.generation);
                 inner.maintenance_cancel.cancel();
                 inner.maintenance_started = false;
             } else {
@@ -254,6 +264,9 @@ impl Client {
     }
     pub(crate) fn connection_generation(&self) -> u64 {
         self.inner.lock().unwrap().generation
+    }
+    pub fn account_uin(&self) -> u64 {
+        self.inner.lock().unwrap().state.keystore.uin
     }
     pub(crate) fn is_current_online(&self, generation: u64) -> bool {
         let inner = self.inner.lock().unwrap();
@@ -591,6 +604,9 @@ impl Client {
             return Ok(());
         }
         drop(i);
+        if let Err(error) = self.guild_session.ingest(generation, &packet) {
+            tracing::warn!(%error, command = packet.command, "QQ guild synchronization push rejected");
+        }
         if packet.return_code != 0 {
             return Err(Error::Server {
                 code: packet.return_code,
@@ -605,6 +621,11 @@ impl Client {
                     let _ = self.packets.send(packet.clone());
                 })?
                 .map(|body| ("ConfigPushSvc.PushResp", body)),
+            crate::guild::PUSH_COMMAND => crate::guild::encode_push_ack(packet.body.clone())
+                .inspect_err(|_| {
+                    let _ = self.packets.send(packet.clone());
+                })?
+                .map(|body| (crate::guild::PUSH_RESPONSE_COMMAND, body)),
             _ => None,
         };
         if let Some(reply) = control_reply {
@@ -726,6 +747,23 @@ impl Client {
         self.request_inner(command, body, request_type, encryption, timeout, None)
             .await
     }
+    pub(crate) async fn request_online(
+        &self,
+        generation: u64,
+        command: &str,
+        body: Bytes,
+        timeout: Duration,
+    ) -> Result<Bytes> {
+        self.request_inner(
+            command,
+            body,
+            RequestType::D2,
+            Encryption::D2,
+            timeout,
+            Some(RequestBinding::Online(generation)),
+        )
+        .await
+    }
     async fn request_inner(
         &self,
         command: &str,
@@ -733,7 +771,7 @@ impl Client {
         request_type: RequestType,
         encryption: Encryption,
         timeout: Duration,
-        binding: Option<(&SigningReport, u64)>,
+        binding: Option<RequestBinding<'_>>,
     ) -> Result<Bytes> {
         if timeout.is_zero() {
             return Err(Error::Timeout);
@@ -743,10 +781,17 @@ impl Client {
             .ok_or_else(|| wire::malformed("Request deadline overflow"))?;
         let (sequence, id, sender, frame, cancel, reply) = {
             let mut i = self.inner.lock().unwrap();
-            if let Some((report, generation)) = binding {
-                if i.generation != generation || !i.signer.report_is_current(report) {
-                    return Err(Error::Disconnected);
+            let current = match binding {
+                None => true,
+                Some(RequestBinding::Online(generation)) => {
+                    i.generation == generation && i.state.online
                 }
+                Some(RequestBinding::SigningReport { generation, report }) => {
+                    i.generation == generation && i.signer.report_is_current(report)
+                }
+            };
+            if !current {
+                return Err(Error::Disconnected);
             }
             let sender = i
                 .connection
@@ -916,6 +961,7 @@ impl Client {
                 self.emit(LoginEvent::Offline { reason })
             }
         }
+        self.guild_session.close(generation);
         self.captcha.lock().unwrap().take();
     }
     fn mark_activity(&self, generation: u64) {
@@ -1187,7 +1233,7 @@ impl Client {
                                 RequestType::D2,
                                 Encryption::D2,
                                 client.config.timeout,
-                                Some((&report, generation)),
+                                Some(RequestBinding::SigningReport { generation, report: &report }),
                             ) => response,
                         };
                         (report, request, response, report_cancel)
@@ -1336,7 +1382,7 @@ impl Client {
                     RequestType::D2,
                     Encryption::D2,
                     client.config.timeout,
-                    Some((&report, generation)),
+                    Some(RequestBinding::SigningReport { generation, report: &report }),
                 ) => result,
             };
             let mut inner = client.inner.lock().unwrap();

@@ -649,20 +649,31 @@ async fn require_online(client: &Arc<Client>) -> Result<()> {
 async fn online(client: &Arc<Client>, reconnect: bool) -> Result<bool> {
     let generation = client.connection_generation();
     let state = client.snapshot().await;
+    let request_random = rand::random::<u32>() % (i32::MAX as u32);
+    client.guild_session.begin(generation, request_random);
     let response = match client
         .call(
             "trpc.msg.register_proxy.RegisterProxy.SsoInfoSync",
-            info_sync(&state, reconnect),
+            info_sync(&state, reconnect, request_random),
             Encryption::D2,
         )
         .await
     {
         Ok(p) => p,
-        Err(Error::Server { .. }) => return Ok(false),
-        Err(e) => return Err(e),
+        Err(Error::Server { .. }) => {
+            client.guild_session.close(generation);
+            return Ok(false);
+        }
+        Err(error) => {
+            client.guild_session.close(generation);
+            return Err(error);
+        }
     };
-    let response: auth::InfoSyncResponse = proto::decode(response)?;
+    let response: auth::InfoSyncResponse = proto::decode(response).inspect_err(|_| {
+        client.guild_session.close(generation);
+    })?;
     if !registration_confirmed(&response) {
+        client.guild_session.close(generation);
         return Ok(false);
     }
     client.confirm_online(generation)?;
@@ -681,10 +692,10 @@ fn registration_confirmed(response: &auth::InfoSyncResponse) -> bool {
         .and_then(|p| p.message.as_deref())
         == Some("register success")
 }
-fn info_sync(state: &SessionState, reconnect: bool) -> Bytes {
+fn info_sync(state: &SessionState, reconnect: bool, request_random: u32) -> Bytes {
     auth::InfoSyncRequest {
         sync_flag: Some(1759),
-        request_random: Some(rand::random::<u32>() % (i32::MAX as u32)),
+        request_random: Some(request_random),
         current_active_status: Some(2),
         group_last_message_time: Some(0),
         sync: Some(auth::SyncState {
@@ -723,9 +734,12 @@ fn info_sync(state: &SessionState, reconnect: bool) -> Bytes {
             field17: Some(0),
             field18: Some(0),
         }),
-        business: Some(auth::OnlineBusiness {
-            version: Some(if reconnect { 2 } else { 0 }),
-            state: Some(auth::OnlineBusinessState { field1: Some(0) }),
+        guild_sync: Some(proto::guild::GuildSyncRequest {
+            pull_scene: Some(if reconnect { 2 } else { 0 }),
+            first_view: Some(proto::guild::GuildFirstViewRequest {
+                last_msg_time: Some(0),
+                last_pull_time: None,
+            }),
         }),
         app: Some(auth::AppState {
             foreground: Some(0),
@@ -923,7 +937,7 @@ mod tests {
             machine_id: "explicit".into(),
             online: false,
         };
-        let sync: auth::InfoSyncRequest = proto::decode(info_sync(&state, false)).unwrap();
+        let sync: auth::InfoSyncRequest = proto::decode(info_sync(&state, false, 7)).unwrap();
         assert_eq!(sync.sync_flag, Some(1759));
         assert_eq!(sync.current_active_status, Some(2));
         assert_eq!(sync.group_last_message_time, Some(0));
@@ -951,11 +965,11 @@ mod tests {
             machine_id: "synthetic-machine".into(),
             online: false,
         };
-        let sync: auth::InfoSyncRequest = proto::decode(info_sync(&state, true)).unwrap();
+        let sync: auth::InfoSyncRequest = proto::decode(info_sync(&state, true, 7)).unwrap();
         assert_eq!(sync.extension, Some(Bytes::new()));
-        let business = sync.business.unwrap();
-        assert_eq!(business.version, Some(2));
-        assert_eq!(business.state.unwrap().field1, Some(0));
+        let guild_sync = sync.guild_sync.unwrap();
+        assert_eq!(guild_sync.pull_scene, Some(2));
+        assert_eq!(guild_sync.first_view.unwrap().last_msg_time, Some(0));
         let register = sync.register.unwrap();
         assert_eq!(register.guid, Some(hex::encode(&state.keystore.guid)));
         assert_eq!(register.first_register, Some(1));

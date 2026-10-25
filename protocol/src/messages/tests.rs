@@ -1403,3 +1403,120 @@ async fn direct_gray_tips_without_a_valid_actor_stay_opaque() {
         [PushEvent::Opaque { sub_type: Some(292), payload, .. }] if payload == &raw
     ));
 }
+
+fn buddy_request_packet(content: &[u8]) -> IncomingPacket {
+    packet(rpc::CommonMessage {
+        routing_head: Some(rpc::RoutingHead {
+            sender_uin: Some(100),
+            sender_uid: "self-uid".into(),
+            recipient_uin: Some(100),
+            recipient_uid: "self-uid".into(),
+            ..Default::default()
+        }),
+        content_head: Some(rpc::ContentHead {
+            message_type: Some(528),
+            sub_type: Some(35),
+            c2c_command: Some(35),
+            ..Default::default()
+        }),
+        message_body: rpc::MessageBody {
+            content: Some(Bytes::copy_from_slice(content)),
+            ..Default::default()
+        }
+        .encode_to_vec()
+        .into(),
+    })
+}
+
+#[tokio::test]
+async fn friend_request_control_notice_preserves_type_and_payload() {
+    let messaging = service(Mock::new(|_, _, _| {
+        panic!("push decoding must not issue requests")
+    }));
+    let input = buddy_request_packet(&[0x1a, 0x02, 0x08, 0x00]);
+    let raw = input.body.to_vec();
+    let events = messaging.decode_push(input).await;
+    assert!(matches!(
+        events.as_slice(),
+        [PushEvent::Opaque {
+            message_type: Some(528),
+            sub_type: Some(35),
+            payload,
+            ..
+        }] if payload == &raw
+    ));
+}
+
+#[tokio::test]
+async fn friend_request_push_emits_every_request_in_order() {
+    let messaging = service(Mock::new(|_, _, _| {
+        panic!("push decoding must not issue requests")
+    }));
+    let content = rpc::FriendRequestPush {
+        requests: vec![
+            rpc::FriendRequestInfo {
+                target_uid: "self-uid".into(),
+                source_uid: "requester-a".into(),
+                message: "first request".into(),
+                source: "source-a".into(),
+            },
+            rpc::FriendRequestInfo {
+                target_uid: "self-uid".into(),
+                source_uid: "requester-b".into(),
+                message: "second request".into(),
+                source: "source-b".into(),
+            },
+        ],
+    }
+    .encode_to_vec();
+    let events = messaging.decode_push(buddy_request_packet(&content)).await;
+    assert!(matches!(
+        events.as_slice(),
+        [
+            PushEvent::FriendRequest {
+                source_uid: first,
+                target_uid: first_target,
+                message: first_message,
+                source: first_source,
+                raw: first_raw,
+                ..
+            },
+            PushEvent::FriendRequest {
+                source_uid: second,
+                target_uid: second_target,
+                message: second_message,
+                source: second_source,
+                raw: second_raw,
+                ..
+            }
+        ] if first == "requester-a"
+            && second == "requester-b"
+            && first_target == "self-uid"
+            && second_target == "self-uid"
+            && first_message == "first request"
+            && second_message == "second request"
+            && first_source == "source-a"
+            && second_source == "source-b"
+            && first_raw == &content
+            && second_raw == &content
+    ));
+}
+
+#[tokio::test]
+async fn malformed_friend_request_content_keeps_error_fallback() {
+    let messaging = service(Mock::new(|_, _, _| {
+        panic!("push decoding must not issue requests")
+    }));
+    let input = buddy_request_packet(&[0x0a, 0x04, 0x12]);
+    let raw = input.body.to_vec();
+    let events = messaging.decode_push(input).await;
+    assert!(matches!(
+        events.as_slice(),
+        [PushEvent::Opaque {
+            message_type: None,
+            sub_type: None,
+            payload,
+            ..
+        }] if payload == &raw
+    ));
+}

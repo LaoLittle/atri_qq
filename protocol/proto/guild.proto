@@ -1,0 +1,109 @@
+syntax = "proto2";
+package atri.qq.guild;
+import "messages.proto";
+
+message RoutingHead {
+  optional uint64 guild_id = 1;
+  optional uint64 channel_id = 2;
+  optional uint64 sender_uin = 3;
+  optional uint64 sender_tiny_id = 4;
+  optional uint64 guild_code = 5;
+  optional uint64 sender_app_id = 6;
+  optional uint32 direct_message_flag = 7;
+}
+message ContentHead {
+  optional uint64 message_type = 1;
+  optional uint64 sub_type = 2;
+  optional uint64 random = 3;
+  optional uint64 sequence = 4;
+  optional uint64 count_sequence = 5;
+  optional uint64 time = 6;
+  optional bytes metadata = 7;
+}
+message MessageHead {
+  optional RoutingHead routing = 1;
+  optional ContentHead content = 2;
+}
+message MessageControlHead {
+  repeated uint64 include_uin = 1;
+  repeated uint64 exclude_uin = 2;
+  repeated uint64 feature_ids = 3;
+  optional uint32 offline_flag = 4;
+  optional uint32 visibility = 5;
+  optional uint64 control_flag = 6;
+  repeated bytes events = 7;
+  optional uint64 level = 8;
+  repeated bytes personal_levels = 9;
+  optional uint64 guild_sync_sequence = 10;
+  optional uint32 member_count = 11;
+  optional uint32 channel_type = 12;
+  optional uint32 private_type = 13;
+}
+message MessageExtension {
+  optional bytes sender_name = 1;
+  optional bytes guild_name = 2;
+  optional bytes channel_name = 3;
+  optional uint32 visibility = 4;
+  optional uint32 notify_type = 5;
+  optional uint32 offline_flag = 6;
+  optional uint32 name_type = 7;
+  optional bytes member_name = 8;
+  optional uint32 timestamp = 9;
+  optional uint64 event_version = 10;
+  repeated bytes events = 11;
+  optional bytes sender_role = 12;
+  optional FrequencyLimit frequency_limit = 13;
+}
+message ChannelMessage {
+  optional MessageHead head = 1;
+  optional MessageControlHead control = 2;
+  optional bytes body = 3;
+  optional MessageExtension extension = 4;
+  optional bytes core = 5;
+}
+message SendRequest { optional SendMessage message = 1; }
+message SendMessage {
+  optional MessageHead head = 1;
+  optional MessageControlHead control = 2;
+  optional TextMessageBody body = 3;
+}
+message TextMessageBody { optional TextRichText rich_text = 1; }
+message TextRichText { repeated TextElement elems = 2; }
+message TextElement { optional atri.qq.messages.Text text = 1; }
+message SendResponse {
+  optional uint32 result = 1;
+  optional bytes error = 2;
+  optional uint32 send_time = 3;
+  optional MessageHead head = 4;
+  optional uint32 error_type = 5;
+  optional TransferResult transfer = 6;
+  optional FrequencyLimit frequency_limit = 7;
+}
+message TransferResult {
+  optional uint32 sub_type = 1;
+  optional int32 code = 2;
+  optional bytes error = 3;
+  optional bytes information = 4;
+}
+message FrequencyLimit {
+  optional uint32 limited = 1;
+  optional uint32 remaining = 2;
+  optional uint64 limit_timestamp = 3;
+}
+message OnlinePush {
+  repeated bytes messages = 1;
+  optional uint32 general_flag = 2;
+  optional uint32 need_response = 3;
+  optional bytes server_buffer = 4;
+  optional uint32 compression_flag = 5;
+  optional bytes compressed_messages = 6;
+  optional bytes focus = 7;
+  optional uint32 huge_flag = 8;
+}
+message CompressedMessages { repeated bytes messages = 1; }
+message PushResponse { optional bytes server_buffer = 1; }
+message MentionReserve {
+  optional uint32 kind = 3;
+  optional uint64 member_uin = 4;
+  optional uint64 tiny_id = 5;
+}

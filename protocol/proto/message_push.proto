@@ -36,7 +36,7 @@ message DirectRecallInfo {
   uint64 sequence = 20;
 }
 message PushTip { string text = 2; }
-message FriendRequestPush { FriendRequestInfo info = 1; }
+message FriendRequestPush { repeated FriendRequestInfo requests = 1; }
 message FriendRequestInfo {
   string target_uid = 1;
   string source_uid = 2;

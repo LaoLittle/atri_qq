@@ -1,17 +1,19 @@
-use crate::{authority, config, conversion, extension_signing as signing};
+use crate::{authority, config, conversion, extension_signing as signing, guild_conversion};
 use async_trait::async_trait;
 use atri_core::{
-    ApiError, BotOffline, BotOnline, EventKind, ExtensionMetadata, ExtensionRole,
+    ApiError, BotOffline, BotOnline, ConversationKind, EventKind, ExtensionMetadata, ExtensionRole,
     InteractionRequest, LogLevel, ServiceCall, ServiceDescriptor, UserIdentity, Value, encode,
     from_value, to_value,
 };
 use atri_extensions::{Context, Extension, ManagedTask};
+use atri_qq_api::guild::GUILD_SERVICE;
 use atri_qq_api::signing::{SIGNING_METHODS, SIGNING_SERVICE};
 use atri_qq_api::{CONTACTS_SERVICE, FRIENDS_METHOD, FriendInfo, FriendsResponse};
 use atri_qq_protocol::{
     Client, Error, LoginChallenge, LoginEvent, ServiceClient,
     admin::{ADMIN_METHODS, Admin},
     contacts::{CONTACT_METHODS, Operations},
+    guild::{GUILD_METHODS, Guild},
     media::{MEDIA_METHODS, Media},
     messages::{MESSAGE_METHODS, Messaging},
 };
@@ -33,6 +35,7 @@ pub(crate) struct Services {
     pub(crate) admin: Admin,
     pub(crate) media: Arc<Media>,
     pub(crate) messaging: Messaging,
+    pub(crate) guild: Guild,
     pub(crate) signing: signing::SigningService,
 }
 
@@ -62,6 +65,7 @@ pub(crate) fn protocol_error(error: Error) -> ApiError {
 async fn bind_services(ctx: &Context, account: Option<&str>) -> Result<(), ApiError> {
     for name in [
         CONTACTS_SERVICE,
+        GUILD_SERVICE,
         "qq.admin",
         "qq.messaging",
         "qq.media",
@@ -88,6 +92,7 @@ impl Extension for QQExtension {
             service(CONTACTS_SERVICE, CONTACT_METHODS),
             service("qq.admin", ADMIN_METHODS),
             service("qq.messaging", MESSAGE_METHODS),
+            service(GUILD_SERVICE, GUILD_METHODS),
             service("qq.media", MEDIA_METHODS),
             service(SIGNING_SERVICE, SIGNING_METHODS),
             service("atri.messaging", &["send"]),
@@ -138,6 +143,7 @@ impl Extension for QQExtension {
             admin: Admin::from_operations(operations.clone()),
             operations,
             configured_uin: config.uin,
+            guild: Guild::new(client.clone()),
             messaging: Messaging::new(transport, media.clone()),
             media,
             signing: signing::SigningService::default(),
@@ -219,9 +225,15 @@ impl Extension for QQExtension {
                         }
                     }
                 };
-                let account = format!("qq:{}", push_services.client.snapshot().await.keystore.uin);
-                for event in push_services.messaging.decode_push(packet).await {
-                    conversion::publish(&push_ctx, &account, event).await?;
+                let account = format!("qq:{}", push_services.client.account_uin());
+                if let Some(events) = push_services.guild.decode_push(&packet).await {
+                    for event in events {
+                        guild_conversion::publish(&push_ctx, &account, event).await?;
+                    }
+                } else {
+                    for event in push_services.messaging.decode_push(packet).await {
+                        conversion::publish(&push_ctx, &account, event).await?;
+                    }
                 }
             }
         })?;
@@ -235,7 +247,16 @@ impl Extension for QQExtension {
     }
 
     async fn on_service(&self, ctx: Context, call: ServiceCall) -> Result<Value, ApiError> {
-        let outbound = authority::prepare(&call)?;
+        let outbound = authority::prepare(&call)?
+            .map(|mut outbound| -> Result<_, ApiError> {
+                if outbound.conversation.kind == ConversationKind::Channel {
+                    outbound.content = atri_core::MessageContent::Text(
+                        guild_conversion::text_content(outbound.content)?,
+                    );
+                }
+                Ok(outbound)
+            })
+            .transpose()?;
         let services = self
             .state
             .lock()
@@ -345,6 +366,11 @@ impl Extension for QQExtension {
             ));
         }
         match call.service.as_str() {
+            GUILD_SERVICE => services
+                .guild
+                .call(&call.method, call.args)
+                .await
+                .map_err(protocol_error),
             CONTACTS_SERVICE => {
                 match call.method.as_str() {
                     "client_key" => {

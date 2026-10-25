@@ -202,15 +202,20 @@ impl Messaging {
                 }
                 if sub == 35 {
                     let request = decode::<wire::FriendRequestPush>(&content)?;
-                    let info = request.info.ok_or_else(|| missing("friend request info"))?;
-                    return Ok(vec![PushEvent::FriendRequest {
-                        source_uid: info.source_uid,
-                        source_uin: routing.sender_uin.unwrap_or_default(),
-                        target_uid: info.target_uid,
-                        message: info.message,
-                        source: info.source,
-                        raw: content.to_vec(),
-                    }]);
+                    if !request.requests.is_empty() {
+                        return Ok(request
+                            .requests
+                            .into_iter()
+                            .map(|info| PushEvent::FriendRequest {
+                                source_uid: info.source_uid,
+                                source_uin: routing.sender_uin.unwrap_or_default(),
+                                target_uid: info.target_uid,
+                                message: info.message,
+                                source: info.source,
+                                raw: content.to_vec(),
+                            })
+                            .collect());
+                    }
                 }
             }
             732 if matches!(sub, 16 | 17 | 20) => {

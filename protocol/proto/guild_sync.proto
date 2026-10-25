@@ -1,0 +1,53 @@
+syntax = "proto2";
+package atri.qq.guild;
+
+message GuildSyncRequest {
+  optional uint32 pull_scene = 2;
+  optional GuildFirstViewRequest first_view = 4;
+}
+message GuildFirstViewRequest {
+  optional uint64 last_msg_time = 1;
+  optional uint64 last_pull_time = 2;
+}
+message InfoSyncPush {
+  optional uint32 result = 1;
+  optional bytes error = 2;
+  optional uint32 stage = 3;
+  optional uint32 request_random = 4;
+  optional GuildFirstViewData guild = 9;
+}
+message GuildFirstViewData {
+  optional uint32 result = 1;
+  optional bytes error = 2;
+  repeated bytes in_tab_nodes = 3;
+  repeated bytes group_nodes = 4;
+  optional uint64 self_tiny_id = 6;
+  optional uint64 get_message_time = 8;
+  optional uint32 message_limit = 10;
+  optional bytes transport_info = 11;
+  optional int32 first_sync_result = 12;
+  optional GuildFirstViewExtra extra = 100;
+}
+message GuildFirstViewExtra {
+  repeated bytes normal_nodes = 2;
+  repeated bytes direct_nodes_12 = 12;
+  optional uint32 field_13 = 13;
+  repeated bytes direct_nodes_15 = 15;
+}
+message FirstViewGuildNode {
+  optional uint64 guild_id = 1;
+  repeated bytes channels = 3;
+  optional bytes name = 4;
+  optional int32 node_kind = 25;
+}
+message FirstViewChannelNode {
+  optional uint64 channel_id = 1;
+  optional bytes name = 8;
+  optional uint32 kind = 9;
+}
+message PushParams {
+  optional GuildPushParameters guild = 6;
+}
+message GuildPushParameters {
+  optional uint32 enabled = 1;
+}

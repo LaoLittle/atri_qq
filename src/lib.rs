@@ -14,4 +14,6 @@ mod conversion;
 #[path = "signing.rs"]
 mod extension_signing;
 #[cfg(feature = "extension")]
+mod guild_conversion;
+#[cfg(feature = "extension")]
 pub use adapter::QQExtension;

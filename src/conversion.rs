@@ -671,6 +671,9 @@ async fn encode_content(
 }
 
 pub(crate) async fn send(services: &Services, outbound: SendMessage) -> Result<Value, ApiError> {
+    if outbound.conversation.kind == ConversationKind::Channel {
+        return crate::guild_conversion::send(services, outbound).await;
+    }
     validate_content(&outbound.content, &outbound.conversation)?;
     let target = native_conversation(services, &outbound.conversation).await?;
     let elements =

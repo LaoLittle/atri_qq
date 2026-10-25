@@ -326,7 +326,10 @@ async fn error_kick_preserves_header_without_decoding_or_publishing_its_body() {
         assert!(!client.snapshot().await.online);
         assert!(pushes.try_recv().is_err());
         client
-            .receive(incoming_status(sequence, command, body, None, -10004, extra), 0)
+            .receive(
+                incoming_status(sequence, command, body, None, -10004, extra),
+                0,
+            )
             .unwrap();
         assert!(events.try_recv().is_err());
     }
@@ -366,7 +369,9 @@ async fn framed_tcp_error_kick_reports_header_and_disconnects_outstanding_reques
     let mut events = client.login_events();
     let mut pushes = client.subscribe();
     client.connect().await.unwrap();
-    client.confirm_online(client.connection_generation()).unwrap();
+    client
+        .confirm_online(client.connection_generation())
+        .unwrap();
     events.recv().await.unwrap();
     let result = client
         .request(
@@ -387,7 +392,10 @@ async fn framed_tcp_error_kick_reports_header_and_disconnects_outstanding_reques
     }
     assert!(!client.snapshot().await.online);
     assert!(pushes.try_recv().is_err());
-    timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
+    timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]
@@ -422,7 +430,10 @@ async fn sso_request_errors_preserve_code_and_extra_without_ending_the_session()
     client
         .receive(incoming(sequence, &command, b"recovered", None), 0)
         .unwrap();
-    assert_eq!(request.await.unwrap().unwrap(), Bytes::from_static(b"recovered"));
+    assert_eq!(
+        request.await.unwrap().unwrap(),
+        Bytes::from_static(b"recovered")
+    );
 }
 
 #[tokio::test]
@@ -441,7 +452,10 @@ async fn unsolicited_sso_errors_are_not_successful_pushes_or_control_requests() 
     for (command, body) in [
         ("example.push", Bytes::new()),
         ("trpc.msg.olpush.OlPushService.MsgPush", Bytes::from(body)),
-        ("ConfigPushSvc.PushReq", wire::config_push::request_fixture(1, 17)),
+        (
+            "ConfigPushSvc.PushReq",
+            wire::config_push::request_fixture(1, 17),
+        ),
     ] {
         assert!(matches!(
             client.receive(incoming_status(-1, command, &body, None, -10004, "rejected"), 0),
@@ -453,7 +467,9 @@ async fn unsolicited_sso_errors_are_not_successful_pushes_or_control_requests() 
     assert!(pushes.try_recv().is_err());
     assert!(events.try_recv().is_err());
     assert!(client.snapshot().await.online);
-    client.close_transport("error dispatch regression complete".into()).await;
+    client
+        .close_transport("error dispatch regression complete".into())
+        .await;
 }
 
 #[tokio::test]
@@ -501,22 +517,34 @@ async fn control_reply_receipts_do_not_generate_an_acknowledgment_loop() {
             0,
         )
         .unwrap();
-    let outgoing = timeout(Duration::from_secs(5), queue.recv()).await.unwrap().unwrap();
+    let outgoing = timeout(Duration::from_secs(5), queue.recv())
+        .await
+        .unwrap()
+        .unwrap();
     let (sequence, command, body, _) = outgoing_d2(outgoing.frame, &[0; 16]);
     let ack: auth::PushAckRequest = crate::proto::decode(body.clone()).unwrap();
     assert_eq!(ack.descriptors, [descriptor]);
-    client.receive(incoming(sequence, &command, &body, None), 0).unwrap();
+    client
+        .receive(incoming(sequence, &command, &body, None), 0)
+        .unwrap();
     let config = wire::config_push::request_fixture(1, 17);
     client
         .receive(incoming(-2, "ConfigPushSvc.PushReq", &config, None), 0)
         .unwrap();
-    let outgoing = timeout(Duration::from_secs(5), queue.recv()).await.unwrap().unwrap();
+    let outgoing = timeout(Duration::from_secs(5), queue.recv())
+        .await
+        .unwrap()
+        .unwrap();
     let (sequence, command, body, _) = outgoing_d2(outgoing.frame, &[0; 16]);
     assert_eq!(command, "ConfigPushSvc.PushResp");
-    client.receive(incoming(sequence, &command, &body, None), 0).unwrap();
+    client
+        .receive(incoming(sequence, &command, &body, None), 0)
+        .unwrap();
     tokio::task::yield_now().await;
     assert!(queue.try_recv().is_err());
-    client.close_transport("control loop regression complete".into()).await;
+    client
+        .close_transport("control loop regression complete".into())
+        .await;
 }
 
 fn outgoing_d2(frame: Bytes, key: &[u8]) -> (i32, String, Bytes, crate::proto::sso::Reserved) {
@@ -1542,6 +1570,42 @@ async fn initial_credential_failures_do_not_invent_ttl_or_background_retries() {
     );
     client.terminate("initial failure recovery complete".into());
     maintenance.await.unwrap();
+}
+
+#[tokio::test]
+async fn bound_business_requests_cannot_cross_connection_or_account_replacement() {
+    let (client, mut first_queue) = queued_client();
+    client.confirm_online(0).unwrap();
+    client.terminate("synthetic connection replaced".into());
+    let (sender, mut second_queue) = mpsc::channel(8);
+    {
+        let mut inner = client.inner.lock().unwrap();
+        inner.generation = 1;
+        inner.cancel = CancellationToken::new();
+        inner.connection = Some(Connection {
+            generation: 1,
+            sender,
+        });
+    }
+    client.confirm_online(1).unwrap();
+    assert!(matches!(
+        client
+            .request_online(0, "example.business", Bytes::new(), Duration::from_secs(1))
+            .await,
+        Err(Error::Disconnected)
+    ));
+    let mut replacement = client.snapshot().await;
+    replacement.keystore.uin = 42;
+    client.replace_state(replacement).await;
+    assert!(matches!(
+        client
+            .request_online(1, "example.business", Bytes::new(), Duration::from_secs(1))
+            .await,
+        Err(Error::Disconnected)
+    ));
+    assert!(first_queue.try_recv().is_err());
+    assert!(second_queue.try_recv().is_err());
+    client.terminate("synthetic replacement complete".into());
 }
 
 #[path = "client_o3_tests.rs"]

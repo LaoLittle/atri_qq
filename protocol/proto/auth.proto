@@ -1,5 +1,6 @@
 syntax = "proto2";
 package atri.qq.auth;
+import "guild_sync.proto";
 
 message KeyExchangeSecret { optional string uin = 1; optional bytes guid = 2; }
 message KeyExchangeRequest {
@@ -74,7 +75,7 @@ message InfoSyncRequest {
   optional SyncState sync = 6;
   optional bytes cookie = 8;
   optional RegisterInfo register = 9;
-  optional OnlineBusiness business = 10;
+  optional atri.qq.guild.GuildSyncRequest guild_sync = 10;
   optional AppState app = 11;
   optional bytes extension = 13;
 }
@@ -102,8 +103,6 @@ message RegisterInfo {
   optional uint32 field18 = 18;
 }
 message RegisterFlags { optional uint32 field1 = 1; optional uint32 field2 = 2; }
-message OnlineBusiness { optional uint32 version = 2; optional OnlineBusinessState state = 4; }
-message OnlineBusinessState { optional uint32 field1 = 1; }
 message AppState { optional uint32 foreground = 1; optional uint32 full_screen = 2; optional uint32 background = 3; }
 message InfoSyncRegisterResponse {
   optional string message = 2;

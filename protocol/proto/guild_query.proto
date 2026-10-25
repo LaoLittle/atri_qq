@@ -1,0 +1,112 @@
+syntax = "proto2";
+package atri.qq.guild;
+
+message QueryChannelsRequest {
+  repeated uint64 guild_ids = 1;
+  repeated uint64 list = 2;
+  optional QueryChannelFilter filter = 3;
+  optional uint32 source_type = 4;
+  optional uint32 field5 = 5;
+}
+message QueryChannelFilter {
+  optional uint32 field1 = 1;
+  optional uint32 field2 = 2;
+  optional uint32 field3 = 3;
+  optional uint32 field4 = 4;
+  optional uint32 field5 = 5;
+}
+message QueryChannelsResponse {
+  repeated QueryGuildEntry guilds = 1;
+}
+message QueryGuildEntry {
+  optional uint64 guild_id = 1;
+  repeated QueryChannelItem channels = 2;
+}
+message QueryChannelItem {
+  optional uint64 id = 1;
+  optional bytes name = 2;
+  optional uint32 kind = 7;
+}
+
+message QueryMembersRequest {
+  optional uint64 guild_id = 1;
+  optional uint32 field2 = 2;
+  optional uint32 field3 = 3;
+  optional QueryMemberFilter filter = 4;
+  optional uint64 start_index = 6;
+  optional uint32 count = 8;
+  optional uint64 channel_id = 12;
+  optional bytes cookie = 13;
+  optional uint64 role_index = 14;
+}
+message QueryMemberFilter {
+  optional uint32 field1 = 1;
+  optional uint32 field3 = 3;
+  optional uint32 field4 = 4;
+  optional uint32 field5 = 5;
+  optional uint32 field6 = 6;
+  optional uint32 field7 = 7;
+  optional uint32 field8 = 8;
+  optional uint32 field9 = 9;
+  optional uint32 field10 = 10;
+  optional uint32 field20 = 20;
+  optional uint32 field27 = 27;
+  optional uint32 field35 = 35;
+  optional uint32 field38 = 38;
+  optional uint32 field40 = 40;
+  optional uint32 field41 = 41;
+  optional uint32 field42 = 42;
+  optional uint32 field48 = 48;
+}
+message QueryMembersResponse {
+  optional uint64 guild_id = 1;
+  repeated QueryMemberItem bots = 4;
+  repeated QueryMemberItem members = 5;
+  optional uint32 finished = 9;
+  optional uint64 next_index = 10;
+  optional bytes next_cookie = 24;
+  repeated QueryRoleGroup roles = 25;
+  optional uint64 next_role_index = 26;
+  repeated QueryMemberItem feed_robots = 29;
+  repeated QueryMemberItem ai_members = 32;
+}
+message QueryRoleGroup {
+  optional uint64 id = 1;
+  repeated QueryMemberItem members = 2;
+  optional bytes name = 3;
+  optional uint32 field4 = 4;
+}
+message QueryMemberItem {
+  optional bytes member_name = 2;
+  optional bytes nickname = 3;
+  optional uint64 join_time = 4;
+  optional int32 role = 5;
+  optional uint64 tiny_id = 8;
+}
+
+message QueryGuildsRequest {
+  optional bytes cookie = 1;
+  optional uint64 tiny_id = 2;
+  optional uint64 guild_id = 4;
+  optional uint32 page_size = 5;
+}
+message QueryGuildsResponse {
+  optional QueryGuildsPage page = 1;
+  optional bytes joined_count_string = 3;
+}
+message QueryGuildsPage {
+  repeated QueryGuildItem guilds = 1;
+  optional bytes cookie = 2;
+  optional bool is_end = 3;
+}
+message QueryGuildItem {
+  optional uint64 guild_id = 1;
+  optional bytes name = 2;
+  optional bytes icon = 3;
+  optional bytes profile = 4;
+  optional uint32 joined = 7;
+  optional uint64 channel_id = 11;
+  optional bytes channel_name = 12;
+  optional uint32 channel_kind = 13;
+  optional bytes number = 17;
+}

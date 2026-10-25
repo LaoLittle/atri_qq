@@ -5,6 +5,7 @@ pub mod contacts;
 mod credentials;
 pub mod crypto;
 mod diagnostics;
+pub mod guild;
 mod http;
 mod lifecycle;
 pub mod login;
