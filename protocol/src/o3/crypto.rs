@@ -24,8 +24,21 @@ pub(super) const PEER_PUBLIC_KEY: [u8; 33] = [
     0x96, 0xd2, 0xc2, 0x4d, 0xf4, 0x39, 0x88, 0x9e, 0xc0, 0x9a, 0xac, 0x35, 0x52, 0xba, 0x18, 0x51,
     0xd8,
 ];
-pub(super) const KEY_IDENTIFIER: &[u8] =
+pub(super) const KEY_IDENTIFIER: &[u8; 66] =
     b"83c562376e929cbaa587870fbb72d8c7f3cfe9771df14808eb30aa917923fdd5ce";
+
+const PEER_MASK: &[u8; 8] = b"3UEBOKPY";
+
+pub(super) fn decode_peer(encoded: &[u8; 33]) -> [u8; 33] {
+    std::array::from_fn(|index| encoded[(index + 25) % 33] ^ PEER_MASK[index % 8])
+}
+
+pub(super) fn encode_peer(peer: &[u8; 33]) -> [u8; 33] {
+    std::array::from_fn(|index| {
+        let decoded_index = (index + 8) % 33;
+        peer[decoded_index] ^ PEER_MASK[decoded_index % 8]
+    })
+}
 
 pub(super) struct Agreement {
     pub public: [u8; 33],
@@ -170,6 +183,18 @@ mod tests {
         decode(
             "d7fe94067fdd9d98f61454c07d0d85f57c3e9718ba62fa681d847ff8a5ade50139c2cb23577ccefa5e712f536aa331f167fbac6e5a8e9d78792cf22941359d81",
         )
+    }
+
+    #[test]
+    fn encoded_peer_default_vector_and_inverse_match_native_material() {
+        let encoded: [u8; 33] = hex::decode(KEY_IDENTIFIER).unwrap().try_into().unwrap();
+        assert_eq!(decode_peer(&encoded), PEER_PUBLIC_KEY);
+        assert_eq!(encode_peer(&PEER_PUBLIC_KEY), encoded);
+        let alternate = peer();
+        let encoded = encode_peer(&alternate);
+        assert_eq!(decode_peer(&encoded), alternate);
+        assert_ne!(encoded, encode_peer(&PEER_PUBLIC_KEY));
+        authenticate(&decode_peer(&encoded), LOCAL, SERVER, &signature()).unwrap();
     }
 
     #[test]

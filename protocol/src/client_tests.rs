@@ -1610,3 +1610,60 @@ async fn bound_business_requests_cannot_cross_connection_or_account_replacement(
 
 #[path = "client_o3_tests.rs"]
 mod o3;
+
+#[tokio::test]
+async fn server_clock_accepts_exact_response_and_rejects_malformed_samples_without_losing_session() {
+    let (client, mut queue) = queued_client();
+    let expected = 2_000_000_000u32;
+    let request = {
+        let client = client.clone();
+        tokio::spawn(async move { client.correct_time().await })
+    };
+    let outgoing = queue.recv().await.unwrap();
+    let (sequence, command, _) = outgoing_identity(outgoing.frame);
+    client
+        .receive(incoming(sequence, &command, &expected.to_be_bytes(), None), 0)
+        .unwrap();
+    request.await.unwrap().unwrap();
+    assert!((expected..=expected + 1).contains(&client.server_time_seconds().unwrap()));
+    for length in [0, 1, 3, 5, 8] {
+        let request = {
+            let client = client.clone();
+            tokio::spawn(async move { client.correct_time().await })
+        };
+        let outgoing = queue.recv().await.unwrap();
+        let (sequence, command, _) = outgoing_identity(outgoing.frame);
+        client
+            .receive(incoming(sequence, &command, &vec![0xff; length], None), 0)
+            .unwrap();
+        assert!(matches!(request.await.unwrap(), Err(Error::Malformed(_))));
+        assert!((expected..=expected + 1).contains(&client.server_time_seconds().unwrap()));
+        assert!(client.inner.lock().unwrap().connection.is_some());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn server_clock_discards_timed_out_and_replaced_transport_samples() {
+    let (client, mut queue) = queued_client();
+    client.inner.lock().unwrap().clock.correction(2_000_000_000, SystemTime::now());
+    let request = {
+        let client = client.clone();
+        tokio::spawn(async move { client.correct_time().await })
+    };
+    let outgoing = queue.recv().await.unwrap();
+    tokio::time::advance(Duration::from_secs(8)).await;
+    assert!(matches!(request.await.unwrap(), Err(Error::Timeout)));
+    let (sequence, command, _) = outgoing_identity(outgoing.frame);
+    client.receive(incoming(sequence, &command, &1u32.to_be_bytes(), None), 0).unwrap();
+    assert!(client.server_time_seconds().unwrap() >= 2_000_000_000);
+    let request = {
+        let client = client.clone();
+        tokio::spawn(async move { client.correct_time().await })
+    };
+    let outgoing = queue.recv().await.unwrap();
+    client.terminate("synthetic clock transport replacement".into());
+    assert!(matches!(request.await.unwrap(), Err(Error::Disconnected)));
+    let (sequence, command, _) = outgoing_identity(outgoing.frame);
+    client.receive(incoming(sequence, &command, &1u32.to_be_bytes(), None), 0).unwrap();
+    assert!(client.server_time_seconds().unwrap() >= 2_000_000_000);
+}

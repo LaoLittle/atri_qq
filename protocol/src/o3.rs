@@ -7,7 +7,7 @@ mod crypto;
 pub(crate) use channel::Channel;
 
 mod heartbeat;
-pub(crate) use heartbeat::Heartbeat;
+pub(crate) use heartbeat::{Heartbeat, Work};
 
 #[derive(Default)]
 pub(crate) struct Session {

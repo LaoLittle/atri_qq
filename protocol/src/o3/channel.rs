@@ -6,6 +6,11 @@ use rand::RngCore;
 
 pub(crate) struct Channel {
     peer: [u8; 33],
+    key_identifier: [u8; 66],
+    scope: u64,
+    generation: u64,
+    retired: [Option<Retired>; 5],
+    next_retired: usize,
     state: State,
 }
 
@@ -22,12 +27,22 @@ struct Established {
     expires_at: u64,
 }
 
+struct Retired {
+    key: [u8; 32],
+    uuid: [u8; 32],
+    parameter: u64,
+    generation: u64,
+}
+
 pub(crate) struct Request {
     pub command: &'static str,
     pub body: Bytes,
     key: [u8; 32],
     uuid: [u8; 32],
     parameter: u64,
+    peer: [u8; 33],
+    scope: u64,
+    generation: u64,
     mode: Mode,
 }
 
@@ -54,26 +69,74 @@ impl Channel {
 
     pub(crate) fn reset(&mut self) {
         self.state = State::Vacant;
+        self.scope = self.scope.wrapping_add(1);
+        self.retired = std::array::from_fn(|_| None);
+        self.next_retired = 0;
     }
 
     pub(crate) fn is_establishing(&self) -> bool {
         matches!(self.state, State::Establishing { .. })
     }
 
+    pub(crate) fn expires_at(&self) -> Option<u64> {
+        match &self.state {
+            State::Established(channel) => Some(channel.expires_at),
+            _ => None,
+        }
+    }
+
     pub(crate) fn failed(&mut self, request: &Request) {
-        if matches!(
-            (&self.state, &request.mode),
-            (State::Establishing { uuid }, Mode::Establish) if *uuid == request.uuid
-        ) {
+        if matches!(request.mode, Mode::Establish) && self.is_current(request) {
             self.state = State::Vacant;
         }
     }
 
     pub(crate) fn with_peer(peer: [u8; 33]) -> Self {
+        let mut key_identifier = *crypto::KEY_IDENTIFIER;
+        if peer != crypto::PEER_PUBLIC_KEY {
+            hex::encode_to_slice(crypto::encode_peer(&peer), &mut key_identifier)
+                .expect("thirty-three bytes encode into sixty-six hex bytes");
+        }
         Self {
             peer,
+            key_identifier,
+            scope: 0,
+            generation: 0,
+            retired: std::array::from_fn(|_| None),
+            next_retired: 0,
             state: State::Vacant,
         }
+    }
+
+    pub(crate) fn rotate_peer(&mut self, payload: &[u8]) -> Result<()> {
+        let encoded: &[u8; 33] = payload
+            .get(..33)
+            .ok_or_else(|| Error::Malformed("Truncated O3 encoded peer".into()))?
+            .try_into()
+            .unwrap();
+        let mut key_identifier = *crypto::KEY_IDENTIFIER;
+        let peer = if *encoded == [0; 33] {
+            crypto::PEER_PUBLIC_KEY
+        } else {
+            hex::encode_to_slice(encoded, &mut key_identifier)
+                .expect("thirty-three bytes encode into sixty-six hex bytes");
+            crypto::decode_peer(encoded)
+        };
+        self.retired[self.next_retired] =
+            match std::mem::replace(&mut self.state, State::Vacant) {
+                State::Established(channel) => Some(Retired {
+                    key: channel.key,
+                    uuid: channel.uuid,
+                    parameter: channel.parameter,
+                    generation: self.generation,
+                }),
+                _ => None,
+            };
+        self.next_retired = (self.next_retired + 1) % self.retired.len();
+        self.generation = self.generation.wrapping_add(1);
+        self.peer = peer;
+        self.key_identifier = key_identifier;
+        Ok(())
     }
 
     pub(crate) fn prepare(&mut self, method: &str, body: Bytes, now: u64) -> Result<Request> {
@@ -94,6 +157,9 @@ impl Channel {
                     key: channel.key,
                     uuid: channel.uuid,
                     parameter: channel.parameter,
+                    peer: self.peer,
+                    scope: self.scope,
+                    generation: self.generation,
                     mode: Mode::Access,
                 });
             }
@@ -117,7 +183,7 @@ impl Channel {
         let body = pb::EstablishShareKeyRequest {
             method: Bytes::copy_from_slice(method.as_bytes()),
             client_public_key: Bytes::copy_from_slice(&agreement.public),
-            key_identifier: Bytes::from_static(crypto::KEY_IDENTIFIER),
+            key_identifier: Bytes::copy_from_slice(&self.key_identifier),
             encrypted_body,
             channel_uuid: encoded_uuid,
         }
@@ -130,6 +196,9 @@ impl Channel {
             key: agreement.key,
             uuid,
             parameter,
+            peer: self.peer,
+            scope: self.scope,
+            generation: self.generation,
             mode: Mode::Establish,
         })
     }
@@ -140,24 +209,50 @@ impl Channel {
         response: Bytes,
         _now: u64,
     ) -> Result<Reply> {
-        let current = match (&self.state, &request.mode) {
-            (State::Establishing { uuid }, Mode::Establish) => *uuid == request.uuid,
-            (State::Established(channel), Mode::Access) => {
-                channel.uuid == request.uuid && channel.parameter == request.parameter
-            }
-            _ => false,
-        };
-        if !current {
+        let current = self.is_current(&request);
+        let retired = !current
+            && matches!(request.mode, Mode::Access)
+            && request.scope == self.scope
+            && self.retired.iter().flatten().any(|channel| {
+                channel.generation == request.generation
+                    && channel.uuid == request.uuid
+                    && channel.key == request.key
+                    && channel.parameter == request.parameter
+            });
+        if !current && !retired {
             return Err(Error::Authentication("Stale O3 channel response".into()));
         }
-        let result = self.complete_current(&request, response);
+        let result = self.complete_request(&request, response, current);
         if result.is_err() && matches!(request.mode, Mode::Establish) {
             self.state = State::Vacant;
         }
         result
     }
 
-    fn complete_current(&mut self, request: &Request, response: Bytes) -> Result<Reply> {
+    fn is_current(&self, request: &Request) -> bool {
+        if request.scope != self.scope
+            || request.generation != self.generation
+            || request.peer != self.peer
+        {
+            return false;
+        }
+        match (&self.state, &request.mode) {
+            (State::Establishing { uuid }, Mode::Establish) => *uuid == request.uuid,
+            (State::Established(channel), Mode::Access) => {
+                channel.uuid == request.uuid
+                    && channel.key == request.key
+                    && channel.parameter == request.parameter
+            }
+            _ => false,
+        }
+    }
+
+    fn complete_request(
+        &mut self,
+        request: &Request,
+        response: Bytes,
+        current: bool,
+    ) -> Result<Reply> {
         match request.mode {
             Mode::Establish => {
                 let outer = pb::EstablishShareKeyResponse::decode(response)?;
@@ -166,7 +261,7 @@ impl Channel {
                 let plaintext = crypto::open(&request.key, &encrypted)?;
                 let inner = pb::EstablishInnerResponse::decode(plaintext)?;
                 crypto::authenticate(
-                    &self.peer,
+                    &request.peer,
                     request.parameter,
                     inner.parameter,
                     &merge_bytes(inner.material),
@@ -185,7 +280,9 @@ impl Channel {
             Mode::Access => {
                 let outer = pb::SecureAccessResponse::decode(response)?;
                 if let Err(error) = check_status(outer.status) {
-                    self.state = State::Vacant;
+                    if current {
+                        self.state = State::Vacant;
+                    }
                     return Err(error);
                 }
                 let encrypted = merge_bytes(outer.encrypted_body);
@@ -235,8 +332,12 @@ mod tests {
     };
 
     fn local_peer() -> (Channel, EcKey<Private>) {
+        local_peer_with_scalar(1)
+    }
+
+    fn local_peer_with_scalar(scalar: u32) -> (Channel, EcKey<Private>) {
         let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
-        let private = BigNum::from_u32(1).unwrap();
+        let private = BigNum::from_u32(scalar).unwrap();
         let mut context = BigNumContext::new().unwrap();
         let mut public = EcPoint::new(&group).unwrap();
         public
@@ -249,6 +350,26 @@ mod tests {
             .unwrap();
         let key = EcKey::from_private_components(&group, &private, &public).unwrap();
         (Channel::with_peer(peer), key)
+    }
+
+    fn server_key(key: &EcKey<Private>, client_public: &[u8]) -> [u8; 32] {
+        let mut context = BigNumContext::new().unwrap();
+        let point = EcPoint::from_bytes(key.group(), client_public, &mut context).unwrap();
+        let public = EcKey::from_public_key(key.group(), &point).unwrap();
+        let private = openssl::pkey::PKey::from_ec_key(key.clone()).unwrap();
+        let public = openssl::pkey::PKey::from_ec_key(public).unwrap();
+        let mut derive = openssl::derive::Deriver::new(&private).unwrap();
+        derive.set_peer(&public).unwrap();
+        let shared = derive.derive_to_vec().unwrap();
+        let mut hkdf = openssl::pkey_ctx::PkeyCtx::new_id(openssl::pkey::Id::HKDF).unwrap();
+        hkdf.derive_init().unwrap();
+        hkdf.set_hkdf_md(openssl::md::Md::sha256()).unwrap();
+        hkdf.set_hkdf_key(&shared).unwrap();
+        hkdf.set_hkdf_salt(&[]).unwrap();
+        hkdf.add_hkdf_info(&[]).unwrap();
+        let mut output = [0; 32];
+        assert_eq!(hkdf.derive(Some(&mut output)).unwrap(), output.len());
+        output
     }
 
     fn inner_response(
@@ -317,7 +438,13 @@ mod tests {
         assert_eq!(request.command, ESTABLISH_COMMAND);
         let outer = pb::EstablishShareKeyRequest::decode(request.body.clone()).unwrap();
         assert_eq!(outer.method.as_ref(), b"getToken");
-        assert_eq!(outer.key_identifier.as_ref(), crypto::KEY_IDENTIFIER);
+        assert_eq!(outer.key_identifier.as_ref(), channel.key_identifier);
+        assert_ne!(outer.key_identifier.as_ref(), crypto::KEY_IDENTIFIER);
+        assert_eq!(
+            outer.key_identifier.as_ref(),
+            hex::encode(crypto::encode_peer(&channel.peer)).as_bytes()
+        );
+        assert_eq!(server_key(&key, &outer.client_public_key), request.key);
         assert_eq!(outer.client_public_key.len(), 33);
         assert_eq!(outer.channel_uuid.as_ref(), request.uuid.as_slice());
         let plain = crypto::open(&request.key, &outer.encrypted_body).unwrap();
@@ -679,5 +806,342 @@ mod tests {
             .complete(request, response.encode_to_vec().into(), 101)
             .unwrap();
         assert_eq!(reply.body.as_ref(), b"fragmented encrypted business reply");
+    }
+
+    #[test]
+    fn peer_rotation_rebinds_establishment_and_preserves_in_flight_access() {
+        let mut channel = established();
+        let before = channel
+            .prepare("getToken", Bytes::from_static(b"before"), 101)
+            .unwrap();
+        let before_response = access_response(&before, b"retired before establishment");
+        let after = channel
+            .prepare("getToken", Bytes::from_static(b"after"), 101)
+            .unwrap();
+        let after_response = access_response(&after, b"retired after establishment");
+        let old_key = before.key;
+        let (replacement, replacement_key) = local_peer_with_scalar(2);
+        let encoded = crypto::encode_peer(&replacement.peer);
+        let mut payload = encoded.to_vec();
+        payload.extend_from_slice(b"accepted trailing data");
+        channel.rotate_peer(&payload).unwrap();
+        assert!(matches!(channel.state, State::Vacant));
+        assert_eq!(channel.peer, replacement.peer);
+        let current = channel
+            .prepare("getToken", Bytes::from_static(b"new channel"), 102)
+            .unwrap();
+        assert_eq!(current.command, ESTABLISH_COMMAND);
+        let current_uuid = current.uuid;
+        let outer = pb::EstablishShareKeyRequest::decode(current.body.clone()).unwrap();
+        assert_eq!(outer.key_identifier.as_ref(), hex::encode(encoded).as_bytes());
+        assert_eq!(
+            server_key(&replacement_key, &outer.client_public_key),
+            current.key
+        );
+        assert_ne!(current.key, old_key);
+        let reply = channel
+            .complete(before, before_response.encode_to_vec().into(), 102)
+            .unwrap();
+        assert_eq!(reply.body.as_ref(), b"retired before establishment");
+        assert!(reply.config.is_none());
+        assert!(matches!(
+            channel.state,
+            State::Establishing { uuid } if uuid == current_uuid
+        ));
+        let inner = inner_response(&channel, &replacement_key, &current);
+        let response = establish_response(&current, inner);
+        channel.complete(current, response, 102).unwrap();
+        let reply = channel
+            .complete(after, after_response.encode_to_vec().into(), 103)
+            .unwrap();
+        assert_eq!(reply.body.as_ref(), b"retired after establishment");
+        assert!(reply.config.is_none());
+        let next = channel
+            .prepare("getToken", Bytes::from_static(b"next"), 103)
+            .unwrap();
+        assert_eq!(next.command, ACCESS_COMMAND);
+        assert_eq!(next.uuid, current_uuid);
+        assert_ne!(next.key, old_key);
+    }
+
+    #[test]
+    fn malformed_rotation_preserves_live_state_and_zero_material_uses_defaults() {
+        let mut channel = established();
+        let peer = channel.peer;
+        let identifier = channel.key_identifier;
+        let old = channel
+            .prepare("getToken", Bytes::from_static(b"old"), 101)
+            .unwrap();
+        let uuid = old.uuid;
+        let response = access_response(&old, b"still live");
+        for length in 0..33 {
+            assert!(channel.rotate_peer(&[0xff; 33][..length]).is_err());
+            assert_eq!(channel.peer, peer);
+            assert_eq!(channel.key_identifier, identifier);
+        }
+        let next = channel
+            .prepare("getToken", Bytes::from_static(b"next"), 101)
+            .unwrap();
+        assert_eq!(next.command, ACCESS_COMMAND);
+        assert_eq!(next.uuid, uuid);
+        channel
+            .complete(old, response.encode_to_vec().into(), 101)
+            .unwrap();
+        channel.rotate_peer(&[0; 33]).unwrap();
+        assert_eq!(channel.peer, crypto::PEER_PUBLIC_KEY);
+        assert_eq!(&channel.key_identifier, crypto::KEY_IDENTIFIER);
+        let request = channel
+            .prepare("getToken", Bytes::from_static(b"default"), 102)
+            .unwrap();
+        assert_eq!(request.command, ESTABLISH_COMMAND);
+        let outer = pb::EstablishShareKeyRequest::decode(request.body).unwrap();
+        assert_eq!(outer.key_identifier.as_ref(), crypto::KEY_IDENTIFIER);
+    }
+
+    #[test]
+    fn rotation_does_not_authenticate_invalid_points_or_old_peer_signatures() {
+        let (mut channel, old_key) = local_peer();
+        let encoded = crypto::encode_peer(&[0xff; 33]);
+        channel.rotate_peer(&encoded).unwrap();
+        assert_eq!(channel.peer, [0xff; 33]);
+        assert!(
+            channel
+                .prepare("getToken", Bytes::from_static(b"invalid point"), 100)
+                .is_err()
+        );
+        assert!(matches!(channel.state, State::Vacant));
+        let (replacement, replacement_key) = local_peer_with_scalar(2);
+        channel
+            .rotate_peer(&crypto::encode_peer(&replacement.peer))
+            .unwrap();
+        let request = channel
+            .prepare("getToken", Bytes::from_static(b"wrong signer"), 100)
+            .unwrap();
+        let inner = inner_response(&channel, &old_key, &request);
+        let response = establish_response(&request, inner);
+        assert!(channel.complete(request, response, 100).is_err());
+        assert!(matches!(channel.state, State::Vacant));
+        let request = channel
+            .prepare("getToken", Bytes::from_static(b"new signer"), 100)
+            .unwrap();
+        let inner = inner_response(&channel, &replacement_key, &request);
+        let response = establish_response(&request, inner);
+        channel.complete(request, response, 100).unwrap();
+    }
+
+    #[test]
+    fn rotation_rejects_superseded_establishment_even_when_peer_is_unchanged() {
+        let (mut channel, key) = local_peer();
+        let mut old = channel
+            .prepare("getToken", Bytes::from_static(b"old"), 100)
+            .unwrap();
+        let inner = inner_response(&channel, &key, &old);
+        let response = establish_response(&old, inner);
+        channel
+            .rotate_peer(&crypto::encode_peer(&channel.peer))
+            .unwrap();
+        let current = channel
+            .prepare("getToken", Bytes::from_static(b"current"), 100)
+            .unwrap();
+        old.uuid = current.uuid;
+        channel.failed(&old);
+        assert!(channel.is_establishing());
+        assert!(channel.complete(old, response, 100).is_err());
+        assert!(matches!(
+            channel.state,
+            State::Establishing { uuid } if uuid == current.uuid
+        ));
+        let inner = inner_response(&channel, &key, &current);
+        let response = establish_response(&current, inner);
+        assert_eq!(
+            channel.complete(current, response, 100).unwrap().config.unwrap().option6,
+            4
+        );
+    }
+
+    #[test]
+    fn retired_rejection_auth_failure_and_context_mismatch_preserve_new_channel() {
+        for failure in 0..6 {
+            let mut channel = established();
+            let mut old = channel
+                .prepare("getToken", Bytes::from_static(b"old"), 101)
+                .unwrap();
+            let mut response = access_response(&old, b"old reply");
+            match failure {
+                0 => response.status = Some(7),
+                1 => {
+                    let mut encrypted = response.encrypted_body.pop().unwrap().to_vec();
+                    *encrypted.last_mut().unwrap() ^= 1;
+                    response.encrypted_body = vec![encrypted.into()];
+                }
+                2 => old.uuid[0] ^= 1,
+                3 => old.key[0] ^= 1,
+                4 => old.parameter ^= 1,
+                5 => old.scope ^= 1,
+                _ => unreachable!(),
+            }
+            let (replacement, key) = local_peer_with_scalar(2);
+            channel
+                .rotate_peer(&crypto::encode_peer(&replacement.peer))
+                .unwrap();
+            let current = channel
+                .prepare("getToken", Bytes::from_static(b"current"), 102)
+                .unwrap();
+            let uuid = current.uuid;
+            let inner = inner_response(&channel, &key, &current);
+            let current_response = establish_response(&current, inner);
+            channel.complete(current, current_response, 102).unwrap();
+            assert!(
+                channel
+                    .complete(old, response.encode_to_vec().into(), 103)
+                    .is_err()
+            );
+            let next = channel
+                .prepare("getToken", Bytes::from_static(b"next"), 103)
+                .unwrap();
+            assert_eq!(next.command, ACCESS_COMMAND);
+            assert_eq!(next.uuid, uuid);
+        }
+    }
+
+    #[test]
+    fn rotation_history_accepts_five_generations_and_evicts_the_sixth() {
+        let (mut channel, key) = local_peer();
+        let encoded = crypto::encode_peer(&channel.peer);
+        let establish = |channel: &mut Channel| {
+            let request = channel
+                .prepare("getToken", Bytes::from_static(b"establish"), 100)
+                .unwrap();
+            let inner = inner_response(channel, &key, &request);
+            let response = establish_response(&request, inner);
+            channel.complete(request, response, 100).unwrap();
+        };
+        establish(&mut channel);
+        let oldest = channel
+            .prepare("getToken", Bytes::from_static(b"oldest"), 101)
+            .unwrap();
+        let oldest_response = access_response(&oldest, b"evicted");
+        let mut pending = Vec::new();
+        for _ in 0..5 {
+            let request = channel
+                .prepare("getToken", Bytes::from_static(b"retiring"), 101)
+                .unwrap();
+            let response = access_response(&request, b"within window");
+            pending.push((request, response));
+            channel.rotate_peer(&encoded).unwrap();
+            establish(&mut channel);
+        }
+        let (request, response) = pending.remove(0);
+        channel
+            .complete(request, response.encode_to_vec().into(), 101)
+            .unwrap();
+        channel.rotate_peer(&encoded).unwrap();
+        establish(&mut channel);
+        assert!(
+            channel
+                .complete(oldest, oldest_response.encode_to_vec().into(), 101)
+                .is_err()
+        );
+        for (request, response) in pending {
+            let reply = channel
+                .complete(request, response.encode_to_vec().into(), 101)
+                .unwrap();
+            assert_eq!(reply.body.as_ref(), b"within window");
+            assert!(reply.config.is_none());
+        }
+    }
+
+    #[test]
+    fn reset_rejects_retired_access_and_preserves_rotated_peer_identity() {
+        let mut channel = established();
+        let old = channel
+            .prepare("getToken", Bytes::from_static(b"old scope"), 101)
+            .unwrap();
+        let response = access_response(&old, b"previous scope");
+        let (replacement, key) = local_peer_with_scalar(2);
+        channel
+            .rotate_peer(&crypto::encode_peer(&replacement.peer))
+            .unwrap();
+        channel.reset();
+        let current = channel
+            .prepare("getToken", Bytes::from_static(b"current scope"), 102)
+            .unwrap();
+        let uuid = current.uuid;
+        assert_eq!(channel.peer, replacement.peer);
+        assert_eq!(channel.key_identifier, replacement.key_identifier);
+        assert!(
+            channel
+                .complete(old, response.encode_to_vec().into(), 102)
+                .is_err()
+        );
+        assert!(matches!(
+            channel.state,
+            State::Establishing { uuid: current_uuid } if current_uuid == uuid
+        ));
+        let inner = inner_response(&channel, &key, &current);
+        let response = establish_response(&current, inner);
+        channel.complete(current, response, 102).unwrap();
+    }
+
+    #[test]
+    fn nonzero_encoded_material_with_zero_prefix_does_not_use_default_peer() {
+        let mut channel = Channel::new();
+        let mut encoded = [0; 33];
+        encoded[32] = 1;
+        channel.rotate_peer(&encoded).unwrap();
+        assert_eq!(channel.peer, crypto::decode_peer(&encoded));
+        assert_ne!(channel.peer, crypto::PEER_PUBLIC_KEY);
+        assert_eq!(
+            channel.key_identifier.as_slice(),
+            hex::encode(encoded).as_bytes()
+        );
+        assert!(
+            channel
+                .prepare("getToken", Bytes::from_static(b"invalid encoded peer"), 100)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn vacant_rotations_evict_retired_keys_without_clearing_new_handshake() {
+        let mut channel = established();
+        let accepted = channel
+            .prepare("getToken", Bytes::from_static(b"accepted"), 101)
+            .unwrap();
+        let accepted_response = access_response(&accepted, b"fifth rotation");
+        let rejected = channel
+            .prepare("getToken", Bytes::from_static(b"rejected"), 101)
+            .unwrap();
+        let mut rejected_response = access_response(&rejected, b"late rejection");
+        rejected_response.status = Some(7);
+        let evicted = channel
+            .prepare("getToken", Bytes::from_static(b"evicted"), 101)
+            .unwrap();
+        let evicted_response = access_response(&evicted, b"sixth rotation");
+        let encoded = crypto::encode_peer(&channel.peer);
+        for _ in 0..5 {
+            channel.rotate_peer(&encoded).unwrap();
+        }
+        let current = channel
+            .prepare("getToken", Bytes::from_static(b"current"), 102)
+            .unwrap();
+        channel
+            .complete(accepted, accepted_response.encode_to_vec().into(), 102)
+            .unwrap();
+        assert!(
+            channel
+                .complete(rejected, rejected_response.encode_to_vec().into(), 102)
+                .is_err()
+        );
+        assert!(matches!(
+            channel.state,
+            State::Establishing { uuid } if uuid == current.uuid
+        ));
+        channel.rotate_peer(&encoded).unwrap();
+        assert!(
+            channel
+                .complete(evicted, evicted_response.encode_to_vec().into(), 102)
+                .is_err()
+        );
     }
 }

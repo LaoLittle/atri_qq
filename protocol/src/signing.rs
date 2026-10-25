@@ -16,8 +16,11 @@ use ::signing::{
 use rand::RngCore;
 use std::{
     collections::VecDeque,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tokio::time::Instant;
+
+const FILE_TELEMETRY_INTERVAL: Duration = Duration::from_secs(3600);
 
 mod commands {
     include!("signed_commands.rs");
@@ -139,7 +142,8 @@ pub struct SessionSigner {
     resources: SigningResources,
     account: Option<u64>,
     empty_token_reported: bool,
-    verify_file_reported: bool,
+    business_session_started: bool,
+    telemetry_deadline: Option<Instant>,
 }
 impl Default for SessionSigner {
     fn default() -> Self {
@@ -148,7 +152,8 @@ impl Default for SessionSigner {
             resources: SigningResources::default(),
             account: None,
             empty_token_reported: false,
-            verify_file_reported: false,
+            business_session_started: false,
+            telemetry_deadline: None,
         }
     }
 }
@@ -166,6 +171,17 @@ impl SessionSigner {
                         || identity.guid.as_slice() != state.keystore.guid.as_slice()
                         || identity.device_name != state.keystore.device_name
                 });
+        if local_identity_changed
+            || self.signer.context().qua != state.profile.qua.as_bytes()
+            || self.signer.context().machine_id != state.machine_id.as_bytes()
+        {
+            self.telemetry_deadline = None;
+            self.resources.report_resources_generation =
+                self.resources.report_resources_generation.wrapping_add(1);
+            self.resources
+                .reports
+                .retain(|report| report.method != o3::REPORT_COMMAND);
+        }
         if local_identity_changed {
             let properties = o3::local_device_properties(state)?;
             let guid = state.keystore.guid.as_slice().try_into().map_err(|_| {
@@ -197,7 +213,8 @@ impl SessionSigner {
     fn initialize_account(&mut self, account: u64, state: &SessionState) -> Result<()> {
         if self.account != Some(account) {
             self.resources.generation = self.resources.generation.wrapping_add(1);
-            self.verify_file_reported = false;
+            self.business_session_started = false;
+            self.telemetry_deadline = None;
         }
         self.signer
             .initialize(
@@ -222,7 +239,8 @@ impl SessionSigner {
         self.initialize(state)?;
         self.resources.generation = self.resources.generation.wrapping_add(1);
         self.empty_token_reported = false;
-        self.verify_file_reported = false;
+        self.business_session_started = false;
+        self.telemetry_deadline = None;
         self.initialize_account(0, state)
     }
     /// Invoke after real login tickets are available, before establishing O3's
@@ -261,17 +279,73 @@ impl SessionSigner {
         }
         Ok(())
     }
-    /// Queue synthetic file telemetry only after successful online registration.
-    /// Retries within one login must not replay it or create account tokens.
-    pub(crate) fn registration_complete(&mut self, state: &SessionState) -> Result<()> {
+    pub(crate) fn business_session_started(&mut self, state: &SessionState) -> Result<()> {
         if state.keystore.uin == 0 || self.account != Some(state.keystore.uin) {
+            return Err(Error::Malformed(
+                "Cannot start business session before signer ticket binding".into(),
+            ));
+        }
+        self.initialize(state)?;
+        if state.keystore.uid.is_empty() || self.business_session_started {
+            return Ok(());
+        }
+        self.business_session_started = true;
+        tracing::debug!(
+            target: "atri_qq_protocol::packet_trace",
+            stage = "o3_state",
+            phase = "business_session_bound",
+            get_token_pending = self.signer.tokens.report_pending(),
+            "QQ O3 state"
+        );
+        self.signer
+            .tokens
+            .refresh_active_account(&mut self.resources)
+            .map_err(|error| Error::Crypto(format!("O3 business session token refresh: {error:?}")))
+    }
+
+    fn telemetry_scope_matches(&self, state: &SessionState) -> bool {
+        state.keystore.uin != 0
+            && self.account == Some(state.keystore.uin)
+            && self.signer.context().qua == state.profile.qua.as_bytes()
+            && self.signer.context().machine_id == state.machine_id.as_bytes()
+            && self.resources.local_identity.as_ref().is_some_and(|identity| {
+                identity.machine_id == state.machine_id
+                    && identity.guid.as_slice() == state.keystore.guid.as_slice()
+                    && identity.device_name == state.keystore.device_name
+            })
+    }
+
+    pub(crate) fn registration_complete(&mut self, state: &SessionState) -> Result<()> {
+        if !self.telemetry_scope_matches(state) {
+            self.telemetry_deadline = None;
             return Err(Error::Malformed(
                 "Cannot report file telemetry before signer ticket binding".into(),
             ));
         }
-        if self.verify_file_reported {
+        if self.telemetry_deadline.is_none() {
+            self.telemetry_deadline = Some(Instant::now());
+            self.poll_telemetry(state)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn telemetry_deadline(&self) -> Option<Instant> {
+        self.telemetry_deadline
+    }
+
+    pub(crate) fn poll_telemetry(&mut self, state: &SessionState) -> Result<()> {
+        self.poll_telemetry_at(state, Instant::now())
+    }
+
+    fn poll_telemetry_at(&mut self, state: &SessionState, now: Instant) -> Result<()> {
+        if !self.telemetry_scope_matches(state) {
+            self.telemetry_deadline = None;
             return Ok(());
         }
+        if self.telemetry_deadline.is_none_or(|deadline| deadline > now) {
+            return Ok(());
+        }
+        self.telemetry_deadline = Some(now + FILE_TELEMETRY_INTERVAL);
         if self.resources.reports.len() >= 64 {
             return Err(Error::Crypto("Pending O3 report queue is full".into()));
         }
@@ -282,7 +356,6 @@ impl SessionSigner {
             generation: self.resources.generation,
             report_resources_generation: self.resources.report_resources_generation,
         });
-        self.verify_file_reported = true;
         Ok(())
     }
     pub fn generation(&self) -> u64 {
@@ -324,9 +397,6 @@ impl SessionSigner {
         }
         Ok(Some(signature))
     }
-    /// Replace explicit session resources. Inventory updates invalidate outstanding
-    /// telemetry snapshots, not getToken transport or its pending state. They do
-    /// not replay an already emitted event; the next login uses the new inventory.
     pub fn set_resources(
         &mut self,
         properties: Option<DeviceProperties>,
@@ -447,6 +517,12 @@ impl SessionSigner {
             .complete_report(&report.account, response)
             .map_err(|e| Error::Crypto(format!("O3 report: {e:?}")))
     }
+    pub(crate) fn token_status(&self) -> (usize, Option<i64>) {
+        self.signer
+            .tokens
+            .account_token(&self.signer.context().uin)
+            .map_or((0, None), |token| (token.bytes.len(), Some(token.expires_at)))
+    }
     pub fn complete_xwid(&mut self, acquisition: XwidAcquisition) {
         self.signer.tokens.complete_xwid(acquisition)
     }
@@ -509,7 +585,7 @@ mod tests {
         assert!(signer.drain_reports().is_empty());
     }
     #[test]
-    fn file_telemetry_is_once_per_login_and_old_replies_are_rejected() {
+    fn file_telemetry_starts_once_per_registration_and_old_replies_are_rejected() {
         let mut signer = SessionSigner::default();
         let state = state(1234);
         assert!(signer.registration_complete(&state).is_err());
@@ -832,5 +908,197 @@ mod tests {
             signer.signer.tokens.account_token(b"1234").unwrap().bytes,
             b"current-attempt"
         );
+    }
+
+    fn issue_token(signer: &mut SessionSigner) {
+        use prost::Message;
+        let report = signer
+            .drain_reports()
+            .into_iter()
+            .find(|report| report.method == "getToken")
+            .unwrap();
+        signer
+            .complete_report(
+                &report,
+                ReportResponse {
+                    bytes: signing_engine::proto::IssuedTokenReply {
+                        token: b"synthetic-issued-token".to_vec(),
+                        expires_at: 4_000_000_000,
+                    }
+                    .encode_to_vec(),
+                    transport_succeeded: true,
+                    error_code: 0,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn business_session_refreshes_a_valid_token_once_after_uid_arrives() {
+        let mut signer = SessionSigner::default();
+        let mut state = state(1234);
+        assert!(signer.business_session_started(&state).is_err());
+        signer.ticket_complete(&state).unwrap();
+        issue_token(&mut signer);
+        let status = signer.token_status();
+        signer.business_session_started(&state).unwrap();
+        assert!(!signer.business_session_started);
+        assert!(signer.drain_reports().is_empty());
+        state.keystore.uid = "u_synthetic".into();
+        signer.business_session_started(&state).unwrap();
+        assert!(signer.business_session_started);
+        assert_eq!(signer.token_status(), status);
+        let reports = signer.drain_reports();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].method, "getToken");
+        signer.business_session_started(&state).unwrap();
+        assert!(signer.drain_reports().is_empty());
+    }
+
+    #[test]
+    fn business_session_does_not_append_a_refresh_after_an_inflight_report() {
+        let mut signer = SessionSigner::default();
+        let mut state = state(1234);
+        state.keystore.uid = "u_synthetic".into();
+        signer.ticket_complete(&state).unwrap();
+        signer.business_session_started(&state).unwrap();
+        assert!(signer.business_session_started);
+        issue_token(&mut signer);
+        signer.business_session_started(&state).unwrap();
+        assert!(signer.drain_reports().is_empty());
+        assert!(!signer.signer.tokens.report_pending());
+    }
+
+    #[test]
+    fn business_session_gate_resets_for_new_login_and_account_generations() {
+        let mut signer = SessionSigner::default();
+        let mut first = state(1234);
+        first.keystore.uid = "u_first".into();
+        signer.ticket_complete(&first).unwrap();
+        issue_token(&mut signer);
+        signer.business_session_started(&first).unwrap();
+        issue_token(&mut signer);
+        let generation = signer.generation();
+        signer.begin_login(&first).unwrap();
+        assert!(!signer.business_session_started);
+        assert!(signer.business_session_started(&first).is_err());
+        signer.ticket_complete(&first).unwrap();
+        signer.drain_reports();
+        signer.business_session_started(&first).unwrap();
+        assert_ne!(signer.generation(), generation);
+        assert_eq!(
+            signer.resources.reports.iter().filter(|report| report.method == "getToken").count(),
+            1
+        );
+        issue_token(&mut signer);
+        let mut second = state(5678);
+        second.keystore.uid = "u_second".into();
+        signer.ticket_complete(&second).unwrap();
+        assert!(!signer.business_session_started);
+        issue_token(&mut signer);
+        signer.business_session_started(&second).unwrap();
+        let reports = signer.drain_reports();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].method, "getToken");
+    }
+
+    #[test]
+    fn file_telemetry_repeats_hourly_without_catchup_or_token_side_effects() {
+        let mut signer = SessionSigner::default();
+        let state = state(1234);
+        signer.ticket_complete(&state).unwrap();
+        assert!(signer.telemetry_deadline().is_none());
+        signer.poll_telemetry(&state).unwrap();
+        assert!(signer.telemetry_deadline().is_none());
+        signer.drain_reports();
+        signer.registration_complete(&state).unwrap();
+        assert_eq!(signer.drain_reports().len(), 1);
+        let deadline = signer.telemetry_deadline().unwrap();
+        let token_status = signer.token_status();
+        signer.poll_telemetry_at(&state, deadline - Duration::from_nanos(1)).unwrap();
+        assert!(signer.drain_reports().is_empty());
+        signer.poll_telemetry_at(&state, deadline).unwrap();
+        let reports = signer.drain_reports();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].method, o3::REPORT_COMMAND);
+        assert!(signer.signer.tokens.report_pending());
+        assert_eq!(signer.token_status(), token_status);
+        let late = deadline + FILE_TELEMETRY_INTERVAL * 5;
+        signer.poll_telemetry_at(&state, late).unwrap();
+        assert_eq!(signer.drain_reports().len(), 1);
+        assert_eq!(signer.telemetry_deadline(), Some(late + FILE_TELEMETRY_INTERVAL));
+    }
+
+    #[test]
+    fn next_file_telemetry_cycle_uses_current_inventory_without_immediate_replay() {
+        use prost::Message;
+        let mut signer = SessionSigner::default();
+        let state = state(1234);
+        signer.ticket_complete(&state).unwrap();
+        signer.drain_reports();
+        signer.registration_complete(&state).unwrap();
+        signer.drain_reports();
+        let deadline = signer.telemetry_deadline().unwrap();
+        let inventory = vec!["/synthetic/new-module.js".to_string()];
+        signer.set_resources(None, None, Some(inventory.clone())).unwrap();
+        assert_eq!(signer.telemetry_deadline(), Some(deadline));
+        signer.poll_telemetry(&state).unwrap();
+        assert!(signer.drain_reports().is_empty());
+        signer.poll_telemetry_at(&state, deadline).unwrap();
+        let report = signer.drain_reports().pop().unwrap();
+        let decoded = crate::proto::o3::TelemetryReport::decode(report.body.as_slice()).unwrap();
+        let paths: Vec<String> = serde_json::from_str(&decoded.data[0].values[4]).unwrap();
+        assert_eq!(paths, inventory);
+    }
+
+    #[test]
+    fn full_file_telemetry_queue_advances_deadline_without_dropping_token_work() {
+        let mut signer = SessionSigner::default();
+        let state = state(1234);
+        signer.ticket_complete(&state).unwrap();
+        signer.drain_reports();
+        for _ in 0..64 {
+            let report = signer.channel_report("getToken", vec![1]);
+            signer.resources.reports.push_back(report);
+        }
+        assert!(signer.registration_complete(&state).is_err());
+        let deadline = signer.telemetry_deadline().unwrap();
+        signer.poll_telemetry(&state).unwrap();
+        assert_eq!(signer.resources.reports.len(), 64);
+        assert!(signer.poll_telemetry_at(&state, deadline).is_err());
+        assert_eq!(signer.telemetry_deadline(), Some(deadline + FILE_TELEMETRY_INTERVAL));
+        assert_eq!(signer.drain_token_reports().len(), 64);
+    }
+
+    #[test]
+    fn file_telemetry_scope_changes_cancel_until_registration() {
+        let mut signer = SessionSigner::default();
+        let mut state = state(1234);
+        signer.ticket_complete(&state).unwrap();
+        let token = signer
+            .drain_reports()
+            .into_iter()
+            .find(|report| report.method == "getToken")
+            .unwrap();
+        let status = signer.token_status();
+        signer.registration_complete(&state).unwrap();
+        let report = signer.drain_reports().pop().unwrap();
+        state.machine_id = "another-machine".into();
+        signer.poll_telemetry(&state).unwrap();
+        assert!(signer.telemetry_deadline().is_none());
+        signer.initialize(&state).unwrap();
+        assert!(!signer.report_is_current(&report));
+        assert!(signer.report_is_current(&token));
+        assert!(signer.signer.tokens.report_pending());
+        assert_eq!(signer.token_status(), status);
+        signer.registration_complete(&state).unwrap();
+        assert!(signer.telemetry_deadline().is_some());
+        signer.begin_login(&state).unwrap();
+        assert!(signer.telemetry_deadline().is_none());
+        signer.ticket_complete(&state).unwrap();
+        assert!(signer.telemetry_deadline().is_none());
+        state.keystore.uin = 5678;
+        signer.poll_telemetry(&state).unwrap();
+        assert!(signer.telemetry_deadline().is_none());
     }
 }

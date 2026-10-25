@@ -11,8 +11,12 @@ use openssl::{
 };
 
 fn peer() -> ([u8; 33], EcKey<Private>) {
+    peer_with_scalar(1)
+}
+
+fn peer_with_scalar(scalar: u32) -> ([u8; 33], EcKey<Private>) {
     let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
-    let private = BigNum::from_u32(1).unwrap();
+    let private = BigNum::from_u32(scalar).unwrap();
     let mut context = BigNumContext::new().unwrap();
     let mut public = EcPoint::new(&group).unwrap();
     public
@@ -73,8 +77,7 @@ fn establish_reply_with_config(
     let plaintext = crate::crypto::aes_gcm_decrypt(&request.encrypted_body, &key).unwrap();
     let inner = pb::ChannelPlaintext::decode(plaintext.as_slice()).unwrap();
     assert_eq!(inner.uuid, request.channel_uuid);
-    let report = signing_engine::proto::TokenReport::decode(inner.body).unwrap();
-    assert!(report.previous_token.is_empty());
+    signing_engine::proto::TokenReport::decode(inner.body).unwrap();
     let mut context = BigNumContext::new().unwrap();
     let encoded = peer
         .public_key()
@@ -662,4 +665,77 @@ async fn reconnect_cancels_unfinished_bootstrap_without_stalling_token_work() {
     assert_ne!(current.channel_uuid, old.channel_uuid);
     assert_ne!(current.client_public_key, old.client_public_key);
     client.terminate("O3 interrupted bootstrap recovery verified".into());
+}
+
+#[tokio::test(start_paused = true)]
+async fn background_peer_rotation_preserves_ack_and_applies_interval_at_next_work() {
+    let (client, mut queue) = queued_client();
+    let (public, first_peer) = peer();
+    let (rotated_public, rotated_peer) = peer_with_scalar(2);
+    let encoded: [u8; 33] = std::array::from_fn(|index| {
+        let decoded = (index + 8) % 33;
+        rotated_public[decoded] ^ b"3UEBOKPY"[decoded % 8]
+    });
+    client.start_background_work(0);
+    client.start_signing_work(0, crate::o3::Channel::with_peer(public));
+    bind(&client);
+    let (sequence, body) = next_establish(&client, &mut queue).await;
+    let (reply, first_key, first_uuid) = establish_reply_with_config(
+        body,
+        &first_peer,
+        b"before-rotation",
+        Some(pb::ChannelConfig { option2: 1, option4: 1, option6: 1, ..Default::default() }),
+        crate::o3::unix_seconds().unwrap() + 7200,
+    );
+    client.receive(incoming(sequence, crate::o3::ESTABLISH_COMMAND, &reply, Some(&[0; 16])), 0).unwrap();
+    let (sequence, heartbeat) = next_access(&client, &mut queue).await;
+    assert_eq!(heartbeat.method.as_ref(), b"heartbeat");
+    let tasks = pb::HeartbeatResponse {
+        identifier: Bytes::from_static(b"rotation"),
+        tasks: vec![
+            pb::HeartbeatTask { kind: 6, identifier: Bytes::from_static(b"interval"), payload: Bytes::copy_from_slice(&61u32.to_be_bytes()) },
+            pb::HeartbeatTask { kind: 9, identifier: Bytes::from_static(b"peer"), payload: Bytes::copy_from_slice(&encoded) },
+            pb::HeartbeatTask { kind: 7, identifier: Bytes::from_static(b"refresh"), ..Default::default() },
+        ],
+    };
+    answer_access(&client, sequence, &first_key, &tasks.encode_to_vec());
+    let (ack_sequence, ack) = next_access(&client, &mut queue).await;
+    assert_eq!(ack.method.as_ref(), b"taskAck");
+    assert_eq!(ack.channel_uuid, first_uuid);
+    let plain = crate::crypto::aes_gcm_decrypt(&ack.encrypted_body, &first_key).unwrap();
+    assert_eq!(pb::TaskAckRequest::decode(plain.as_slice()).unwrap().identifier.as_ref(), b"rotation");
+    let (sequence, body) = next_establish(&client, &mut queue).await;
+    let request = pb::EstablishShareKeyRequest::decode(body.clone()).unwrap();
+    assert_eq!(request.key_identifier.as_ref(), hex::encode(encoded).as_bytes());
+    let (reply, rotated_key, rotated_uuid) = establish_reply_with_config(
+        body,
+        &rotated_peer,
+        b"after-rotation",
+        Some(pb::ChannelConfig { option2: 1, option4: 1, option6: 1, ..Default::default() }),
+        crate::o3::unix_seconds().unwrap() + 7200,
+    );
+    client.receive(incoming(sequence, crate::o3::ESTABLISH_COMMAND, &reply, Some(&[0; 16])), 0).unwrap();
+    let (report_sequence, report) = next_access(&client, &mut queue).await;
+    assert_eq!(report.method.as_ref(), b"taskReport");
+    assert_eq!(report.channel_uuid, rotated_uuid);
+    let plain = crate::crypto::aes_gcm_decrypt(&report.encrypted_body, &rotated_key).unwrap();
+    let report = pb::TaskReportRequest::decode(plain.as_slice()).unwrap();
+    assert_eq!(report.results.iter().map(|r| r.identifier.as_ref()).collect::<Vec<_>>(), [b"interval".as_slice(), b"peer".as_slice(), b"refresh".as_slice()]);
+    assert!(report.results.iter().all(|result| result.body.is_empty()));
+    let empty = pb::HeartbeatResponse { identifier: Bytes::from_static(b"done"), ..Default::default() }.encode_to_vec();
+    answer_access(&client, ack_sequence, &first_key, &empty);
+    answer_access(&client, report_sequence, &rotated_key, &empty);
+    tokio::task::yield_now().await;
+    assert_eq!(token(&client), b"after-rotation");
+    tokio::time::advance(Duration::from_secs(179)).await;
+    assert!(queue.try_recv().is_err());
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let (sequence, heartbeat) = next_access(&client, &mut queue).await;
+    assert_eq!(heartbeat.channel_uuid, rotated_uuid);
+    let plain = crate::crypto::aes_gcm_decrypt(&heartbeat.encrypted_body, &rotated_key).unwrap();
+    let heartbeat = pb::HeartbeatRequest::decode(plain.as_slice()).unwrap();
+    assert_eq!(heartbeat.interval_seconds, 61);
+    assert_eq!(heartbeat.sequence, 1);
+    answer_access(&client, sequence, &rotated_key, &empty);
+    client.terminate("synthetic rotation regression complete".into());
 }

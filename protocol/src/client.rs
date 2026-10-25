@@ -13,7 +13,7 @@ use prost::Message;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     sync::{Arc, Mutex, Weak},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tokio::{
     net::TcpStream,
@@ -45,6 +45,7 @@ struct Pending {
     cancel: CancellationToken,
 }
 enum RequestBinding<'a> {
+    Connection(u64),
     Online(u64),
     SigningReport {
         generation: u64,
@@ -72,6 +73,7 @@ struct Inner {
     state: SessionState,
     signer: SessionSigner,
     o3: crate::o3::Session,
+    clock: crate::clock::ServerClock,
     sequence: i32,
     next_id: u64,
     generation: u64,
@@ -150,6 +152,7 @@ impl Client {
                 state,
                 signer,
                 o3: crate::o3::Session::default(),
+                clock: crate::clock::ServerClock::default(),
                 sequence: rand::random::<u32>().wrapping_rem(4_900_001) as i32 + 5_000_000,
                 next_id: 0,
                 generation: 0,
@@ -233,6 +236,13 @@ impl Client {
             self.emit(LoginEvent::KeystoreChanged(state.keystore.clone()))
         }
         inner.state = state;
+        if inner.state.online {
+            let Inner { state, signer, .. } = &mut *inner;
+            if let Err(error) = signer.business_session_started(state) {
+                tracing::warn!(%error, "O3 business session could not be bound");
+            }
+            self.signing_work.notify_one();
+        }
     }
     pub(crate) fn confirm_online(&self, generation: u64) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
@@ -244,8 +254,12 @@ impl Client {
         }
         if inner.state.keystore.uin != 0 {
             let Inner { state, signer, .. } = &mut *inner;
+            if let Err(error) = signer.business_session_started(state) {
+                tracing::warn!(%error, "O3 business session could not be bound");
+            }
             signer.registration_complete(state)?;
             self.background_work.notify_one();
+            self.signing_work.notify_one();
         }
         inner.state.online = true;
         let cancel = inner.cancel.clone();
@@ -267,6 +281,39 @@ impl Client {
     }
     pub fn account_uin(&self) -> u64 {
         self.inner.lock().unwrap().state.keystore.uin
+    }
+    pub(crate) fn server_time_seconds(&self) -> Result<u32> {
+        self.inner.lock().unwrap().clock.unix_seconds()
+    }
+    pub(crate) async fn correct_time(&self) -> Result<()> {
+        let generation = self.connection_generation();
+        let started = Instant::now();
+        let response = self
+            .request_inner(
+                "Client.CorrectTime",
+                Bytes::from_static(&[0, 0, 0, 4]),
+                RequestType::Simple,
+                Encryption::None,
+                Duration::from_secs(7),
+                Some(RequestBinding::Connection(generation)),
+            )
+            .await?;
+        if started.elapsed() > Duration::from_secs(7) {
+            return Err(wire::malformed("CorrectTime round trip exceeds seven seconds"));
+        }
+        let server = u32::from_be_bytes(
+            response
+                .as_ref()
+                .try_into()
+                .map_err(|_| wire::malformed("CorrectTime response must contain four bytes"))?,
+        );
+        let mut inner = self.inner.lock().unwrap();
+        if inner.generation != generation || inner.connection.is_none() || inner.cancel.is_cancelled() {
+            return Err(Error::Disconnected);
+        }
+        inner.clock.correction(server, SystemTime::now());
+        tracing::debug!(target: "atri_qq_protocol::packet_trace", stage = "clock", generation, server_time = server, "QQ clock corrected");
+        Ok(())
     }
     pub(crate) fn is_current_online(&self, generation: u64) -> bool {
         let inner = self.inner.lock().unwrap();
@@ -783,6 +830,7 @@ impl Client {
             let mut i = self.inner.lock().unwrap();
             let current = match binding {
                 None => true,
+                Some(RequestBinding::Connection(generation)) => i.generation == generation,
                 Some(RequestBinding::Online(generation)) => {
                     i.generation == generation && i.state.online
                 }
@@ -1165,7 +1213,7 @@ impl Client {
                     queued.clear();
                     scope = active_scope;
                 }
-                queued.extend(reports);
+                queued.extend(reports.into_iter().map(crate::o3::Work::Report));
                 if active_scope.is_some() {
                     let mut inner = client.inner.lock().unwrap();
                     if inner.signing_ready && inner.generation == generation {
@@ -1174,7 +1222,9 @@ impl Client {
                         } = &mut *inner;
                         match o3.heartbeat.take_due(state) {
                             Ok(Some(body)) => {
-                                queued.push_back(signer.channel_report("heartbeat", body));
+                                queued.push_back(crate::o3::Work::Report(
+                                    signer.channel_report("heartbeat", body),
+                                ));
                             }
                             Ok(None) => {}
                             Err(error) => {
@@ -1189,14 +1239,31 @@ impl Client {
                         if inner.generation != generation || inner.connection.is_none() {
                             return;
                         }
-                        if inner.o3.channel.is_establishing() {
+                        let Some(work) = queued.pop_front() else {
                             break;
-                        }
-                        let Some(mut report) = queued.pop_front() else {
-                            break;
+                        };
+                        let mut report = match work {
+                            crate::o3::Work::Report(report) => report,
+                            crate::o3::Work::RotatePeer { material, generation: signing_generation, account } => {
+                                if inner.signing_ready
+                                    && inner.signer.generation() == signing_generation
+                                    && inner.state.keystore.uin == account
+                                {
+                                    if let Err(error) = inner.o3.channel.rotate_peer(&material) {
+                                        tracing::warn!(%error, "O3 peer rotation rejected");
+                                    } else {
+                                        tracing::debug!(target: "atri_qq_protocol::packet_trace", stage = "o3_state", generation, phase = "peer_rotated", "QQ O3 state");
+                                    }
+                                }
+                                continue;
+                            }
                         };
                         if !inner.signing_ready || !inner.signer.report_is_current(&report) {
                             continue;
+                        }
+                        if inner.o3.channel.is_establishing() {
+                            queued.push_front(crate::o3::Work::Report(report));
+                            break;
                         }
                         let body = Bytes::from(std::mem::take(&mut report.body));
                         let request = match crate::o3::unix_seconds()
@@ -1254,6 +1321,7 @@ impl Client {
                         if inner.generation != generation || !inner.signer.report_is_current(&report) {
                             continue;
                         }
+                        let command = request.command;
                         let result = match response {
                             Ok(response) => crate::o3::unix_seconds()
                                 .and_then(|now| inner.o3.channel.complete(request, response, now)),
@@ -1264,9 +1332,11 @@ impl Client {
                         };
                         match result {
                             Ok(reply) => {
+                                tracing::debug!(target: "atri_qq_protocol::packet_trace", stage = "o3_state", generation, method = report.method, command, phase = "authenticated_reply", channel_expires_at = ?inner.o3.channel.expires_at(), "QQ O3 state");
                                 if let Some(config) = reply.config {
                                     inner.signer.apply_channel_config(&config);
                                     inner.o3.heartbeat.configure(config.option4 != 0);
+                                    tracing::debug!(target: "atri_qq_protocol::packet_trace", stage = "o3_state", generation, phase = "configuration_applied", heartbeat_enabled = config.option4 != 0, sign_enabled = config.option2 != 0, xwid_selector = config.option6, "QQ O3 state");
                                     if inner.state.keystore.o3_xwid_switch != Some(config.option6) {
                                         inner.state.keystore.o3_xwid_switch = Some(config.option6);
                                         let _ = client.events.send(LoginEvent::KeystoreChanged(
@@ -1283,6 +1353,8 @@ impl Client {
                                     if let Err(error) = inner.signer.complete_report(&report, completion) {
                                         tracing::warn!(%error, "O3 issued token reply rejected");
                                     }
+                                    let (token_length, token_expires_at) = inner.signer.token_status();
+                                    tracing::debug!(target: "atri_qq_protocol::packet_trace", stage = "o3_state", generation, phase = "token_completion", token_length, token_expires_at = ?token_expires_at, "QQ O3 state");
                                 } else {
                                     let Inner { state, signer, o3, .. } = &mut *inner;
                                     match o3.heartbeat.complete(reply.body, state, signer) {
@@ -1292,6 +1364,7 @@ impl Client {
                                 }
                             }
                             Err(error) => {
+                                tracing::debug!(target: "atri_qq_protocol::packet_trace", stage = "o3_state", generation, method = report.method, command, phase = "failed", %error, "QQ O3 state");
                                 if report.method == "getToken" {
                                     let completion = signing_engine::token::ReportResponse {
                                         bytes: Vec::new(),
@@ -1325,13 +1398,18 @@ impl Client {
                 tokio::pin!(notified);
                 notified.as_mut().enable();
                 let Some(client) = weak.upgrade() else { return };
-                let (replies, reports) = {
+                let (replies, reports, telemetry_deadline) = {
                     let mut inner = client.inner.lock().unwrap();
                     if inner.generation != generation || inner.connection.is_none() {
                         return;
                     }
+                    let Inner { state, signer, .. } = &mut *inner;
+                    if let Err(error) = signer.poll_telemetry(state) {
+                        tracing::warn!(%error, "O3 periodic file report could not be queued");
+                    }
                     let replies: Vec<_> = inner.control_replies.drain(..).collect();
-                    (replies, inner.signer.drain_telemetry_reports())
+                    let reports = inner.signer.drain_telemetry_reports();
+                    (replies, reports, inner.signer.telemetry_deadline())
                 };
                 for (command, body) in replies {
                     let result = tokio::select! {
@@ -1357,6 +1435,7 @@ impl Client {
                     biased;
                     _ = cancel.cancelled() => return,
                     _ = &mut notified => {},
+                    _ = tokio::time::sleep_until(telemetry_deadline.unwrap_or_else(Instant::now)), if telemetry_deadline.is_some() => {},
                 }
             }
         });
@@ -1503,3 +1582,4 @@ impl ServiceClient for Client {
 #[cfg(test)]
 #[path = "client_tests.rs"]
 mod tests;
+

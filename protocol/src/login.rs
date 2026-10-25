@@ -71,6 +71,9 @@ pub(crate) async fn login(client: &Arc<Client>) -> Result<UserInfo> {
     client.connect().await?;
     client.begin_signing_login()?;
     client.start_alive();
+    if let Err(error) = client.correct_time().await {
+        tracing::warn!(target: "atri_qq_protocol::login", %error, "Server clock correction unavailable");
+    }
     let mut codecs = client.codecs.lock().await;
     if codecs.is_none() {
         *codecs = Some(LoginCodecs::new()?)
@@ -189,7 +192,7 @@ pub(crate) async fn refresh_tickets(client: &Arc<Client>) -> Result<()> {
 }
 async fn key_exchange(client: &Client, codec: &mut NtLogin) -> Result<()> {
     let state = client.snapshot().await;
-    let request = codec.key_exchange(&state)?;
+    let request = codec.key_exchange(&state, client.server_time_seconds()?)?;
     let response = client
         .call(
             "trpc.login.ecdh.EcdhService.SsoKeyExchange",

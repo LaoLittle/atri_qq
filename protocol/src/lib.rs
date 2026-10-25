@@ -1,6 +1,7 @@
 //! Linux desktop NT protocol client. Session persistence belongs to the embedding adapter.
 pub mod admin;
 pub mod client;
+mod clock;
 pub mod contacts;
 mod credentials;
 pub mod crypto;

@@ -56,9 +56,13 @@ async fn request(socket: &mut Framed<TcpStream, SsoFrameCodec>) -> (i32, String,
             frame.p32().unwrap();
             let mut header = Reader::new(frame.p32().unwrap());
             let command = String::from_utf8(header.p32().unwrap().to_vec()).unwrap();
-            assert_eq!(command, "Heartbeat.Alive");
+            let body = match command.as_str() {
+                "Heartbeat.Alive" => Bytes::new(),
+                "Client.CorrectTime" => Bytes::copy_from_slice(&unix_seconds().to_be_bytes()),
+                other => panic!("unexpected login control command {other}"),
+            };
             socket
-                .send(incoming(sequence, &command, &[]))
+                .send(incoming(sequence, &command, &body))
                 .await
                 .unwrap();
             continue;

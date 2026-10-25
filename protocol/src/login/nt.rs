@@ -48,14 +48,13 @@ impl NtLogin {
             exchange_prepared: false,
         })
     }
-    pub fn key_exchange(&mut self, state: &SessionState) -> Result<Bytes> {
+    pub fn key_exchange(&mut self, state: &SessionState, timestamp: u32) -> Result<Bytes> {
         if self.exchange_prepared {
             self.ecdh = Ecdh::new(Curve::P256)?;
         }
         self.exchange_prepared = true;
         let server=hex::decode("049d1423332735980edabe7e9ea451b3395b6f35250db8fc56f25889f628cbae3e8e73077914071eeebc108f4e0170057792bb17aa303af652313d17c1ac815e79").map_err(|e|malformed(e.to_string()))?;
         let shared = self.ecdh.shared_secret(&server, false)?;
-        let timestamp = super::unix_seconds();
         let secret = auth::KeyExchangeSecret {
             uin: Some(state.keystore.uin.to_string()),
             guid: Some(Bytes::copy_from_slice(&state.keystore.guid)),
@@ -530,12 +529,14 @@ mod tests {
             machine_id: "synthetic-machine".into(),
             online: false,
         };
+        let timestamp = 1_712_345_678;
         let request: auth::KeyExchangeRequest =
-            proto::decode(codec.key_exchange(&state).unwrap()).unwrap();
+            proto::decode(codec.key_exchange(&state, timestamp).unwrap()).unwrap();
         let public = request.public_key.unwrap();
         assert_eq!(public.len(), 65);
         assert_eq!(public[0], 4);
         assert_eq!(request.r#type, Some(1));
+        assert_eq!(request.timestamp, Some(timestamp));
         let encrypted = request.encrypted_secret.unwrap();
         let secret = auth::KeyExchangeSecret {
             uin: Some("123456".into()),
@@ -547,12 +548,15 @@ mod tests {
         verify.u32(1);
         verify.bytes(&encrypted);
         verify.u32(0);
-        verify.u32(request.timestamp.unwrap());
+        verify.u32(timestamp);
         let hash_key =
             hex::decode("e2733bf403149913cbf80c7a95168bd4ca6935ee53cd39764beebe2e007e3aee")
                 .unwrap();
         let hash = crypto::aes_gcm_decrypt(&request.encrypted_hash.unwrap(), &hash_key).unwrap();
         assert_eq!(hash, crypto::sha256(&verify.data));
+        verify.data.truncate(verify.data.len() - 4);
+        verify.u32(timestamp + 1);
+        assert_ne!(hash, crypto::sha256(&verify.data));
     }
 
     #[test]
@@ -581,14 +585,14 @@ mod tests {
         };
         let peer = Ecdh::new(Curve::P256).unwrap();
         let first: auth::KeyExchangeRequest =
-            proto::decode(codec.key_exchange(&state).unwrap()).unwrap();
+            proto::decode(codec.key_exchange(&state, 1_712_345_678).unwrap()).unwrap();
         let old_reply = reply(&peer, first.public_key.as_ref().unwrap(), b"old-exchange");
         assert_eq!(
             codec.decode_key_exchange(old_reply.clone()).unwrap().0,
             b"old-exchange"
         );
         let second: auth::KeyExchangeRequest =
-            proto::decode(codec.key_exchange(&state).unwrap()).unwrap();
+            proto::decode(codec.key_exchange(&state, 1_712_345_679).unwrap()).unwrap();
         assert_ne!(first.public_key, second.public_key);
         assert!(codec.decode_key_exchange(old_reply).is_err());
         let current_reply = reply(
