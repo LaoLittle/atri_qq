@@ -105,7 +105,7 @@ fn decode_response(bytes: Bytes) -> Result<AdaptedShareInfo> {
         crate::diagnostics::decode_response(ADAPT_SHARE_INFO_COMMAND, bytes)?;
     if let Some(code) = response.code.filter(|code| *code != 0) {
         return Err(Error::Server {
-            code,
+            code: code as i32,
             message: response.error_message.unwrap_or_default(),
         });
     }
