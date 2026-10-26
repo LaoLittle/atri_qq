@@ -56,7 +56,11 @@ mod tests {
                 .unwrap(),
             42
         );
-        assert!(clock.unix_seconds_at(UNIX_EPOCH - Duration::from_nanos(1)).is_err());
+        assert!(
+            clock
+                .unix_seconds_at(UNIX_EPOCH - Duration::from_nanos(1))
+                .is_err()
+        );
         assert_eq!(
             clock
                 .unix_seconds_at(UNIX_EPOCH + Duration::new(u64::from(u32::MAX), 999_999_999))
@@ -78,15 +82,21 @@ mod tests {
             clock.correction(server, wall);
             assert_eq!(clock.unix_seconds_at(wall).unwrap(), server);
             assert_eq!(
-                clock.unix_seconds_at(wall + Duration::from_nanos(999_999_999)).unwrap(),
+                clock
+                    .unix_seconds_at(wall + Duration::from_nanos(999_999_999))
+                    .unwrap(),
                 server
             );
             assert_eq!(
-                clock.unix_seconds_at(wall + Duration::from_secs(1)).unwrap(),
+                clock
+                    .unix_seconds_at(wall + Duration::from_secs(1))
+                    .unwrap(),
                 server + 1
             );
             assert_eq!(
-                clock.unix_seconds_at(wall - Duration::from_nanos(1)).unwrap(),
+                clock
+                    .unix_seconds_at(wall - Duration::from_nanos(1))
+                    .unwrap(),
                 server - 1
             );
         }
@@ -101,7 +111,9 @@ mod tests {
         clock.correction(90, later);
         assert_eq!(clock.unix_seconds_at(later).unwrap(), 90);
         assert_eq!(
-            clock.unix_seconds_at(later + Duration::from_nanos(999_999_999)).unwrap(),
+            clock
+                .unix_seconds_at(later + Duration::from_nanos(999_999_999))
+                .unwrap(),
             90
         );
     }
@@ -112,7 +124,12 @@ mod tests {
         let mut clock = ServerClock::default();
         clock.correction(42, wall);
         assert_eq!(clock.unix_seconds_at(wall).unwrap(), 42);
-        assert_eq!(clock.unix_seconds_at(wall + Duration::from_secs(1)).unwrap(), 43);
+        assert_eq!(
+            clock
+                .unix_seconds_at(wall + Duration::from_secs(1))
+                .unwrap(),
+            43
+        );
     }
 
     #[test]
@@ -121,12 +138,22 @@ mod tests {
         let mut clock = ServerClock::default();
         clock.correction(0, wall);
         assert_eq!(clock.unix_seconds_at(wall).unwrap(), 0);
-        assert!(clock.unix_seconds_at(wall - Duration::from_nanos(1)).is_err());
+        assert!(
+            clock
+                .unix_seconds_at(wall - Duration::from_nanos(1))
+                .is_err()
+        );
         clock.correction(u32::MAX, wall);
         assert_eq!(
-            clock.unix_seconds_at(wall + Duration::from_nanos(999_999_999)).unwrap(),
+            clock
+                .unix_seconds_at(wall + Duration::from_nanos(999_999_999))
+                .unwrap(),
             u32::MAX
         );
-        assert!(clock.unix_seconds_at(wall + Duration::from_secs(1)).is_err());
+        assert!(
+            clock
+                .unix_seconds_at(wall + Duration::from_secs(1))
+                .is_err()
+        );
     }
 }

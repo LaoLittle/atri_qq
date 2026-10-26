@@ -12,6 +12,12 @@ chacha20 = { version = "0.10", default-features = false, features = ["legacy"] }
 crc32fast = "1"
 rand_core = { version = "0.10", default-features = false }
 rand_chacha = { version = "0.10", default-features = false }
+rand = { version = "0.10", default-features = false, features = ["std", "sys_rng"] }
+base64 = "0.23"
+bytes = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+xxhash-rust = { version = "0.8", features = ["xxh32"] }
 
 [build-dependencies]
 prost-build = "0.14"

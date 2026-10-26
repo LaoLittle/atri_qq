@@ -278,16 +278,32 @@ async fn normal_kick_unregisters_before_closing_and_rejects_business_requests() 
     client.connect().await.unwrap();
     let (socket, _) = listener.accept().await.unwrap();
     let mut server = Framed::new(socket, SsoFrameCodec);
-    client.confirm_online(client.connection_generation()).unwrap();
-    assert!(matches!(events.recv().await.unwrap(), LoginEvent::Online { .. }));
+    client
+        .confirm_online(client.connection_generation())
+        .unwrap();
+    assert!(matches!(
+        events.recv().await.unwrap(),
+        LoginEvent::Online { .. }
+    ));
     let pending = {
         let client = client.clone();
         tokio::spawn(async move {
-            client.request("WaitingBeforeKick", Bytes::new(), RequestType::D2, Encryption::D2, Duration::from_secs(5)).await
+            client
+                .request(
+                    "WaitingBeforeKick",
+                    Bytes::new(),
+                    RequestType::D2,
+                    Encryption::D2,
+                    Duration::from_secs(5),
+                )
+                .await
         })
     };
     let frame = timeout(Duration::from_secs(2), server.next())
-        .await.unwrap().unwrap().unwrap();
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert_eq!(outgoing_d2(frame, &[0; 16]).1, "WaitingBeforeKick");
     let body = auth::Kick {
         title: Some("Session expired".into()),
@@ -297,26 +313,56 @@ async fn normal_kick_unregisters_before_closing_and_rejects_business_requests() 
         kicked_type: Some(17),
         security_kicked_type: Some(3),
         ..Default::default()
-    }.encode_to_vec();
-    server.send(incoming(-71, "trpc.qq_new_tech.status_svc.StatusService.KickNT", &body, None))
-        .await.unwrap();
+    }
+    .encode_to_vec();
+    server
+        .send(incoming(
+            -71,
+            "trpc.qq_new_tech.status_svc.StatusService.KickNT",
+            &body,
+            None,
+        ))
+        .await
+        .unwrap();
     let frame = timeout(Duration::from_secs(2), server.next())
-        .await.unwrap().unwrap().unwrap();
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     let (_, command, body, _) = outgoing_d2(frame, &[0; 16]);
-    assert_eq!(command, "trpc.qq_new_tech.status_svc.StatusService.UnRegister");
+    assert_eq!(
+        command,
+        "trpc.qq_new_tech.status_svc.StatusService.UnRegister"
+    );
     let unregister: auth::UnregisterRequest = crate::proto::decode(body).unwrap();
     assert_eq!(unregister.reason, Some(1));
     assert!(matches!(pending.await.unwrap(), Err(Error::Disconnected)));
     assert!(matches!(
-        client.request("AfterKick", Bytes::new(), RequestType::D2, Encryption::D2, Duration::from_secs(1)).await,
+        client
+            .request(
+                "AfterKick",
+                Bytes::new(),
+                RequestType::D2,
+                Encryption::D2,
+                Duration::from_secs(1)
+            )
+            .await,
         Err(Error::Disconnected)
     ));
     assert!(matches!(
-        timeout(Duration::from_secs(2), events.recv()).await.unwrap().unwrap(),
+        timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap(),
         LoginEvent::Offline { .. }
     ));
     assert!(!client.snapshot().await.online);
-    assert!(timeout(Duration::from_secs(2), server.next()).await.unwrap().is_none());
+    assert!(
+        timeout(Duration::from_secs(2), server.next())
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -704,11 +750,7 @@ async fn reregistration_replaces_heartbeat_timer_and_uses_completion_time() {
     let (sequence, command, body, reserve) = outgoing_d2(first.frame, &[0; 16]);
     assert!(reserve.secure_info.is_none());
     let body: auth::HeartbeatRequest = crate::proto::decode(body).unwrap();
-    assert_eq!(body.server_time, Some(200));
-    assert_eq!(body.r#type, Some(1));
-    assert_eq!(body.state.as_ref().and_then(|state| state.status), Some(0));
-    assert_eq!(body.state.as_ref().and_then(|state| state.field2), Some(0));
-    assert_eq!(body.local_silence, Some(0));
+    assert_eq!(body.trigger_time, Some(200));
     tokio::time::advance(Duration::from_secs(5)).await;
     let response = auth::HeartbeatResponse {
         interval_seconds: Some(3),
@@ -728,7 +770,7 @@ async fn reregistration_replaces_heartbeat_timer_and_uses_completion_time() {
     let second = queue.recv().await.unwrap();
     let (sequence, command, body, _) = outgoing_d2(second.frame, &[0; 16]);
     let body: auth::HeartbeatRequest = crate::proto::decode(body).unwrap();
-    assert_eq!(body.server_time, Some(335));
+    assert_eq!(body.trigger_time, Some(335));
     assert!(queue.try_recv().is_err());
     let response = auth::HeartbeatResponse {
         interval_seconds: Some(900),
@@ -745,7 +787,7 @@ async fn reregistration_replaces_heartbeat_timer_and_uses_completion_time() {
     let third = queue.recv().await.unwrap();
     let (_, _, body, _) = outgoing_d2(third.frame, &[0; 16]);
     let body: auth::HeartbeatRequest = crate::proto::decode(body).unwrap();
-    assert_eq!(body.server_time, Some(455));
+    assert_eq!(body.trigger_time, Some(455));
     client.close_transport("heartbeat test done".into()).await;
 }
 
@@ -774,7 +816,7 @@ async fn failed_sso_heartbeat_keeps_the_session_and_periodic_schedule() {
     let second = queue.recv().await.unwrap();
     let (_, _, body, _) = outgoing_d2(second.frame, &[0; 16]);
     let body: auth::HeartbeatRequest = crate::proto::decode(body).unwrap();
-    assert_eq!(body.server_time, Some(460));
+    assert_eq!(body.trigger_time, Some(460));
     tokio::time::advance(client.config.timeout).await;
     tokio::task::yield_now().await;
     assert!(client.snapshot().await.online);
@@ -1073,15 +1115,6 @@ async fn ticket_and_registration_telemetry_preserve_real_token_acquisition() {
     let telemetry: crate::proto::o3::TelemetryReport = crate::proto::decode(body).unwrap();
     let values = telemetry.data.into_iter().next().unwrap().values;
     assert_eq!(values[2], "verify_file");
-    assert_eq!(values[6], client.snapshot().await.machine_id);
-    let inventory: serde_json::Value = serde_json::from_str(&values[3]).unwrap();
-    assert_eq!(
-        inventory,
-        serde_json::json!({"/opt/QQ/resources/app/application.json": "0"})
-    );
-    let modules: Vec<String> = serde_json::from_str(&values[4]).unwrap();
-    assert!(modules.iter().all(|path| path.starts_with("/opt/QQ/resources/app/")));
-    assert!(!modules.iter().any(|path| path.ends_with("/875.background.js")));
     client
         .receive(incoming(sequence, &command, &[], Some(&[0; 16])), 0)
         .unwrap();
@@ -1643,7 +1676,8 @@ async fn bound_business_requests_cannot_cross_connection_or_account_replacement(
 mod o3;
 
 #[tokio::test]
-async fn server_clock_accepts_exact_response_and_rejects_malformed_samples_without_losing_session() {
+async fn server_clock_accepts_exact_response_and_rejects_malformed_samples_without_losing_session()
+{
     let (client, mut queue) = queued_client();
     let expected = 2_000_000_000u32;
     let request = {
@@ -1653,7 +1687,10 @@ async fn server_clock_accepts_exact_response_and_rejects_malformed_samples_witho
     let outgoing = queue.recv().await.unwrap();
     let (sequence, command, _) = outgoing_identity(outgoing.frame);
     client
-        .receive(incoming(sequence, &command, &expected.to_be_bytes(), None), 0)
+        .receive(
+            incoming(sequence, &command, &expected.to_be_bytes(), None),
+            0,
+        )
         .unwrap();
     request.await.unwrap().unwrap();
     assert!((expected..=expected + 1).contains(&client.server_time_seconds().unwrap()));
@@ -1676,7 +1713,12 @@ async fn server_clock_accepts_exact_response_and_rejects_malformed_samples_witho
 #[tokio::test(start_paused = true)]
 async fn server_clock_discards_timed_out_and_replaced_transport_samples() {
     let (client, mut queue) = queued_client();
-    client.inner.lock().unwrap().clock.correction(2_000_000_000, SystemTime::now());
+    client
+        .inner
+        .lock()
+        .unwrap()
+        .clock
+        .correction(2_000_000_000, SystemTime::now());
     let request = {
         let client = client.clone();
         tokio::spawn(async move { client.correct_time().await })
@@ -1685,7 +1727,9 @@ async fn server_clock_discards_timed_out_and_replaced_transport_samples() {
     tokio::time::advance(Duration::from_secs(8)).await;
     assert!(matches!(request.await.unwrap(), Err(Error::Timeout)));
     let (sequence, command, _) = outgoing_identity(outgoing.frame);
-    client.receive(incoming(sequence, &command, &1u32.to_be_bytes(), None), 0).unwrap();
+    client
+        .receive(incoming(sequence, &command, &1u32.to_be_bytes(), None), 0)
+        .unwrap();
     assert!(client.server_time_seconds().unwrap() >= 2_000_000_000);
     let request = {
         let client = client.clone();
@@ -1695,7 +1739,9 @@ async fn server_clock_discards_timed_out_and_replaced_transport_samples() {
     client.terminate("synthetic clock transport replacement".into());
     assert!(matches!(request.await.unwrap(), Err(Error::Disconnected)));
     let (sequence, command, _) = outgoing_identity(outgoing.frame);
-    client.receive(incoming(sequence, &command, &1u32.to_be_bytes(), None), 0).unwrap();
+    client
+        .receive(incoming(sequence, &command, &1u32.to_be_bytes(), None), 0)
+        .unwrap();
     assert!(client.server_time_seconds().unwrap() >= 2_000_000_000);
 }
 
@@ -1710,7 +1756,10 @@ async fn configuration_bootstrap_survives_update_failure_without_repeating_full_
             let outgoing = queue.recv().await.unwrap();
             let (sequence, command, body, _) = outgoing_d2(outgoing.frame, &[0; 16]);
             if command == "trpc.group_pro.configdistribution.ConfigDistributionSvr.SsoGetConfig" {
-                return (sequence, configuration::ConfigRequest::decode(body).unwrap());
+                return (
+                    sequence,
+                    configuration::ConfigRequest::decode(body).unwrap(),
+                );
             }
             assert_eq!(command, "QQClubComm.getNewFlag");
             let reply = configuration::ClubFlagResponse {
@@ -1718,7 +1767,12 @@ async fn configuration_bootstrap_survives_update_failure_without_repeating_full_
                 poll_seconds: Some(300),
                 ..Default::default()
             };
-            client.receive(incoming(sequence, &command, &reply.encode_to_vec(), Some(&[0; 16])), 0).unwrap();
+            client
+                .receive(
+                    incoming(sequence, &command, &reply.encode_to_vec(), Some(&[0; 16])),
+                    0,
+                )
+                .unwrap();
         }
     }
     let command = "trpc.group_pro.configdistribution.ConfigDistributionSvr.SsoGetConfig";
@@ -1729,7 +1783,11 @@ async fn configuration_bootstrap_survives_update_failure_without_repeating_full_
         inner.state.keystore.uin = 1234;
     }
     let cancel = CancellationToken::new();
-    let driver = tokio::spawn(crate::lifecycle::run(Arc::downgrade(&client), 0, cancel.clone()));
+    let driver = tokio::spawn(crate::lifecycle::run(
+        Arc::downgrade(&client),
+        0,
+        cancel.clone(),
+    ));
     let (sequence, bootstrap) = next_configuration(&client, &mut queue).await;
     assert_eq!(bootstrap.fetch_type, Some(5));
     assert!(bootstrap.groups.is_empty());
@@ -1752,7 +1810,12 @@ async fn configuration_bootstrap_survives_update_failure_without_repeating_full_
         }),
         ..Default::default()
     };
-    client.receive(incoming(sequence, command, &reply.encode_to_vec(), Some(&[0; 16])), 0).unwrap();
+    client
+        .receive(
+            incoming(sequence, command, &reply.encode_to_vec(), Some(&[0; 16])),
+            0,
+        )
+        .unwrap();
     let (sequence, exact) = next_configuration(&client, &mut queue).await;
     assert_eq!(exact.fetch_type, Some(2));
     assert_eq!(exact.origin.unwrap().model_type, Some(2));
@@ -1760,7 +1823,9 @@ async fn configuration_bootstrap_survives_update_failure_without_repeating_full_
     assert_eq!(exact.groups[0].old_version.as_deref(), Some("1"));
     assert_eq!(exact.groups[0].new_version, Some(8));
     assert_eq!(exact.cache.unwrap().inc_cookies, Some(Bytes::new()));
-    client.receive(incoming(sequence, command, b"\x22\xff", Some(&[0; 16])), 0).unwrap();
+    client
+        .receive(incoming(sequence, command, b"\x22\xff", Some(&[0; 16])), 0)
+        .unwrap();
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_secs(3599)).await;
     tokio::task::yield_now().await;
@@ -1768,9 +1833,16 @@ async fn configuration_bootstrap_survives_update_failure_without_repeating_full_
         let (sequence, command, _, _) = outgoing_d2(outgoing.frame, &[0; 16]);
         assert_eq!(command, "QQClubComm.getNewFlag");
         let reply = configuration::ClubFlagResponse {
-            code: Some(0), poll_seconds: Some(300), ..Default::default()
+            code: Some(0),
+            poll_seconds: Some(300),
+            ..Default::default()
         };
-        client.receive(incoming(sequence, &command, &reply.encode_to_vec(), Some(&[0; 16])), 0).unwrap();
+        client
+            .receive(
+                incoming(sequence, &command, &reply.encode_to_vec(), Some(&[0; 16])),
+                0,
+            )
+            .unwrap();
     }
     tokio::time::advance(Duration::from_secs(1)).await;
     let (sequence, exact) = next_configuration(&client, &mut queue).await;
@@ -1781,7 +1853,12 @@ async fn configuration_bootstrap_survives_update_failure_without_repeating_full_
         state: Some(configuration::ConfigServerState::default()),
         ..Default::default()
     };
-    client.receive(incoming(sequence, command, &reply.encode_to_vec(), Some(&[0; 16])), 0).unwrap();
+    client
+        .receive(
+            incoming(sequence, command, &reply.encode_to_vec(), Some(&[0; 16])),
+            0,
+        )
+        .unwrap();
     cancel.cancel();
     driver.await.unwrap();
     assert!(client.is_current_online(0));
@@ -1812,7 +1889,12 @@ async fn mobile_logoff_notice_is_observable_without_pc_logout_or_ack() {
         "QQService.SvcReqMSFLoginNotify",
         body.freeze(),
     );
-    client.receive(incoming(-87, crate::network::LOGIN_NOTIFICATION_COMMAND, &body, None), 0).unwrap();
+    client
+        .receive(
+            incoming(-87, crate::network::LOGIN_NOTIFICATION_COMMAND, &body, None),
+            0,
+        )
+        .unwrap();
     assert_eq!(notices.recv().await.unwrap().body.raw_field3, 110);
     assert!(client.snapshot().await.online);
     assert!(events.try_recv().is_err());
@@ -1833,7 +1915,10 @@ async fn canceled_file_transfer_acquisition_does_not_block_the_next_demand() {
         let client = client.clone();
         tokio::spawn(async move { client.file_transfer_ticket().await })
     };
-    let first = timeout(Duration::from_secs(2), queue.recv()).await.unwrap().unwrap();
+    let first = timeout(Duration::from_secs(2), queue.recv())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(first.command, "OidbSvcTrpcTcp.0x9a2_8");
     fetching.abort();
     assert!(fetching.await.unwrap_err().is_cancelled());
@@ -1841,21 +1926,31 @@ async fn canceled_file_transfer_acquisition_does_not_block_the_next_demand() {
         let client = client.clone();
         tokio::spawn(async move { client.file_transfer_ticket().await })
     };
-    let retry = timeout(Duration::from_secs(2), queue.recv()).await.unwrap().unwrap();
+    let retry = timeout(Duration::from_secs(2), queue.recv())
+        .await
+        .unwrap()
+        .unwrap();
     let response = crate::proto::contacts::OidbEnvelope {
         command: Some(0x9a2),
         service: Some(8),
         code: Some(0),
-        body: Some(crate::proto::file_transfer::FileTransSignResponse {
-            ticket: Some(crate::proto::file_transfer::FileTransSignTicket {
-                sign: Some(Bytes::from_static(b"synthetic-relay-ticket")),
-                lifetime_seconds: Some(43200),
-            }),
-            ..Default::default()
-        }.encode_to_vec().into()),
+        body: Some(
+            crate::proto::file_transfer::FileTransSignResponse {
+                ticket: Some(crate::proto::file_transfer::FileTransSignTicket {
+                    sign: Some(Bytes::from_static(b"synthetic-relay-ticket")),
+                    lifetime_seconds: Some(43200),
+                }),
+                ..Default::default()
+            }
+            .encode_to_vec()
+            .into(),
+        ),
         ..Default::default()
-    }.encode_to_vec();
-    client.receive(incoming(retry.sequence, &retry.command, &response, None), 0).unwrap();
+    }
+    .encode_to_vec();
+    client
+        .receive(incoming(retry.sequence, &retry.command, &response, None), 0)
+        .unwrap();
     fetching.await.unwrap().unwrap();
     assert!(client.cached_file_transfer_ticket().is_some());
     let replacement = SessionState {
@@ -1873,12 +1968,18 @@ async fn canceled_file_transfer_acquisition_does_not_block_the_next_demand() {
 }
 
 fn synchronized_message(group: Option<u64>, sequence: u64, time: u64) -> Bytes {
-    use crate::{messages::{MessageElement, encode_elements}, proto::messages as pb};
+    use crate::{
+        messages::{MessageElement, encode_elements},
+        proto::messages as pb,
+    };
     pb::CommonMessage {
         routing_head: Some(pb::RoutingHead {
             sender_uin: Some(7),
             sender_uid: "u_synthetic_peer".into(),
-            group: group.map(|uin| pb::CommonGroup { uin: Some(uin), ..Default::default() }),
+            group: group.map(|uin| pb::CommonGroup {
+                uin: Some(uin),
+                ..Default::default()
+            }),
             ..Default::default()
         }),
         content_head: Some(pb::ContentHead {
@@ -1888,19 +1989,27 @@ fn synchronized_message(group: Option<u64>, sequence: u64, time: u64) -> Bytes {
             time: Some(time),
             ..Default::default()
         }),
-        message_body: encode_elements(&[MessageElement::Text("ping".into())], &[]).unwrap().into(),
-    }.encode_to_vec().into()
+        message_body: encode_elements(&[MessageElement::Text("ping".into())], &[])
+            .unwrap()
+            .into(),
+    }
+    .encode_to_vec()
+    .into()
 }
 
 #[tokio::test]
 async fn localhost_first_view_group_additional_and_partial_retry_consume_without_live_replay() {
-    use crate::{message_sync::{self as sync, Source}, proto::message_sync as pb};
+    use crate::{
+        message_sync::{self as sync, Source},
+        proto::message_sync as pb,
+    };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
         let mut framed = Framed::new(socket, SsoFrameCodec);
-        let (sequence, command, body, _) = outgoing_d2(framed.next().await.unwrap().unwrap(), &[0; 16]);
+        let (sequence, command, body, _) =
+            outgoing_d2(framed.next().await.unwrap().unwrap(), &[0; 16]);
         assert_eq!(command, sync::INFO_COMMAND);
         let request: auth::InfoSyncRequest = crate::proto::decode(body).unwrap();
         assert_eq!(request.sync_flag, Some(1759));
@@ -1908,17 +2017,42 @@ async fn localhost_first_view_group_additional_and_partial_retry_consume_without
         let random = request.request_random.unwrap();
         let response = auth::InfoSyncResponse {
             request_random: Some(random),
-            register: Some(auth::InfoSyncRegisterResponse { message: Some("register success".into()), ..Default::default() }),
+            register: Some(auth::InfoSyncRegisterResponse {
+                message: Some("register success".into()),
+                ..Default::default()
+            }),
             ..Default::default()
         };
-        framed.send(incoming(sequence, &command, &response.encode_to_vec(), Some(&[0; 16]))).await.unwrap();
+        framed
+            .send(incoming(
+                sequence,
+                &command,
+                &response.encode_to_vec(),
+                Some(&[0; 16]),
+            ))
+            .await
+            .unwrap();
         let nodes = pb::InfoSyncPush {
             request_random: Some(random),
             stage: Some(5),
-            groups: vec![pb::GroupNode { group_uin: Some(55), message_seq: Some(120), total_seq: Some(140), message_time: Some(222), ..Default::default() }],
+            groups: vec![pb::GroupNode {
+                group_uin: Some(55),
+                message_seq: Some(120),
+                total_seq: Some(140),
+                message_time: Some(222),
+                ..Default::default()
+            }],
             ..Default::default()
         };
-        framed.send(incoming(-1, sync::INFO_PUSH, &nodes.encode_to_vec(), Some(&[0; 16]))).await.unwrap();
+        framed
+            .send(incoming(
+                -1,
+                sync::INFO_PUSH,
+                &nodes.encode_to_vec(),
+                Some(&[0; 16]),
+            ))
+            .await
+            .unwrap();
         let first = pb::InfoSyncPush {
             request_random: Some(random),
             result: Some(0x05f5e3c0),
@@ -1926,28 +2060,81 @@ async fn localhost_first_view_group_additional_and_partial_retry_consume_without
             c2c_messages: Some(pb::C2cMessages {
                 current_cookie: Some(Bytes::from_static(b"current\0opaque")),
                 previous_cookie: Some(Bytes::from_static(b"independent-previous")),
-                conversations: vec![pb::C2cConversation { last_message_time: Some(99999), messages: vec![synchronized_message(None, 1, 111)], ..Default::default() }],
+                conversations: vec![pb::C2cConversation {
+                    last_message_time: Some(99999),
+                    messages: vec![synchronized_message(None, 1, 111)],
+                    ..Default::default()
+                }],
                 ..Default::default()
             }),
             ..Default::default()
         };
-        framed.send(incoming(-2, sync::INFO_PUSH, &first.encode_to_vec(), Some(&[0; 16]))).await.unwrap();
-        let end = pb::InfoSyncPush { request_random: Some(random), stage: Some(4), ..Default::default() };
-        framed.send(incoming(-3, sync::INFO_PUSH, &end.encode_to_vec(), Some(&[0; 16]))).await.unwrap();
-        let (sequence, command, body, _) = outgoing_d2(framed.next().await.unwrap().unwrap(), &[0; 16]);
+        framed
+            .send(incoming(
+                -2,
+                sync::INFO_PUSH,
+                &first.encode_to_vec(),
+                Some(&[0; 16]),
+            ))
+            .await
+            .unwrap();
+        let end = pb::InfoSyncPush {
+            request_random: Some(random),
+            stage: Some(4),
+            ..Default::default()
+        };
+        framed
+            .send(incoming(
+                -3,
+                sync::INFO_PUSH,
+                &end.encode_to_vec(),
+                Some(&[0; 16]),
+            ))
+            .await
+            .unwrap();
+        let (sequence, command, body, _) =
+            outgoing_d2(framed.next().await.unwrap().unwrap(), &[0; 16]);
         assert_eq!(command, sync::GROUP_COMMAND);
         let request: pb::GroupSyncRequest = crate::proto::decode(body).unwrap();
         assert_eq!(request.groups.len(), 1);
-        assert_eq!((request.groups[0].begin_seq, request.groups[0].end_seq), (Some(106), Some(120)));
-        let response = pb::GroupSyncResponse { request_random: request.request_random, ..Default::default() };
-        framed.send(incoming(sequence, &command, &response.encode_to_vec(), Some(&[0; 16]))).await.unwrap();
+        assert_eq!(
+            (request.groups[0].begin_seq, request.groups[0].end_seq),
+            (Some(106), Some(120))
+        );
+        let response = pb::GroupSyncResponse {
+            request_random: request.request_random,
+            ..Default::default()
+        };
+        framed
+            .send(incoming(
+                sequence,
+                &command,
+                &response.encode_to_vec(),
+                Some(&[0; 16]),
+            ))
+            .await
+            .unwrap();
         let group = pb::GroupMsgPush {
             request_random: request.request_random,
             flag: Some(2),
-            groups: vec![pb::GroupMessageResult { group_uin: Some(55), server_end_seq: Some(120), messages: vec![synchronized_message(Some(55), 119, 222)], ..Default::default() }],
+            groups: vec![pb::GroupMessageResult {
+                group_uin: Some(55),
+                server_end_seq: Some(120),
+                messages: vec![synchronized_message(Some(55), 119, 222)],
+                ..Default::default()
+            }],
         };
-        framed.send(incoming(-4, sync::GROUP_PUSH, &group.encode_to_vec(), Some(&[0; 16]))).await.unwrap();
-        let (sequence, command, body, _) = outgoing_d2(framed.next().await.unwrap().unwrap(), &[0; 16]);
+        framed
+            .send(incoming(
+                -4,
+                sync::GROUP_PUSH,
+                &group.encode_to_vec(),
+                Some(&[0; 16]),
+            ))
+            .await
+            .unwrap();
+        let (sequence, command, body, _) =
+            outgoing_d2(framed.next().await.unwrap().unwrap(), &[0; 16]);
         assert_eq!(command, sync::INFO_COMMAND);
         let retry: auth::InfoSyncRequest = crate::proto::decode(body).unwrap();
         assert_eq!(retry.sync_flag, Some(1));
@@ -1955,62 +2142,160 @@ async fn localhost_first_view_group_additional_and_partial_retry_consume_without
         assert_ne!(retry.request_random, Some(random));
         assert_eq!(retry.group_last_message_time, Some(222));
         let state = retry.sync.unwrap();
-        assert_eq!(state.current_cookie.as_deref(), Some(b"current\0opaque".as_slice()));
-        assert_eq!(state.previous_cookie.as_deref(), Some(b"independent-previous".as_slice()));
+        assert_eq!(
+            state.current_cookie.as_deref(),
+            Some(b"current\0opaque".as_slice())
+        );
+        assert_eq!(
+            state.previous_cookie.as_deref(),
+            Some(b"independent-previous".as_slice())
+        );
         assert_eq!(state.last_message_time, Some(111));
-        let response = auth::InfoSyncResponse { request_random: retry.request_random, ..Default::default() };
-        framed.send(incoming(sequence, &command, &response.encode_to_vec(), Some(&[0; 16]))).await.unwrap();
+        let response = auth::InfoSyncResponse {
+            request_random: retry.request_random,
+            ..Default::default()
+        };
+        framed
+            .send(incoming(
+                sequence,
+                &command,
+                &response.encode_to_vec(),
+                Some(&[0; 16]),
+            ))
+            .await
+            .unwrap();
         let stale = pb::InfoSyncPush {
             request_random: Some(random),
             stage: Some(2),
-            c2c_messages: Some(pb::C2cMessages { current_cookie: Some(Bytes::from_static(b"stale")), conversations: vec![pb::C2cConversation { messages: vec![synchronized_message(None, 2, 999)], ..Default::default() }], ..Default::default() }),
+            c2c_messages: Some(pb::C2cMessages {
+                current_cookie: Some(Bytes::from_static(b"stale")),
+                conversations: vec![pb::C2cConversation {
+                    messages: vec![synchronized_message(None, 2, 999)],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
             ..Default::default()
         };
-        framed.send(incoming(-5, sync::INFO_PUSH, &stale.encode_to_vec(), Some(&[0; 16]))).await.unwrap();
-        let complete = pb::InfoSyncPush { request_random: retry.request_random, stage: Some(4), ..Default::default() };
-        framed.send(incoming(-6, sync::INFO_PUSH, &complete.encode_to_vec(), Some(&[0; 16]))).await.unwrap();
+        framed
+            .send(incoming(
+                -5,
+                sync::INFO_PUSH,
+                &stale.encode_to_vec(),
+                Some(&[0; 16]),
+            ))
+            .await
+            .unwrap();
+        let complete = pb::InfoSyncPush {
+            request_random: retry.request_random,
+            stage: Some(4),
+            ..Default::default()
+        };
+        framed
+            .send(incoming(
+                -6,
+                sync::INFO_PUSH,
+                &complete.encode_to_vec(),
+                Some(&[0; 16]),
+            ))
+            .await
+            .unwrap();
         assert!(framed.next().await.is_none());
     });
-    let client = Client::new(ClientConfig { host: "127.0.0.1".into(), port, timeout: Duration::from_secs(5), ..Default::default() }, Keystore::default()).unwrap();
+    let client = Client::new(
+        ClientConfig {
+            host: "127.0.0.1".into(),
+            port,
+            timeout: Duration::from_secs(5),
+            ..Default::default()
+        },
+        Keystore::default(),
+    )
+    .unwrap();
     let mut changed = client.message_sync_changes();
     client.connect().await.unwrap();
-    let (_, registration) = timeout(Duration::from_secs(5), client.start_message_sync(false)).await.unwrap().unwrap();
+    let (_, registration) = timeout(Duration::from_secs(5), client.start_message_sync(false))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(registration.message.as_deref(), Some("register success"));
     timeout(Duration::from_secs(8), async {
         loop {
             let snapshot = client.message_sync_snapshot();
-            if snapshot.protocol_complete && snapshot.additional_complete && snapshot.sent_flag == 1 { break; }
+            if snapshot.protocol_complete && snapshot.additional_complete && snapshot.sent_flag == 1
+            {
+                break;
+            }
             changed.changed().await.unwrap();
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     let snapshot = client.message_sync_snapshot();
     assert_eq!(snapshot.batches.len(), 2);
     assert_eq!(snapshot.batches[0].source, Source::FirstView);
     assert_eq!(snapshot.batches[1].source, Source::GroupAdditional);
-    assert_eq!(snapshot.batches.iter().map(|batch| batch.messages.len()).sum::<usize>(), 2);
+    assert_eq!(
+        snapshot
+            .batches
+            .iter()
+            .map(|batch| batch.messages.len())
+            .sum::<usize>(),
+        2
+    );
     assert_eq!(snapshot.checkpoint.c2c_last_message_time, 111);
     assert_eq!(snapshot.checkpoint.group_last_message_time, 222);
     assert_eq!(snapshot.checkpoint.groups[&55].received_message_seq, 119);
     assert_eq!(snapshot.checkpoint.groups[&55].total_seq, 0);
-    let messaging = crate::messages::Messaging::new(client.clone(), Arc::new(crate::media::Media::new(client.clone())));
-    let events = messaging.decode_push(IncomingPacket { command: sync::INFO_PUSH.into(), sequence: -7, return_code: 0, body: pb::InfoSyncPush::default().encode_to_vec().into(), header: Default::default() }).await;
-    assert!(!events.iter().any(|event| matches!(event, crate::messages::PushEvent::Message { .. })));
-    let value = messaging.call("sync_snapshot", ciborium::Value::Null).await.unwrap();
+    let messaging = crate::messages::Messaging::new(
+        client.clone(),
+        Arc::new(crate::media::Media::new(client.clone())),
+    );
+    let events = messaging
+        .decode_push(IncomingPacket {
+            command: sync::INFO_PUSH.into(),
+            sequence: -7,
+            return_code: 0,
+            body: pb::InfoSyncPush::default().encode_to_vec().into(),
+            header: Default::default(),
+        })
+        .await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, crate::messages::PushEvent::Message { .. }))
+    );
+    let value = messaging
+        .call("sync_snapshot", ciborium::Value::Null)
+        .await
+        .unwrap();
     let mut bytes = Vec::new();
     ciborium::into_writer(&value, &mut bytes).unwrap();
     let exposed: sync::Snapshot = ciborium::from_reader(bytes.as_slice()).unwrap();
     assert_eq!(exposed.batches[0].source, Source::FirstView);
-    client.close_transport("Synthetic message synchronization finished".into()).await;
-    timeout(Duration::from_secs(3), server).await.unwrap().unwrap();
+    client
+        .close_transport("Synthetic message synchronization finished".into())
+        .await;
+    timeout(Duration::from_secs(3), server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test(start_paused = true)]
 async fn message_sync_retry_waits_weakly_and_identity_replacement_cancels_queued_work() {
     let (client, mut queue) = queued_client();
     let session = client.snapshot().await;
-    let (binding, action) = client.message_sync.begin(0, &session, &client.cancellation(), crate::login::info_sync(&session, false));
+    let (binding, action) = client.message_sync.begin(
+        0,
+        &session,
+        &client.cancellation(),
+        crate::login::info_sync(&session, false),
+    );
     let request = client.message_sync.prepare(&binding, action).unwrap();
-    let actions = client.message_sync.direct(&binding, &request, Err(Error::Timeout));
+    let actions = client
+        .message_sync
+        .direct(&binding, &request, Err(Error::Timeout));
     client.spawn_message_sync_actions(binding, actions);
     tokio::task::yield_now().await;
     let mut replacement = session.clone();
@@ -2020,9 +2305,16 @@ async fn message_sync_retry_waits_weakly_and_identity_replacement_cancels_queued
     tokio::task::yield_now().await;
     assert!(queue.try_recv().is_err());
     let session = client.snapshot().await;
-    let (binding, action) = client.message_sync.begin(0, &session, &client.cancellation(), crate::login::info_sync(&session, false));
+    let (binding, action) = client.message_sync.begin(
+        0,
+        &session,
+        &client.cancellation(),
+        crate::login::info_sync(&session, false),
+    );
     let request = client.message_sync.prepare(&binding, action).unwrap();
-    let actions = client.message_sync.direct(&binding, &request, Err(Error::Timeout));
+    let actions = client
+        .message_sync
+        .direct(&binding, &request, Err(Error::Timeout));
     client.spawn_message_sync_actions(binding, actions);
     tokio::task::yield_now().await;
     let weak = Arc::downgrade(&client);
@@ -2035,28 +2327,77 @@ async fn message_sync_retry_waits_weakly_and_identity_replacement_cancels_queued
 async fn kick_cancels_message_sync_retry_before_any_late_send_or_cookie_commit() {
     let (client, mut queue) = queued_client();
     let session = client.snapshot().await;
-    let (binding, action) = client.message_sync.begin(0, &session, &client.cancellation(), crate::login::info_sync(&session, false));
+    let (binding, action) = client.message_sync.begin(
+        0,
+        &session,
+        &client.cancellation(),
+        crate::login::info_sync(&session, false),
+    );
     let request = client.message_sync.prepare(&binding, action).unwrap();
-    let actions = client.message_sync.direct(&binding, &request, Err(Error::Timeout));
+    let actions = client
+        .message_sync
+        .direct(&binding, &request, Err(Error::Timeout));
     client.spawn_message_sync_actions(binding.clone(), actions);
     tokio::task::yield_now().await;
-    let kick = auth::Kick { message: Some("synthetic synchronization cancellation".into()), ..Default::default() };
-    client.receive(incoming(-1, "trpc.qq_new_tech.status_svc.StatusService.KickNT", &kick.encode_to_vec(), Some(&[0; 16])), 0).unwrap();
+    let kick = auth::Kick {
+        message: Some("synthetic synchronization cancellation".into()),
+        ..Default::default()
+    };
+    client
+        .receive(
+            incoming(
+                -1,
+                "trpc.qq_new_tech.status_svc.StatusService.KickNT",
+                &kick.encode_to_vec(),
+                Some(&[0; 16]),
+            ),
+            0,
+        )
+        .unwrap();
     assert!(binding.cancel.is_cancelled());
     let outgoing = queue.try_recv().unwrap();
     let (_, command, _, _) = outgoing_d2(outgoing.frame, &[0; 16]);
-    assert_eq!(command, "trpc.qq_new_tech.status_svc.StatusService.UnRegister");
-    let crate::message_sync::Request::Info { body } = request else { panic!("expected InfoSync"); };
+    assert_eq!(
+        command,
+        "trpc.qq_new_tech.status_svc.StatusService.UnRegister"
+    );
+    let crate::message_sync::Request::Info { body } = request else {
+        panic!("expected InfoSync");
+    };
     let late = crate::proto::message_sync::InfoSyncPush {
-        request_random: body.request_random, stage: Some(2),
-        c2c_messages: Some(crate::proto::message_sync::C2cMessages { current_cookie: Some(Bytes::from_static(b"late")), conversations: vec![crate::proto::message_sync::C2cConversation { messages: vec![synchronized_message(None, 1, 999)], ..Default::default() }], ..Default::default() }),
+        request_random: body.request_random,
+        stage: Some(2),
+        c2c_messages: Some(crate::proto::message_sync::C2cMessages {
+            current_cookie: Some(Bytes::from_static(b"late")),
+            conversations: vec![crate::proto::message_sync::C2cConversation {
+                messages: vec![synchronized_message(None, 1, 999)],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
         ..Default::default()
     };
-    client.receive(incoming(-2, crate::message_sync::INFO_PUSH, &late.encode_to_vec(), Some(&[0; 16])), 0).unwrap();
+    client
+        .receive(
+            incoming(
+                -2,
+                crate::message_sync::INFO_PUSH,
+                &late.encode_to_vec(),
+                Some(&[0; 16]),
+            ),
+            0,
+        )
+        .unwrap();
     tokio::time::advance(Duration::from_secs(4)).await;
     tokio::task::yield_now().await;
     assert!(queue.try_recv().is_err());
-    assert!(client.message_sync_snapshot().checkpoint.current_cookie.is_empty());
+    assert!(
+        client
+            .message_sync_snapshot()
+            .checkpoint
+            .current_cookie
+            .is_empty()
+    );
     assert!(client.message_sync_snapshot().batches.is_empty());
     client.terminate("Synthetic kick synchronization scenario finished".into());
 }

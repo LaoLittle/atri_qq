@@ -87,7 +87,7 @@ fn image_key_type(url: &reqwest::Url) -> Option<u32> {
             "appid" if app_id.is_none() => app_id = Some(value),
             "fileid" if file_id.is_none() => file_id = Some(value),
             "appid" | "fileid" => return None,
-            _ => {},
+            _ => {}
         }
     }
     if file_id.is_none_or(|value| value.is_empty()) {
@@ -101,19 +101,29 @@ fn image_key_type(url: &reqwest::Url) -> Option<u32> {
 }
 fn authorize_image_url(mut url: reqwest::Url, key: &MediaDownloadKey) -> Result<String> {
     if image_key_type(&url) != Some(key.business_type) || key.store_id != 1 {
-        return Err(Error::Malformed("Media key does not match image URL".into()));
+        return Err(Error::Malformed(
+            "Media key does not match image URL".into(),
+        ));
     }
     let parameter = key.parameter.strip_prefix('&').unwrap_or(&key.parameter);
     let parameter = reqwest::Url::parse(&format!("https://localhost/?{parameter}"))
         .map_err(|_| Error::Malformed("Invalid media key parameter".into()))?;
     let mut pairs = parameter.query_pairs();
-    let (name, value) = pairs.next().ok_or_else(|| Error::Malformed("Missing media key parameter".into()))?;
+    let (name, value) = pairs
+        .next()
+        .ok_or_else(|| Error::Malformed("Missing media key parameter".into()))?;
     if name != "rkey" || value.is_empty() || pairs.next().is_some() {
         return Err(Error::Malformed("Invalid media key parameter".into()));
     }
-    let retained: Vec<_> = url.query_pairs().filter(|(name, _)| name != "rkey")
-        .map(|(name, value)| (name.into_owned(), value.into_owned())).collect();
-    url.query_pairs_mut().clear().extend_pairs(retained).append_pair("rkey", &value);
+    let retained: Vec<_> = url
+        .query_pairs()
+        .filter(|(name, _)| name != "rkey")
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect();
+    url.query_pairs_mut()
+        .clear()
+        .extend_pairs(retained)
+        .append_pair("rkey", &value);
     Ok(url.into())
 }
 impl Media {
@@ -464,8 +474,11 @@ impl Media {
     }
     async fn authorize_download_url(&self, url: &str) -> Result<String> {
         valid_http_url(url)?;
-        let parsed = reqwest::Url::parse(url).map_err(|_| Error::Malformed("Invalid media URL".into()))?;
-        let Some(business_type) = image_key_type(&parsed) else { return Ok(url.to_owned()) };
+        let parsed =
+            reqwest::Url::parse(url).map_err(|_| Error::Malformed("Invalid media URL".into()))?;
+        let Some(business_type) = image_key_type(&parsed) else {
+            return Ok(url.to_owned());
+        };
         let key = self.client.media_download_key(business_type, 1).await?;
         authorize_image_url(parsed, &key)
     }

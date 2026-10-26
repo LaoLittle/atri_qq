@@ -1,4 +1,3 @@
-//! Linux desktop NT protocol client. Session persistence belongs to the embedding adapter.
 pub mod admin;
 pub mod client;
 mod clock;
@@ -11,22 +10,22 @@ mod http;
 mod lifecycle;
 pub mod login;
 pub mod media;
-pub mod messages;
 pub mod message_sync;
+pub mod messages;
 pub mod mini_app;
 pub mod models;
-pub mod sdk_share;
 pub mod network;
 pub mod o3;
 pub mod personal_events;
 pub mod proto;
+pub mod sdk_share;
 pub mod signing;
 mod ticket_refresh;
 pub mod wire;
 
 pub use client::{Client, ServiceClient};
-pub use models::*;
 pub use credentials::file_transfer::FileTransferTicket;
+pub use models::*;
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {

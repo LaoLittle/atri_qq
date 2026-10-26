@@ -32,7 +32,9 @@ sha3 = "0.12"
 crc32fast = "1"
 aes-gcm = "0.11"
 openssl = { version = "0.10", features = ["vendored"] }
+p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "std"] }
 hex = "0.4"
+itoa = "1"
 base64 = "0.23"
 quick-xml = "0.42"
 tracing = "0.1"
@@ -40,6 +42,9 @@ signing = { package = "atri_qq_signing", path = "../signing" }
 atri_qq_silk = { path = "../silk" }
 mp4 = "0.14"
 jce = { path = "../crates/jce" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 
 [build-dependencies]
 prost-build = "0.14"

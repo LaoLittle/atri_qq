@@ -111,6 +111,11 @@ impl WtLogin {
         unusual: Option<&[u8]>,
         state: &SessionState,
     ) -> Result<Bytes> {
+        if state.profile.platform.is_ios() {
+            return Err(Error::Unsupported(
+                "iOS local QR acquisition/polling is not established; desktop WT 0x31/0x12 is not a mobile login path".into(),
+            ));
+        }
         let p = &state.profile;
         let k = &state.keystore;
         if command == 0x31 {
@@ -148,7 +153,10 @@ impl WtLogin {
             })?;
             t.write(0x1d, |w| {
                 w.u8(1);
-                w.u32(p.misc_bitmap);
+                w.u32(
+                    p.misc_bitmap
+                        .ok_or_else(|| malformed("WT misc bitmap resource missing"))?,
+                );
                 w.u32(0);
                 w.u8(0);
                 Ok(())
@@ -205,6 +213,11 @@ impl WtLogin {
         self.packet(0x812, &wrapped.data, state)
     }
     pub fn login(&mut self, state: &SessionState) -> Result<Bytes> {
+        if state.profile.platform.is_ios() {
+            return Err(Error::Unsupported(
+                "iOS WT login requires native packet and signature/bitmap resources; desktop WT encoding is unavailable for mobile profiles".into(),
+            ));
+        }
         let p = &state.profile;
         let k = &state.keystore;
         let mut nested = Tlv::default();
@@ -212,7 +225,11 @@ impl WtLogin {
         nested.write(0x147, |w| {
             w.u32(p.app_id);
             w.p16(&p.pt_version)?;
-            w.p16(&p.apk_signature_md5)
+            w.p16(
+                p.apk_signature_md5
+                    .as_deref()
+                    .ok_or_else(|| malformed("WT APK signature resource missing"))?,
+            )
         })?;
         nested.write(0x128, |w| {
             w.u16(0);
@@ -230,8 +247,14 @@ impl WtLogin {
         t.add(0x144, encrypted);
         t.write(0x116, |w| {
             w.u8(0);
-            w.u32(p.misc_bitmap);
-            w.u32(p.sub_sig_map);
+            w.u32(
+                p.misc_bitmap
+                    .ok_or_else(|| malformed("WT misc bitmap resource missing"))?,
+            );
+            w.u32(
+                p.sub_sig_map
+                    .ok_or_else(|| malformed("WT sub signature map resource missing"))?,
+            );
             w.u8(0);
             Ok(())
         })?;
@@ -268,7 +291,10 @@ impl WtLogin {
             w.u32(p.app_id);
             w.u32(p.sub_app_id);
             w.u32(p.client_version.into());
-            w.u32(p.main_sig_map);
+            w.u32(
+                p.main_sig_map
+                    .ok_or_else(|| malformed("WT main signature map resource missing"))?,
+            );
             Ok(())
         })?;
         t.write(0x107, |w| {
@@ -446,6 +472,26 @@ pub(super) fn decode_login_error(result: u8, tlvs: &BTreeMap<u16, Bytes>) -> Res
 mod tests {
     use super::*;
     #[test]
+    fn mobile_profiles_never_encode_desktop_qr_or_wt_login_packets() {
+        for profile in [Profile::iphone(), Profile::ipad()] {
+            let state = SessionState {
+                profile,
+                keystore: Keystore::default(),
+                machine_id: "synthetic-machine".into(),
+                online: false,
+            };
+            let mut codec = WtLogin::new().unwrap();
+            for command in [0x31, 0x12] {
+                assert!(matches!(
+                    codec.qr(command, None, &state),
+                    Err(Error::Unsupported(_))
+                ));
+            }
+            assert!(matches!(codec.login(&state), Err(Error::Unsupported(_))));
+            assert_eq!(codec.trans_emp_sequence, 0);
+        }
+    }
+    #[test]
     fn repeated_ticket_uses_last_value_before_atomic_keystore_update() {
         let mut tlvs = Tlv::default();
         tlvs.add(0x305, [0x11; 16]);
@@ -469,7 +515,10 @@ mod tests {
         assert_eq!(keystore.nt_ticket_times, None);
         assert_eq!(keystore.ticket_generated_unix_seconds, Some(1_000));
         assert_eq!(keystore.next_ticket_refresh_unix_seconds(), Some(605_800));
-        assert_eq!(keystore.wt_ticket_times.unwrap().expire_unix_seconds, 2_593_000);
+        assert_eq!(
+            keystore.wt_ticket_times.unwrap().expire_unix_seconds,
+            2_593_000
+        );
         let restored: Keystore =
             serde_json::from_slice(&serde_json::to_vec(&keystore).unwrap()).unwrap();
         assert_eq!(restored.wt_ticket_times, keystore.wt_ticket_times);

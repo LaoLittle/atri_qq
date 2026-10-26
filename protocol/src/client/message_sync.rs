@@ -37,7 +37,7 @@ impl Client {
             {
                 return Err(Error::Disconnected);
             }
-            let template = login::info_sync(&inner.state, reconnect);
+            let template = login::info_sync_for_config(&inner.state, reconnect, &self.config)?;
             let (binding, action) =
                 self.message_sync
                     .begin(inner.generation, &inner.state, &inner.cancel, template);

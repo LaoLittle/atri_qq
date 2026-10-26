@@ -29,6 +29,9 @@ mod network;
 mod personal_events;
 mod robot_ranges;
 
+#[cfg(test)]
+mod ios_signing_tests;
+
 #[async_trait]
 pub trait ServiceClient: Send + Sync {
     async fn request(
@@ -43,19 +46,23 @@ pub trait ServiceClient: Send + Sync {
     async fn replace_state(&self, state: SessionState);
     fn subscribe(&self) -> broadcast::Receiver<IncomingPacket>;
     fn message_sync_snapshot(&self) -> Result<crate::message_sync::Snapshot> {
-        Err(Error::Unsupported("Message synchronization snapshots are unavailable".into()))
+        Err(Error::Unsupported(
+            "Message synchronization snapshots are unavailable".into(),
+        ))
     }
     async fn media_download_key(
         &self,
         _business_type: u32,
         _store_id: u32,
     ) -> Result<crate::media::MediaDownloadKey> {
-        Err(Error::Unsupported("Media download key provider is unavailable".into()))
+        Err(Error::Unsupported(
+            "Media download key provider is unavailable".into(),
+        ))
     }
-    async fn fetch_friend_statuses(
-        &self,
-    ) -> Result<Arc<crate::contacts::FriendStatusSnapshot>> {
-        Err(Error::Unsupported("Friend status provider is unavailable".into()))
+    async fn fetch_friend_statuses(&self) -> Result<Arc<crate::contacts::FriendStatusSnapshot>> {
+        Err(Error::Unsupported(
+            "Friend status provider is unavailable".into(),
+        ))
     }
 }
 struct Pending {
@@ -64,7 +71,10 @@ struct Pending {
     key: Vec<u8>,
     reply: oneshot::Sender<Result<Bytes>>,
     cancel: CancellationToken,
-    message_sync: Option<(Arc<crate::message_sync::Binding>, Arc<crate::message_sync::Request>)>,
+    message_sync: Option<(
+        Arc<crate::message_sync::Binding>,
+        Arc<crate::message_sync::Request>,
+    )>,
 }
 enum RequestBinding<'a> {
     Connection(u64),
@@ -98,6 +108,8 @@ struct Connection {
 struct Inner {
     state: SessionState,
     signer: SessionSigner,
+    ios_transport: Option<IosTransportResources>,
+    connection_cookie: Bytes,
     o3: crate::o3::Session,
     clock: crate::clock::ServerClock,
     sequence: i32,
@@ -120,7 +132,10 @@ struct Inner {
     ticket_refresh_schedule: watch::Sender<crate::ticket_refresh::Schedule>,
     friend_statuses: crate::lifecycle::status::Cache,
     kick_reason: Option<String>,
-    ip_direct_configuration: Option<(Arc<credentials::Session>, Arc<crate::network::IpDirectConfiguration>)>,
+    ip_direct_configuration: Option<(
+        Arc<credentials::Session>,
+        Arc<crate::network::IpDirectConfiguration>,
+    )>,
     sso_configuration: Option<Arc<crate::network::SsoConfiguration>>,
     server_cursor: usize,
     file_transfer: credentials::file_transfer::Cache,
@@ -174,10 +189,12 @@ impl Client {
                 "Explicit machine ID and QUA must be nonempty C strings",
             ));
         }
+        if config.profile.platform.is_ios() {
+            keystore.ensure_ios_identity()?;
+        }
         // A new client cannot resume another NT manager's challenge/session state.
         keystore.qr_sig.clear();
-        keystore.key_exchange_ticket.clear();
-        keystore.key_exchange_key.clear();
+        keystore.key_exchange_session = None;
         keystore.login_cookie.clear();
         let (events, _) = broadcast::channel(128);
         let (packets, _) = broadcast::channel(256);
@@ -190,18 +207,31 @@ impl Client {
             keystore,
             online: false,
         };
-        let mut signer = SessionSigner::with_application_uuid(config.application_uuid.clone());
-        signer.initialize(&state)?;
+        let signer = SessionSigner::for_client(
+            config.application_uuid.clone(),
+            &state,
+            config.ios_signing.clone(),
+        )?;
+        let ios_transport = config.ios_transport.clone();
+        if config.profile.platform.is_ios() {
+            if let Some(resources) = &ios_transport {
+                resources.validate()?;
+            }
+        }
         let guild_session = Arc::new(crate::guild::Session::default());
         Ok(Arc::new_cyclic(|weak| Self {
             config,
             guild_session: guild_session.clone(),
-            message_sync: Arc::new(crate::message_sync::Coordinator::with_guild(guild_session.clone())),
+            message_sync: Arc::new(crate::message_sync::Coordinator::with_guild(
+                guild_session.clone(),
+            )),
             personal_events: crate::personal_events::Coordinator::default(),
             media_keys: Arc::new(crate::lifecycle::maintenance::Session::default()),
             inner: Mutex::new(Inner {
                 state,
                 signer,
+                ios_transport,
+                connection_cookie: Bytes::new(),
                 o3: crate::o3::Session::default(),
                 clock: crate::clock::ServerClock::default(),
                 sequence: rand::random::<u32>().wrapping_rem(4_900_001) as i32 + 5_000_000,
@@ -259,6 +289,15 @@ impl Client {
     pub async fn snapshot(&self) -> SessionState {
         self.inner.lock().unwrap().state.clone()
     }
+    pub(crate) fn clear_nt_login_cookie(&self) {
+        self.inner
+            .lock()
+            .unwrap()
+            .state
+            .keystore
+            .login_cookie
+            .clear();
+    }
     pub async fn replace_state(&self, state: SessionState) {
         let mut inner = self.inner.lock().unwrap();
         self.replace_state_locked(&mut inner, state);
@@ -270,8 +309,10 @@ impl Client {
         let account_changed = inner.state.keystore.uin != state.keystore.uin
             || inner.state.keystore.uid != state.keystore.uid;
         if account_changed {
-            self.message_sync.replace_identity(state.keystore.uin, &state.keystore.uid);
-            self.personal_events.replace_identity(state.keystore.uin, &state.keystore.uid);
+            self.message_sync
+                .replace_identity(state.keystore.uin, &state.keystore.uid);
+            self.personal_events
+                .replace_identity(state.keystore.uin, &state.keystore.uid);
             inner.robot_ranges.clear();
             inner.ticket_refresh_failures = 0;
             inner.sso_configuration = None;
@@ -389,10 +430,7 @@ impl Client {
         &self,
     ) -> Result<crate::lifecycle::maintenance::Binding> {
         let inner = self.inner.lock().unwrap();
-        if !inner.state.online
-            || inner.connection.is_none()
-            || inner.cancel.is_cancelled()
-        {
+        if !inner.state.online || inner.connection.is_none() || inner.cancel.is_cancelled() {
             return Err(Error::Disconnected);
         }
         self.media_keys.binding(
@@ -409,6 +447,14 @@ impl Client {
     }
     pub(crate) fn server_time_seconds(&self) -> Result<u32> {
         self.inner.lock().unwrap().clock.unix_seconds()
+    }
+    pub(crate) fn nt_key_exchange_time(&self) -> Result<u64> {
+        let inner = self.inner.lock().unwrap();
+        if inner.state.profile.platform.is_ios() {
+            inner.clock.unix_millis().map(|millis| millis / 1000 * 1000)
+        } else {
+            inner.clock.unix_seconds().map(u64::from)
+        }
     }
     pub(crate) async fn correct_time(&self) -> Result<()> {
         let generation = self.connection_generation();
@@ -589,8 +635,11 @@ impl Client {
         inner.friend_statuses.snapshot.clone()
     }
 
-    pub async fn fetch_friend_statuses(&self) -> Result<Arc<crate::contacts::FriendStatusSnapshot>> {
-        self.fetch_friend_statuses_generation(self.connection_generation()).await
+    pub async fn fetch_friend_statuses(
+        &self,
+    ) -> Result<Arc<crate::contacts::FriendStatusSnapshot>> {
+        self.fetch_friend_statuses_generation(self.connection_generation())
+            .await
     }
 
     pub(crate) async fn fetch_friend_statuses_generation(
@@ -606,7 +655,10 @@ impl Client {
             {
                 return Err(Error::Disconnected);
             }
-            if inner.friend_statuses.binding.as_ref()
+            if inner
+                .friend_statuses
+                .binding
+                .as_ref()
                 .is_none_or(|binding| !Self::friend_status_current(&inner, binding))
             {
                 inner.friend_statuses.clear();
@@ -660,7 +712,8 @@ impl Client {
             Encryption::D2,
             Duration::from_secs(30),
             Some(RequestBinding::FriendStatus(binding)),
-        ).await
+        )
+        .await
     }
 
     pub(crate) fn start_maintenance(&self, generation: u64) -> Result<()> {
@@ -836,6 +889,7 @@ impl Client {
             i.generation = i.generation.checked_add(1).ok_or_else(|| {
                 Error::Unsupported("Connection generation space exhausted".into())
             })?;
+            i.connection_cookie = Bytes::new();
             (i.generation, i.cancel.clone())
         };
         let socket = tokio::select! {
@@ -951,7 +1005,9 @@ impl Client {
     }
     fn receive(&self, frame: Bytes, generation: u64) -> Result<()> {
         let mut i = self.inner.lock().unwrap();
-        if i.connection.as_ref().map(|c| c.generation) != Some(generation) {
+        if i.generation != generation
+            || i.connection.as_ref().map(|c| c.generation) != Some(generation)
+        {
             tracing::debug!(target: "atri_qq_protocol::packet_trace", direction = "receive", stage = "wire", command = "<unavailable>", generation, decode_error = "stale connection generation", length = frame.len(), raw_hex = %hex::encode(&frame), "QQ packet");
             return Ok(());
         }
@@ -966,6 +1022,12 @@ impl Client {
             tracing::debug!(target: "atri_qq_protocol::packet_trace", direction = "receive", stage = "wire", command = "<unavailable>", generation, decode_error = %error, length = frame.len(), raw_hex = %hex::encode(&frame), "QQ packet");
             crate::diagnostics::log_raw_error("SSO", &frame, error);
         })?;
+        if i.state.profile.platform.is_ios()
+            && i.connection_cookie.is_empty()
+            && !packet.header.message_cookie.is_empty()
+        {
+            i.connection_cookie = packet.header.message_cookie.clone();
+        }
         tracing::debug!(target: "atri_qq_protocol::packet_trace", direction = "receive", stage = "wire", command = packet.command, sequence = packet.sequence, generation, length = frame.len(), raw_hex = %hex::encode(&frame), "QQ packet");
         tracing::debug!(target: "atri_qq_protocol::packet_trace", direction = "receive", stage = "decoded", generation, command = packet.command, sequence = packet.sequence, return_code = packet.return_code, extra, packet = ?packet, body_hex = %hex::encode(&packet.body), "QQ packet");
         if packet.return_code != 0 {
@@ -1018,7 +1080,8 @@ impl Client {
             return Ok(());
         }
         let sync = if packet.return_code == 0 {
-            self.message_sync.ingest(generation, &i.state, &packet.command, packet.body.clone())
+            self.message_sync
+                .ingest(generation, &i.state, &packet.command, packet.body.clone())
         } else {
             Ok((false, None, Vec::new()))
         };
@@ -1050,14 +1113,18 @@ impl Client {
                     let _ = self.packets.send(packet.clone());
                 })?;
             let inner = self.inner.lock().unwrap();
-            if inner.generation == generation && inner.connection.is_some() && inner.kick_reason.is_none() {
+            if inner.generation == generation
+                && inner.connection.is_some()
+                && inner.kick_reason.is_none()
+            {
                 let _ = self.login_notifications.send(Arc::new(notification));
             }
         }
         let control_reply = match packet.command.as_str() {
             "trpc.msg.olpush.OlPushService.MsgPush" => wire::encode_push_ack(packet.body.clone())?
                 .map(|body| ("trpc.msg.olpush.OlPushService.SsoPushAck", body)),
-            "ConfigPushSvc.PushReq" => self.apply_network_push(generation, packet.body.clone())
+            "ConfigPushSvc.PushReq" => self
+                .apply_network_push(generation, packet.body.clone())
                 .inspect_err(|_| {
                     let _ = self.packets.send(packet.clone());
                 })?
@@ -1198,15 +1265,26 @@ impl Client {
         request_type: RequestType,
         encryption: Encryption,
     ) -> Result<(i32, Bytes)> {
+        if inner.state.profile.platform.is_ios() {
+            let resources = inner.ios_transport.as_ref().ok_or_else(|| {
+                Error::Authentication("iOS requests require actual transport resources".into())
+            })?;
+            resources.validate()?;
+            if command == "PushService.get" && resources.push_service_get_statistics.is_none() {
+                return Err(Error::Authentication(
+                    "PushService.get requires actual iOS transport statistics".into(),
+                ));
+            }
+        }
         inner.sequence = inner.sequence.checked_add(1).ok_or_else(|| {
             Error::Unsupported("SSO sequence space exhausted; reconnect required".into())
         })?;
         let sequence = inner.sequence;
         let signing_generation = inner.signer.generation();
-        let signature = inner.signer.sign(
+        let signature = inner.signer.sign_shared(
             command,
             sequence,
-            &body,
+            body.clone(),
             &inner.state,
             self.config.randomize_signature_for_testing,
         )?;
@@ -1226,7 +1304,16 @@ impl Client {
             encryption,
             &inner.state,
             signature,
+            inner
+                .ios_transport
+                .as_ref()
+                .map(|resources| (resources, inner.connection_cookie.as_ref())),
         )?;
+        if inner.state.profile.platform.is_ios() && command == "PushService.get" {
+            if let Some(resources) = &mut inner.ios_transport {
+                resources.push_service_get_statistics = Some(IosPushStatistics::default());
+            }
+        }
         Ok((sequence, frame))
     }
     async fn send_only(&self, command: &str, body: Bytes, generation: u64) -> Result<()> {
@@ -1331,11 +1418,16 @@ impl Client {
                 Some(RequestBinding::Online(generation)) => {
                     i.generation == generation && i.state.online
                 }
-                Some(RequestBinding::FriendStatus(binding)) => Self::friend_status_current(&i, binding),
-                Some(RequestBinding::Credentials(session)) => {
-                    Self::current_online(&i, session.generation) && i.credentials.is_current(session)
+                Some(RequestBinding::FriendStatus(binding)) => {
+                    Self::friend_status_current(&i, binding)
                 }
-                Some(RequestBinding::FileTransfer(binding)) => Self::file_transfer_current(&i, binding),
+                Some(RequestBinding::Credentials(session)) => {
+                    Self::current_online(&i, session.generation)
+                        && i.credentials.is_current(session)
+                }
+                Some(RequestBinding::FileTransfer(binding)) => {
+                    Self::file_transfer_current(&i, binding)
+                }
                 Some(RequestBinding::SigningReport { generation, report }) => {
                     i.generation == generation
                         && i.signer.report_is_current(report)
@@ -1507,7 +1599,12 @@ impl Client {
     fn terminate_generation(&self, generation: u64, reason: String) {
         self.terminate_generation_with_policy(generation, reason, false);
     }
-    fn terminate_generation_with_policy(&self, generation: u64, reason: String, preserve_kick: bool) {
+    fn terminate_generation_with_policy(
+        &self,
+        generation: u64,
+        reason: String,
+        preserve_kick: bool,
+    ) {
         {
             let mut i = self.inner.lock().unwrap();
             if i.generation != generation || (preserve_kick && i.kick_reason.is_some()) {
@@ -1523,6 +1620,7 @@ impl Client {
             i.file_transfer_worker = None;
             i.friend_statuses.clear();
             let connected = i.connection.take().is_some();
+            i.connection_cookie = Bytes::new();
             let online = i.state.online;
             i.state.online = false;
             i.control_replies.clear();
@@ -1624,11 +1722,11 @@ impl Client {
                 let body = auth::HeartbeatRequest {
                     r#type: Some(1),
                     state: Some(auth::HeartbeatState {
-                        status: Some(0),
-                        field2: Some(0),
+                        silence_status: Some(0),
+                        silent_version: Some(0),
                     }),
-                    local_silence: Some(0),
-                    server_time: Some(trigger_time),
+                    battery_status: Some(0),
+                    trigger_time: Some(trigger_time),
                 }
                 .encode_to_vec()
                 .into();
@@ -1676,7 +1774,7 @@ impl Client {
                 inner.signing_cancel.cancel();
                 inner.signing_cancel = CancellationToken::new();
             }
-            inner.signing_ready = true;
+            inner.signing_ready = inner.signer.uses_desktop_maintenance();
         }
         self.background_work.notify_one();
         self.signing_work.notify_one();
@@ -1685,7 +1783,7 @@ impl Client {
     fn start_signing_work(&self, generation: u64, channel: crate::o3::Channel) {
         {
             let mut inner = self.inner.lock().unwrap();
-            if inner.generation != generation {
+            if inner.generation != generation || !inner.signer.uses_desktop_maintenance() {
                 return;
             }
             if inner
@@ -1749,11 +1847,12 @@ impl Client {
                             state, o3, signer, ..
                         } = &mut *inner;
                         match o3.heartbeat.take_due(state) {
-                            Ok(Some(body)) => {
-                                queued.push_back(crate::o3::Work::Report(
-                                    signer.channel_report("heartbeat", body),
-                                ));
-                            }
+                            Ok(Some(body)) => match signer.channel_report("heartbeat", body) {
+                                Ok(report) => queued.push_back(crate::o3::Work::Report(report)),
+                                Err(error) => {
+                                    tracing::warn!(%error, "O3 heartbeat signing scope rejected")
+                                }
+                            },
                             Ok(None) => {}
                             Err(error) => {
                                 tracing::warn!(%error, "O3 heartbeat could not be prepared")
@@ -1771,7 +1870,11 @@ impl Client {
                             let report_cancel = {
                                 let inner = client.inner.lock().unwrap();
                                 if inner.generation != generation
-                                    || inner.connection.as_ref().map(|connection| connection.generation) != Some(generation)
+                                    || inner
+                                        .connection
+                                        .as_ref()
+                                        .map(|connection| connection.generation)
+                                        != Some(generation)
                                     || !inner.signing_ready
                                     || inner.o3.scope != Some(task_scope)
                                     || inner.state.keystore.uin != task_scope.1
@@ -1932,7 +2035,10 @@ impl Client {
                             Ok(reply) => {
                                 tracing::debug!(target: "atri_qq_protocol::packet_trace", stage = "o3_state", generation, method = report.method, command, phase = "authenticated_reply", channel_expires_at = ?inner.o3.channel.expires_at(), "QQ O3 state");
                                 if let Some(config) = reply.config {
-                                    inner.signer.apply_channel_config(&config);
+                                    if let Err(error) = inner.signer.apply_channel_config(&config) {
+                                        tracing::warn!(%error, "O3 configuration signing scope rejected");
+                                        continue;
+                                    }
                                     inner.o3.heartbeat.configure(config.option4 != 0);
                                     tracing::debug!(target: "atri_qq_protocol::packet_trace", stage = "o3_state", generation, phase = "configuration_applied", heartbeat_enabled = config.option4 != 0, sign_enabled = config.option2 != 0, xwid_selector = config.option6, "QQ O3 state");
                                     if inner.state.keystore.o3_xwid_switch != Some(config.option6) {
@@ -2005,7 +2111,9 @@ impl Client {
                         return;
                     }
                     let Inner { state, signer, .. } = &mut *inner;
-                    if let Err(error) = signer.poll_telemetry(state) {
+                    if signer.uses_desktop_maintenance()
+                        && let Err(error) = signer.poll_telemetry(state)
+                    {
                         tracing::warn!(%error, "O3 periodic file report could not be queued");
                     }
                     let replies: Vec<_> = inner.control_replies.drain(..).collect();
@@ -2115,13 +2223,37 @@ impl Client {
             report_module_paths,
         )
     }
+    pub fn set_ios_signing_resources(
+        &self,
+        resources: crate::signing::IosSigningResources,
+    ) -> Result<()> {
+        self.inner
+            .lock()
+            .unwrap()
+            .signer
+            .set_ios_resources(resources)
+    }
+    pub fn set_ios_transport_resources(&self, resources: IosTransportResources) -> Result<()> {
+        resources.validate()?;
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.state.profile.platform.is_ios() {
+            return Err(Error::Unsupported(
+                "iOS transport resources require an iPhone or iPad client".into(),
+            ));
+        }
+        inner.ios_transport = Some(resources);
+        Ok(())
+    }
     pub fn take_signing_token_error(&self) -> Option<::signing::token::TokenError> {
         self.inner.lock().unwrap().signer.take_token_error()
     }
-    pub fn complete_signing_xwid(&self, acquisition: ::signing::token::XwidAcquisition) {
+    pub fn complete_signing_xwid(
+        &self,
+        acquisition: ::signing::token::XwidAcquisition,
+    ) -> Result<()> {
         self.inner.lock().unwrap().signer.complete_xwid(acquisition)
     }
-    pub fn set_signing_footer_seed(&self, seed: &[u8; 48]) {
+    pub fn set_signing_footer_seed(&self, seed: &[u8; 48]) -> Result<()> {
         self.inner.lock().unwrap().signer.set_footer_seed(seed)
     }
     pub fn answer_signing_property_challenge(&self, ids: &[u8]) -> Result<Vec<u8>> {
@@ -2189,9 +2321,7 @@ impl ServiceClient for Client {
     ) -> Result<crate::media::MediaDownloadKey> {
         Client::media_download_key(self, business_type, store_id).await
     }
-    async fn fetch_friend_statuses(
-        &self,
-    ) -> Result<Arc<crate::contacts::FriendStatusSnapshot>> {
+    async fn fetch_friend_statuses(&self) -> Result<Arc<crate::contacts::FriendStatusSnapshot>> {
         Client::fetch_friend_statuses(self).await
     }
 }
@@ -2430,8 +2560,15 @@ mod ticket_refresh_tests {
         let (client, mut queue) = online_client();
         {
             let mut inner = client.inner.lock().unwrap();
-            inner.state.keystore.key_exchange_ticket = b"synthetic-exchange-ticket".to_vec();
-            inner.state.keystore.key_exchange_key = vec![42; 16];
+            inner.state.keystore.key_exchange_session = Some(
+                crate::models::NtKeyExchangeSession::new(
+                    inner.state.profile.platform,
+                    Bytes::from_static(&[42; 16]),
+                    Bytes::from_static(b"synthetic-exchange-ticket"),
+                    3600,
+                )
+                .unwrap(),
+            );
         }
         let mut events = client.login_events();
         client.set_ticket_refresh_interval(7, 1).unwrap();
@@ -2443,7 +2580,10 @@ mod ticket_refresh_tests {
         ));
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(1)).await;
-        let outgoing = tokio::time::timeout(Duration::from_secs(3), queue.recv()).await.unwrap().unwrap();
+        let outgoing = tokio::time::timeout(Duration::from_secs(3), queue.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             outgoing.command,
             "trpc.login.ecdh.EcdhService.SsoNTLoginRefreshTicket"
@@ -2520,7 +2660,10 @@ mod friend_status_tests {
         {
             let mut inner = client.inner.lock().unwrap();
             inner.generation = 7;
-            inner.connection = Some(Connection { generation: 7, sender });
+            inner.connection = Some(Connection {
+                generation: 7,
+                sender,
+            });
             inner.state.online = true;
             inner.state.keystore.uin = 42;
             inner.state.keystore.uid = "u_synthetic_self".into();
@@ -2529,7 +2672,13 @@ mod friend_status_tests {
     }
 
     fn reply(client: &Client, sequence: i32, response: Result<Bytes>) {
-        let pending = client.inner.lock().unwrap().pending.remove(&sequence).unwrap();
+        let pending = client
+            .inner
+            .lock()
+            .unwrap()
+            .pending
+            .remove(&sequence)
+            .unwrap();
         assert!(pending.reply.send(response).is_ok());
     }
 
@@ -2538,23 +2687,28 @@ mod friend_status_tests {
             command: Some(0x116d),
             service: Some(1),
             code: Some(0),
-            body: Some(pb::FriendStatusResponse {
-                self_uid: Some("u_synthetic_self".into()),
-                interval_minutes: Some(30),
-                over: Some(1),
-                next_start: Some(400),
-                online_info: vec![pb::FriendOnlineInfo {
-                    uid: Some("u_synthetic_friend".into()),
-                    status: Some(10),
-                    status_override: Some(11),
+            body: Some(
+                pb::FriendStatusResponse {
+                    self_uid: Some("u_synthetic_self".into()),
+                    interval_minutes: Some(30),
+                    over: Some(1),
+                    next_start: Some(400),
+                    online_info: vec![pb::FriendOnlineInfo {
+                        uid: Some("u_synthetic_friend".into()),
+                        status: Some(10),
+                        status_override: Some(11),
+                        ..Default::default()
+                    }],
                     ..Default::default()
-                }],
-                ..Default::default()
-            }.encode_to_vec().into()),
+                }
+                .encode_to_vec()
+                .into(),
+            ),
             ..Default::default()
-        }.encode_to_vec().into()
+        }
+        .encode_to_vec()
+        .into()
     }
-
 
     #[tokio::test(start_paused = true)]
     async fn polls_after_login_every_thirty_minutes_and_stops_without_losing_error_semantics() {
@@ -2570,10 +2724,20 @@ mod friend_status_tests {
         assert!(queue.try_recv().is_err());
         tokio::time::advance(Duration::from_secs(1)).await;
         let poll = queue.recv().await.unwrap();
-        reply(&client, poll.sequence, Err(Error::Server { code: 17, message: "synthetic rejection".into() }));
+        reply(
+            &client,
+            poll.sequence,
+            Err(Error::Server {
+                code: 17,
+                message: "synthetic rejection".into(),
+            }),
+        );
         tokio::task::yield_now().await;
         assert!(client.is_current_online(7));
-        assert!(Arc::ptr_eq(&snapshot, &client.cached_friend_statuses().unwrap()));
+        assert!(Arc::ptr_eq(
+            &snapshot,
+            &client.cached_friend_statuses().unwrap()
+        ));
         cancel.cancel();
         worker.await.unwrap();
         tokio::time::advance(Duration::from_secs(3600)).await;
@@ -2586,7 +2750,14 @@ mod friend_status_tests {
         let fetch_client = client.clone();
         let fetch = tokio::spawn(async move { fetch_client.fetch_friend_statuses().await });
         let outgoing = queue.recv().await.unwrap();
-        let binding = client.inner.lock().unwrap().friend_statuses.binding.clone().unwrap();
+        let binding = client
+            .inner
+            .lock()
+            .unwrap()
+            .friend_statuses
+            .binding
+            .clone()
+            .unwrap();
         let mut state = client.snapshot().await;
         state.keystore.uin = 43;
         state.keystore.uid = "u_other_synthetic".into();
@@ -2606,8 +2777,14 @@ mod friend_status_tests {
             interval_minutes: Some(30),
             received_unix_ms: 0,
         });
-        assert!(matches!(client.commit_friend_statuses(&binding, snapshot), Err(Error::Disconnected)));
-        assert!(matches!(client.request_friend_status(&binding, Bytes::new()).await, Err(Error::Disconnected)));
+        assert!(matches!(
+            client.commit_friend_statuses(&binding, snapshot),
+            Err(Error::Disconnected)
+        ));
+        assert!(matches!(
+            client.request_friend_status(&binding, Bytes::new()).await,
+            Err(Error::Disconnected)
+        ));
         assert!(queue.try_recv().is_err());
     }
 

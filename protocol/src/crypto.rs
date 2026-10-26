@@ -1,4 +1,3 @@
-//! QQ's sixteen-round double-chained TEA and desktop SEC1 ECDH key agreement.
 use crate::{Error, Result, models::random_bytes};
 use aes_gcm::aes::Aes192;
 use aes_gcm::{
@@ -14,6 +13,73 @@ use openssl::{
     pkey::{PKey, Private},
 };
 use std::num::Wrapping;
+
+pub struct P256Verifier(p256::ecdsa::VerifyingKey);
+
+impl P256Verifier {
+    pub fn new(public_key: &[u8]) -> Result<Self> {
+        p256::ecdsa::VerifyingKey::from_sec1_bytes(public_key)
+            .map(Self)
+            .map_err(crypto_error)
+    }
+
+    pub fn verify_digest(&self, digest: &[u8; 32], signature: &[u8]) -> Result<()> {
+        use p256::ecdsa::signature::hazmat::PrehashVerifier;
+
+        let signature = p256::ecdsa::Signature::from_der(signature).map_err(crypto_error)?;
+        self.0
+            .verify_prehash(digest, &signature)
+            .map_err(|_| crypto_error("Invalid P-256 response signature"))
+    }
+}
+
+pub struct NtClientA1<'a> {
+    pub app_id: u32,
+    pub account: &'a str,
+    pub salt: u64,
+    pub guid: &'a [u8],
+    pub password_digest: &'a [u8; 16],
+}
+
+impl NtClientA1<'_> {
+    pub fn encrypt(&self, unix_seconds: u32) -> Result<bytes::Bytes> {
+        let account_length = u16::try_from(self.account.len()).map_err(crypto_error)?;
+        let body_length = self
+            .guid
+            .len()
+            .checked_add(82 + usize::from(account_length))
+            .ok_or_else(|| crypto_error("Client A1 length overflow"))?;
+        let mut entropy = [0; 20];
+        rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut entropy)
+            .map_err(crypto_error)?;
+        let mut w = crate::wire::Writer {
+            data: tea_frame(body_length)?,
+        };
+        w.u16(4);
+        w.bytes(&entropy[..4]);
+        w.u32(0);
+        w.u32(self.app_id);
+        w.u32(8001);
+        w.u64(self.salt);
+        w.u32(unix_seconds);
+        w.u32(0);
+        w.u8(1);
+        w.bytes(self.password_digest);
+        w.bytes(&entropy[4..]);
+        w.u32(0);
+        w.u8(1);
+        w.bytes(self.guid);
+        w.u32(1);
+        w.u32(1);
+        w.u16(account_length);
+        w.bytes(self.account.as_bytes());
+        w.zeros(7);
+        let mut digest = Md5::new();
+        digest.update(self.password_digest);
+        digest.update(self.salt.to_be_bytes());
+        Ok(tea_encrypt_blocks(w.data, &digest.finalize())?.into())
+    }
+}
 
 pub fn md5(data: &[u8]) -> [u8; 16] {
     Md5::digest(data).into()
@@ -93,10 +159,19 @@ fn tea_block(value: u64, k: &[u32; 4], decrypt: bool) -> u64 {
     }
     (u64::from(x.0) << 32) | u64::from(y.0)
 }
+fn tea_frame(data_length: usize) -> Result<Vec<u8>> {
+    let fill = 10 - ((data_length % 8 + 1) & 7);
+    let capacity = data_length
+        .checked_add(fill + 7)
+        .ok_or_else(|| crypto_error("QQ TEA length overflow"))?;
+    let mut padded = Vec::with_capacity(capacity);
+    padded.resize(fill, 0);
+    rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut padded).map_err(crypto_error)?;
+    padded[0] = (padded[0] & 0xf8) | ((fill - 3) as u8);
+    Ok(padded)
+}
 pub fn tea_encrypt(data: &[u8], key: &[u8]) -> Result<Vec<u8>> {
-    let fill = 10 - ((data.len() % 8 + 1) & 7);
-    let mut padded = random_bytes(fill);
-    padded[0] = ((fill - 3) as u8) | 0xf8;
+    let mut padded = tea_frame(data.len())?;
     padded.extend_from_slice(data);
     padded.extend_from_slice(&[0; 7]);
     tea_encrypt_blocks(padded, key)
@@ -243,6 +318,32 @@ impl Ecdh {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_mobile_a1_ciphertext_and_independent_salt() {
+        let native_clear = hex::decode(
+            "0004deadbeef000000000000001000001f41000000010001e2406553f1000000000001000102030405060708090a0b0c0d0e0f4242424242424242424242424242424200000000013131313131313131313131313131313100000001000000010006313233343536",
+        )
+        .unwrap();
+        let native_cipher = hex::decode(
+            "9596bcb9cd04ff06a89e084d10bd0c4e1c96c203bb693c77cb5e39dc9b6ebd4da5477e1bc3b2d4ef4dd94b23e0ea2b120a8b89eb51b44c4e41847bdfda6e0185fe1759e3ffc2181e3d736411d31969a595a2ab992bee1a606c9e5d55e3add82502e3b0f74479075b0a7a5fcbfb6c2ab57c5c9961b8b2aa06",
+        )
+        .unwrap();
+        let key = hex::decode("f376ff4fa31716ac6384bde2931d5622").unwrap();
+        assert_eq!(tea_decrypt(&native_cipher, &key).unwrap(), native_clear);
+        let encrypted = NtClientA1 {
+            app_id: 16,
+            account: "123456",
+            salt: 0x1_0001_e240,
+            guid: &[0x31; 16],
+            password_digest: &std::array::from_fn(|i| i as u8),
+        }
+        .encrypt(1_700_000_000)
+        .unwrap();
+        let mut clear = tea_decrypt(&encrypted, &key).unwrap();
+        clear[2..6].copy_from_slice(&native_clear[2..6]);
+        clear[51..67].copy_from_slice(&native_clear[51..67]);
+        assert_eq!(clear, native_clear);
+    }
     #[test]
     fn tea_all_residues_and_corruption() {
         for n in 0..40 {

@@ -2,7 +2,8 @@ use std::sync::LazyLock;
 
 pub(crate) fn client_builder() -> reqwest::ClientBuilder {
     static TLS_CONFIG: LazyLock<rustls::ClientConfig> = LazyLock::new(|| {
-        let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let roots =
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let mut config = rustls::ClientConfig::builder_with_provider(
             rustls::crypto::aws_lc_rs::default_provider().into(),
         )

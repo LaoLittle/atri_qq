@@ -156,12 +156,7 @@ pub(super) fn open(key: &[u8; 32], encrypted: &[u8]) -> Result<Bytes> {
     let tag: &Tag = (&encrypted[end..]).try_into().map_err(crypto_error)?;
     let mut plain = encrypted[12..end].to_vec();
     Aes256Gcm::new(key.into())
-        .decrypt_inout_detached(
-            nonce,
-            &[],
-            plain.as_mut_slice().into(),
-            tag,
-        )
+        .decrypt_inout_detached(nonce, &[], plain.as_mut_slice().into(), tag)
         .map_err(|_| crypto_error("Invalid O3 AES-GCM authentication tag"))?;
     Ok(plain.into())
 }

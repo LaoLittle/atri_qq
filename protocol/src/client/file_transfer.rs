@@ -9,8 +9,13 @@ struct Attempt<'a> {
 
 impl Drop for Attempt<'_> {
     fn drop(&mut self) {
-        if self.active && let Ok(mut inner) = self.client.inner.lock() {
-            let _ = inner.file_transfer.apply(self.session, Err(Error::Disconnected), Instant::now());
+        if self.active
+            && let Ok(mut inner) = self.client.inner.lock()
+        {
+            let _ =
+                inner
+                    .file_transfer
+                    .apply(self.session, Err(Error::Disconnected), Instant::now());
         }
     }
 }
@@ -37,8 +42,15 @@ impl Client {
             inner.state.keystore.uin,
             inner.state.keystore.uid.clone(),
             Bytes::copy_from_slice(&inner.state.keystore.a2),
-            inner.state.keystore.guid.as_slice().try_into()
-                .map_err(|_| wire::malformed("File transfer requires a sixteen-byte machine GUID"))?,
+            inner
+                .state
+                .keystore
+                .guid
+                .as_slice()
+                .try_into()
+                .map_err(|_| {
+                    wire::malformed("File transfer requires a sixteen-byte machine GUID")
+                })?,
             &inner.cancel,
         )?);
         inner.file_transfer.activate(binding)
@@ -49,7 +61,9 @@ impl Client {
             return Ok(ticket);
         }
         let binding = self.file_transfer_binding()?;
-        let ticket = self.refresh_file_transfer(&binding, true).await?
+        let ticket = self
+            .refresh_file_transfer(&binding, true)
+            .await?
             .ok_or_else(|| Error::Authentication("File transfer ticket was not acquired".into()))?;
         self.start_file_transfer_work(binding);
         Ok(ticket)
@@ -89,20 +103,32 @@ impl Client {
             };
             session
         };
-        let mut attempt = Attempt { client: self, session: &session, active: true };
+        let mut attempt = Attempt {
+            client: self,
+            session: &session,
+            active: true,
+        };
         let response = async {
             let body = file_transfer::build(&session)?;
-            let bytes = self.request_inner(
-                file_transfer::COMMAND,
-                body,
-                RequestType::D2,
-                Encryption::D2,
-                self.config.timeout,
-                Some(RequestBinding::FileTransfer(binding)),
-            ).await?;
+            let bytes = self
+                .request_inner(
+                    file_transfer::COMMAND,
+                    body,
+                    RequestType::D2,
+                    Encryption::D2,
+                    self.config.timeout,
+                    Some(RequestBinding::FileTransfer(binding)),
+                )
+                .await?;
             file_transfer::decode(bytes)
-        }.await;
-        let result = self.inner.lock().unwrap().file_transfer.apply(&session, response, Instant::now());
+        }
+        .await;
+        let result =
+            self.inner
+                .lock()
+                .unwrap()
+                .file_transfer
+                .apply(&session, response, Instant::now());
         attempt.active = false;
         self.file_transfer_work.notify_one();
         result.map(Some)
@@ -112,7 +138,10 @@ impl Client {
         {
             let mut inner = self.inner.lock().unwrap();
             if !Self::file_transfer_current(&inner, &binding)
-                || inner.file_transfer_worker.as_ref().is_some_and(|current| Arc::ptr_eq(current, &binding))
+                || inner
+                    .file_transfer_worker
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &binding))
             {
                 return;
             }
@@ -135,7 +164,9 @@ impl Client {
                 };
                 if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
                     let result = client.refresh_file_transfer(&binding, false).await;
-                    if let Err(error) = result && !binding.cancel.is_cancelled() {
+                    if let Err(error) = result
+                        && !binding.cancel.is_cancelled()
+                    {
                         tracing::warn!(%error, "File transfer ticket refresh failed; retaining valid cached credentials");
                     }
                     continue;

@@ -4,6 +4,7 @@ use crate::{
     wire::{SsoFrameCodec, Writer},
 };
 use futures_util::{SinkExt, StreamExt};
+use p256::ecdsa::{Signature, SigningKey, signature::hazmat::PrehashSigner};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
 
@@ -110,6 +111,7 @@ fn nt_error(code: u64, signature: Option<Bytes>) -> Bytes {
             cookie: Some(auth::NtCookie {
                 cookie: Some(Bytes::from_static(ATTEMPT_COOKIE)),
             }),
+            ..Default::default()
         }),
         body: Some(body.encode_to_vec().into()),
     };
@@ -164,19 +166,27 @@ async fn serve(scenario: Scenario, listener: TcpListener, store: Keystore, clien
     assert_eq!(command, "trpc.login.ecdh.EcdhService.SsoKeyExchange");
     let exchange: auth::KeyExchangeRequest = proto::decode(body).unwrap();
     let peer = Ecdh::new(Curve::P256).unwrap();
-    let shared = peer
-        .shared_secret(&exchange.public_key.unwrap(), false)
-        .unwrap();
+    let client_public = exchange.public_key.unwrap();
+    let shared = peer.shared_secret(&client_public, false).unwrap();
     let session = auth::KeyExchangeSession {
         key: Some(Bytes::copy_from_slice(&NT_KEY)),
         ticket: Some(Bytes::from_static(b"synthetic-session-ticket")),
+        expire_seconds: Some(3600),
     };
+    let encrypted = crypto::aes_gcm_encrypt(&session.encode_to_vec(), &shared).unwrap();
+    let digest = crypto::sha256(
+        &[
+            client_public.as_ref(),
+            peer.public_key(),
+            encrypted.as_slice(),
+        ]
+        .concat(),
+    );
+    let signing_key = SigningKey::from_slice(&[1; 32]).unwrap();
+    let signature: Signature = signing_key.sign_prehash(&digest).unwrap();
     let reply = auth::KeyExchangeResponse {
-        encrypted_secret: Some(
-            crypto::aes_gcm_encrypt(&session.encode_to_vec(), &shared)
-                .unwrap()
-                .into(),
-        ),
+        encrypted_secret: Some(encrypted.into()),
+        signature: Some(Bytes::copy_from_slice(signature.to_der().as_bytes())),
         public_key: Some(Bytes::copy_from_slice(peer.public_key())),
     };
     socket
@@ -342,6 +352,19 @@ async fn exercise(scenario: Scenario) {
         store.clone(),
     )
     .unwrap();
+    let signing_key = SigningKey::from_slice(&[1; 32]).unwrap();
+    let mut codecs = LoginCodecs::new().unwrap();
+    codecs.nt = NtLogin::with_verifier(
+        crypto::P256Verifier::new(
+            signing_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    *client.codecs.lock().await = Some(codecs);
     let server = tokio::spawn(serve(scenario, listener, store, client.clone()));
     let result = tokio::time::timeout(Duration::from_secs(10), client.login())
         .await

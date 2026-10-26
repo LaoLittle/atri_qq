@@ -34,7 +34,9 @@ async fn run_network(weak: Weak<Client>, generation: u64, cancel: CancellationTo
         _ = cancel.cancelled() => return,
         result = client.refresh_ip_direct_configuration(generation) => result,
     };
-    if let Err(error) = result && client.is_current_online(generation) {
+    if let Err(error) = result
+        && client.is_current_online(generation)
+    {
         tracing::warn!(%error, "QQ domain address configuration could not be loaded");
     }
 }

@@ -39,7 +39,10 @@ impl Cache {
 
     pub(crate) fn is_current(&self, binding: &Arc<Binding>) -> bool {
         !binding.cancel.is_cancelled()
-            && self.binding.as_ref().is_some_and(|current| Arc::ptr_eq(current, binding))
+            && self
+                .binding
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, binding))
     }
 }
 
@@ -47,20 +50,26 @@ pub(crate) fn build(uid: &str, start_index: u32, has_local: bool) -> Bytes {
     OidbEnvelope {
         command: Some(0x116d),
         service: Some(1),
-        body: Some(pb::FriendStatusRequest {
-            self_uid: Some(uid.to_owned()),
-            field5: Some(1),
-            field7: Some(0),
-            field8: Some(1),
-            social_style: Some(0),
-            social_switch: Some(0),
-            has_local: has_local.then_some(1),
-            start_index: Some(start_index),
-            count: Some(400),
-        }.encode_to_vec().into()),
+        body: Some(
+            pb::FriendStatusRequest {
+                self_uid: Some(uid.to_owned()),
+                field5: Some(1),
+                field7: Some(0),
+                field8: Some(1),
+                social_style: Some(0),
+                social_switch: Some(0),
+                has_local: has_local.then_some(1),
+                start_index: Some(start_index),
+                count: Some(400),
+            }
+            .encode_to_vec()
+            .into(),
+        ),
         reserved: Some(0),
         ..Default::default()
-    }.encode_to_vec().into()
+    }
+    .encode_to_vec()
+    .into()
 }
 
 fn decode(bytes: Bytes, uid: &str) -> Result<pb::FriendStatusResponse> {
@@ -69,29 +78,45 @@ fn decode(bytes: Bytes, uid: &str) -> Result<pb::FriendStatusResponse> {
     if envelope.command.is_some_and(|command| command != 0x116d)
         || envelope.service.is_some_and(|service| service != 1)
     {
-        return Err(Error::Malformed("Unexpected friend status OIDB envelope".into()));
+        return Err(Error::Malformed(
+            "Unexpected friend status OIDB envelope".into(),
+        ));
     }
     let body = required(envelope.body, "friend status response body")?;
     let response: pb::FriendStatusResponse = crate::diagnostics::decode_response(COMMAND, body)?;
-    if response.self_uid.as_deref().is_some_and(|value| value != uid) {
-        return Err(Error::Authentication("Friend status response belongs to another account".into()));
+    if response
+        .self_uid
+        .as_deref()
+        .is_some_and(|value| value != uid)
+    {
+        return Err(Error::Authentication(
+            "Friend status response belongs to another account".into(),
+        ));
     }
     Ok(response)
 }
 
-fn append(statuses: &mut BTreeMap<String, FriendStatus>, records: Vec<pb::FriendOnlineInfo>) -> Result<()> {
+fn append(
+    statuses: &mut BTreeMap<String, FriendStatus>,
+    records: Vec<pb::FriendOnlineInfo>,
+) -> Result<()> {
     for record in records {
-        let uid = record.uid.filter(|uid| !uid.is_empty())
+        let uid = record
+            .uid
+            .filter(|uid| !uid.is_empty())
             .or_else(|| record.fallback_uid.filter(|uid| !uid.is_empty()))
             .ok_or_else(|| Error::Malformed("Friend status record has no UID".into()))?;
-        statuses.insert(uid, FriendStatus {
-            status: record.status_override.or(record.status),
-            reported_status: record.status,
-            extended_status: record.extended_status,
-            battery_status: record.battery_status,
-            terminal_type: record.terminal_type,
-            network_type: record.network_type,
-        });
+        statuses.insert(
+            uid,
+            FriendStatus {
+                status: record.status_override.or(record.status),
+                reported_status: record.status,
+                extended_status: record.extended_status,
+                battery_status: record.battery_status,
+                terminal_type: record.terminal_type,
+                network_type: record.network_type,
+            },
+        );
     }
     Ok(())
 }
@@ -102,12 +127,18 @@ fn next_start(response: &pb::FriendStatusResponse, previous: u32) -> Result<Opti
     }
     let next = required(response.next_start, "friend status next index")?;
     if next <= previous {
-        return Err(Error::Malformed("Friend status pagination did not advance".into()));
+        return Err(Error::Malformed(
+            "Friend status pagination did not advance".into(),
+        ));
     }
     Ok(Some(next))
 }
 
-pub(crate) async fn fetch(client: &Client, binding: &Arc<Binding>, has_local: bool) -> Result<Arc<FriendStatusSnapshot>> {
+pub(crate) async fn fetch(
+    client: &Client,
+    binding: &Arc<Binding>,
+    has_local: bool,
+) -> Result<Arc<FriendStatusSnapshot>> {
     let mut statuses = BTreeMap::new();
     let mut start = 0;
     let mut interval_minutes = None;
@@ -129,8 +160,12 @@ pub(crate) async fn fetch(client: &Client, binding: &Arc<Binding>, has_local: bo
     let snapshot = Arc::new(FriendStatusSnapshot {
         statuses,
         interval_minutes,
-        received_unix_ms: SystemTime::now().duration_since(UNIX_EPOCH)
-            .unwrap_or_default().as_millis().try_into().unwrap_or(u64::MAX),
+        received_unix_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX),
     });
     client.commit_friend_statuses(binding, snapshot.clone())?;
     Ok(snapshot)
@@ -157,7 +192,9 @@ pub(crate) async fn run(weak: Weak<Client>, generation: u64, cancel: Cancellatio
             return;
         }
         let interval = match result {
-            Ok(snapshot) => snapshot.interval_minutes.filter(|minutes| *minutes != 0)
+            Ok(snapshot) => snapshot
+                .interval_minutes
+                .filter(|minutes| *minutes != 0)
                 .map(|minutes| Duration::from_secs(u64::from(minutes) * 60))
                 .unwrap_or(INTERVAL),
             Err(error) => {
@@ -174,23 +211,29 @@ pub(crate) async fn run(weak: Weak<Client>, generation: u64, cancel: Cancellatio
 mod tests {
     use super::*;
 
-
     #[test]
     fn native_mapping_keeps_unknown_and_absent_values() {
         let mut statuses = BTreeMap::new();
-        append(&mut statuses, vec![pb::FriendOnlineInfo {
-            uid: Some("u_synthetic".into()),
-            status: Some(10),
-            status_override: Some(11),
-            extended_status: Some(876543),
-            terminal_type: Some(1),
-            network_type: Some(5),
-            battery_status: Some(83714),
-            ..Default::default()
-        }, pb::FriendOnlineInfo {
-            fallback_uid: Some("u_fallback".into()),
-            ..Default::default()
-        }]).unwrap();
+        append(
+            &mut statuses,
+            vec![
+                pb::FriendOnlineInfo {
+                    uid: Some("u_synthetic".into()),
+                    status: Some(10),
+                    status_override: Some(11),
+                    extended_status: Some(876543),
+                    terminal_type: Some(1),
+                    network_type: Some(5),
+                    battery_status: Some(83714),
+                    ..Default::default()
+                },
+                pb::FriendOnlineInfo {
+                    fallback_uid: Some("u_fallback".into()),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
         let status = &statuses["u_synthetic"];
         assert_eq!(status.status, Some(11));
         assert_eq!(status.reported_status, Some(10));
@@ -213,12 +256,28 @@ mod tests {
 
     #[test]
     fn envelope_errors_and_identity_are_not_success() {
-        let error = OidbEnvelope { code: Some(17), ..Default::default() };
-        assert!(matches!(decode(error.encode_to_vec().into(), "u_self"), Err(Error::Server { code: 17, .. })));
-        let envelope = OidbEnvelope {
-            body: Some(pb::FriendStatusResponse { self_uid: Some("u_other".into()), ..Default::default() }.encode_to_vec().into()),
+        let error = OidbEnvelope {
+            code: Some(17),
             ..Default::default()
         };
-        assert!(matches!(decode(envelope.encode_to_vec().into(), "u_self"), Err(Error::Authentication(_))));
+        assert!(matches!(
+            decode(error.encode_to_vec().into(), "u_self"),
+            Err(Error::Server { code: 17, .. })
+        ));
+        let envelope = OidbEnvelope {
+            body: Some(
+                pb::FriendStatusResponse {
+                    self_uid: Some("u_other".into()),
+                    ..Default::default()
+                }
+                .encode_to_vec()
+                .into(),
+            ),
+            ..Default::default()
+        };
+        assert!(matches!(
+            decode(envelope.encode_to_vec().into(), "u_self"),
+            Err(Error::Authentication(_))
+        ));
     }
 }

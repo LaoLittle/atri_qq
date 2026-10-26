@@ -7,11 +7,11 @@ message KeyExchangeRequest {
   optional bytes public_key = 1;
   optional uint32 type = 2;
   optional bytes encrypted_secret = 3;
-  optional uint32 timestamp = 4;
+  optional uint64 timestamp = 4;
   optional bytes encrypted_hash = 5;
 }
-message KeyExchangeResponse { optional bytes encrypted_secret = 1; optional bytes public_key = 3; }
-message KeyExchangeSession { optional bytes key = 1; optional bytes ticket = 2; }
+message KeyExchangeResponse { optional bytes encrypted_secret = 1; optional bytes signature = 2; optional bytes public_key = 3; }
+message KeyExchangeSession { optional bytes key = 1; optional bytes ticket = 2; optional int64 expire_seconds = 3; }
 message NtForward { optional bytes ticket = 1; optional bytes encrypted = 3; optional uint32 type = 4; }
 message NtAccountRequest { optional string uin = 1; }
 message NtClient { optional string os = 1; optional string device_name = 2; optional uint32 platform = 3; optional bytes guid = 4; }
@@ -19,7 +19,7 @@ message NtApp { optional string kernel = 1; optional uint32 app_id = 2; optional
 message NtCookie { optional bytes cookie = 1; }
 message NtError { optional uint64 code = 1; optional string title = 2; optional string message = 3; optional string jump_word = 4; optional string jump_url = 5; }
 message NtSecurity { optional uint32 mode = 1; }
-message NtRequestHead { optional NtAccountRequest account = 1; optional NtClient client = 2; optional NtApp app = 3; optional NtCookie cookie = 5; optional NtSecurity security = 7; }
+message NtRequestHead { optional NtAccountRequest account = 1; optional NtClient client = 2; optional NtApp app = 3; optional NtCookie cookie = 5; optional NtSecurity security = 7; optional NtCookie long_cookie = 8; }
 message NtRequest { optional NtRequestHead head = 1; optional bytes body = 2; }
 message NtLoginBody { optional bytes a1 = 1; optional NtCaptcha captcha = 2; }
 message NtRefreshTicketBody { optional bytes a1 = 1; }
@@ -28,7 +28,7 @@ message NtCaptcha { optional string ticket = 1; optional string random = 2; opti
 message NtNewDeviceBody { optional string success_token = 1; }
 // The common envelope carries an RPC-specific body.
 message NtResponse { optional NtResponseHead head = 1; optional bytes body = 2; }
-message NtResponseHead { optional NtError error = 4; optional NtCookie cookie = 5; }
+message NtResponseHead { optional NtError error = 4; optional NtCookie cookie = 5; optional NtCookie long_cookie = 8; }
 message NtEasyLoginResponseBody { optional NtTickets tickets = 1; optional NtUnusualDevice protection = 3; }
 message NtPasswordResponseBody { optional NtTickets tickets = 1; optional NtCaptchaChallenge captcha = 2; optional NtUnusualDevice protection = 3; optional NtAccount account = 4; }
 message NtNewDeviceResponseBody { optional NtTickets tickets = 1; optional NtAccount account = 3; }
@@ -78,8 +78,8 @@ message Kick {
 message StatusDevice { optional bytes name = 1; optional bytes kernel = 2; optional bytes vendor = 3; optional bytes model = 4; optional bytes os = 5; }
 message UnregisterRequest { optional uint32 type = 1; optional StatusDevice device = 2; optional uint32 reason = 3; }
 message StatusResponse { optional string message = 2; }
-message HeartbeatState { optional uint32 status = 1; optional uint32 field2 = 2; }
-message HeartbeatRequest { optional uint32 type = 1; optional HeartbeatState state = 2; optional uint32 local_silence = 3; optional uint64 server_time = 4; }
+message HeartbeatState { optional uint32 silence_status = 1; optional uint32 silent_version = 2; }
+message HeartbeatRequest { optional uint32 type = 1; optional HeartbeatState state = 2; optional uint32 battery_status = 3; optional uint64 trigger_time = 4; }
 message HeartbeatResponse { optional uint32 interval_seconds = 3; }
 message InfoSyncRequest {
   optional uint32 sync_flag = 1;

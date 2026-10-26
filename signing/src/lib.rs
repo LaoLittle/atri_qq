@@ -2,6 +2,7 @@ pub mod command_policy;
 mod digest;
 pub mod extra;
 mod footer;
+pub mod ios;
 pub mod metadata;
 pub mod proto;
 pub mod token;
@@ -47,6 +48,7 @@ pub enum Signature {
     Empty,
     Sequence([u8; 16]),
     Full([u8; 48]),
+    Ios(ios::signer::Signature),
 }
 
 impl AsRef<[u8]> for Signature {
@@ -55,6 +57,7 @@ impl AsRef<[u8]> for Signature {
             Self::Empty => &[],
             Self::Sequence(bytes) => bytes,
             Self::Full(bytes) => bytes,
+            Self::Ios(signature) => signature.as_ref(),
         }
     }
 }
@@ -183,7 +186,11 @@ impl Signer {
             let clock = resources.clock_ns().map_err(SignError::Entropy)? as i64;
             let mut prepared = digest::prepare_sign(&input, clock);
 
-            prepared[5] = if self.desktop_resource_initialized { 0 } else { 0x80 };
+            prepared[5] = if self.desktop_resource_initialized {
+                0
+            } else {
+                0x80
+            };
             let counter = self.command_policy.next(command.as_bytes());
             let facts = resources
                 .metadata_resources(self.metadata.requires_entropy())

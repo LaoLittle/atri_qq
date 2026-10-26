@@ -28,7 +28,9 @@ impl FileTransferTicket {
 
 impl fmt::Debug for FileTransferTicket {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("FileTransferTicket").finish_non_exhaustive()
+        formatter
+            .debug_struct("FileTransferTicket")
+            .finish_non_exhaustive()
     }
 }
 
@@ -52,7 +54,9 @@ impl Binding {
         cancel: &CancellationToken,
     ) -> Result<Self> {
         if uin == 0 || u32::try_from(uin).is_err() || uid.is_empty() || a2.is_empty() {
-            return Err(Error::Authentication("Incomplete file transfer credential identity".into()));
+            return Err(Error::Authentication(
+                "Incomplete file transfer credential identity".into(),
+            ));
         }
         if cancel.is_cancelled() {
             return Err(Error::Disconnected);
@@ -80,7 +84,9 @@ impl Binding {
 
 impl fmt::Debug for Binding {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("FileTransferBinding").finish_non_exhaustive()
+        formatter
+            .debug_struct("FileTransferBinding")
+            .finish_non_exhaustive()
     }
 }
 
@@ -90,7 +96,9 @@ pub(crate) struct Session {
 
 impl fmt::Debug for Session {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("FileTransferSession").finish_non_exhaustive()
+        formatter
+            .debug_struct("FileTransferSession")
+            .finish_non_exhaustive()
     }
 }
 
@@ -101,7 +109,9 @@ pub(crate) struct Response {
 
 impl fmt::Debug for Response {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("FileTransferResponse").finish_non_exhaustive()
+        formatter
+            .debug_struct("FileTransferResponse")
+            .finish_non_exhaustive()
     }
 }
 
@@ -119,9 +129,11 @@ impl Cache {
         if binding.cancel.is_cancelled() {
             return Err(Error::Disconnected);
         }
-        if let Some(current) = self.binding.as_ref().filter(|current| {
-            !current.cancel.is_cancelled() && current.same_identity(&binding)
-        }) {
+        if let Some(current) = self
+            .binding
+            .as_ref()
+            .filter(|current| !current.cancel.is_cancelled() && current.same_identity(&binding))
+        {
             return Ok(current.clone());
         }
         self.invalidate();
@@ -140,7 +152,8 @@ impl Cache {
     }
 
     pub(crate) fn binding(&self) -> Result<Arc<Binding>> {
-        self.binding.as_ref()
+        self.binding
+            .as_ref()
             .filter(|binding| !binding.cancel.is_cancelled())
             .cloned()
             .ok_or(Error::Disconnected)
@@ -148,12 +161,18 @@ impl Cache {
 
     pub(crate) fn is_current(&self, binding: &Arc<Binding>) -> bool {
         !binding.cancel.is_cancelled()
-            && self.binding.as_ref().is_some_and(|current| Arc::ptr_eq(current, binding))
+            && self
+                .binding
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, binding))
     }
 
     pub(crate) fn cached(&self, now: Instant) -> Option<FileTransferTicket> {
         self.binding().ok()?;
-        self.ticket.as_ref().filter(|ticket| ticket.expires > now).cloned()
+        self.ticket
+            .as_ref()
+            .filter(|ticket| ticket.expires > now)
+            .cloned()
     }
 
     pub(crate) fn enable(&mut self, now: Instant) -> Result<()> {
@@ -191,7 +210,10 @@ impl Cache {
         now: Instant,
     ) -> Result<FileTransferTicket> {
         if !self.is_current(&session.binding)
-            || !self.pending.as_ref().is_some_and(|pending| Arc::ptr_eq(pending, session))
+            || !self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| Arc::ptr_eq(pending, session))
         {
             return Err(Error::Disconnected);
         }
@@ -199,14 +221,23 @@ impl Cache {
         self.due = None;
         let response = response?;
         if response.sign.is_empty() || response.lifetime_seconds == 0 {
-            return Err(Error::Malformed("Missing file transfer ticket or lifetime".into()));
+            return Err(Error::Malformed(
+                "Missing file transfer ticket or lifetime".into(),
+            ));
         }
-        let expires = now.checked_add(Duration::from_secs(response.lifetime_seconds))
-            .ok_or_else(|| Error::Malformed("File transfer ticket lifetime exceeds clock range".into()))?;
+        let expires = now
+            .checked_add(Duration::from_secs(response.lifetime_seconds))
+            .ok_or_else(|| {
+                Error::Malformed("File transfer ticket lifetime exceeds clock range".into())
+            })?;
         let interval = renewal_interval(response.lifetime_seconds);
-        let due = now.checked_add(interval)
+        let due = now
+            .checked_add(interval)
             .ok_or_else(|| Error::Malformed("File transfer renewal exceeds clock range".into()))?;
-        let ticket = FileTransferTicket { sign: response.sign, expires };
+        let ticket = FileTransferTicket {
+            sign: response.sign,
+            expires,
+        };
         self.ticket = Some(ticket.clone());
         self.due = Some(due);
         Ok(ticket)
@@ -214,7 +245,11 @@ impl Cache {
 }
 
 fn renewal_interval(lifetime_seconds: u64) -> Duration {
-    Duration::from_secs(if lifetime_seconds >= 3601 { lifetime_seconds >> 1 } else { 1800 })
+    Duration::from_secs(if lifetime_seconds >= 3601 {
+        lifetime_seconds >> 1
+    } else {
+        1800
+    })
 }
 
 pub(crate) fn build(session: &Session) -> Result<Bytes> {
@@ -228,24 +263,28 @@ pub(crate) fn build(session: &Session) -> Result<Bytes> {
         a2: Some(binding.a2.clone()),
         field4: Some(0),
         machine_guid: Some(Bytes::copy_from_slice(&binding.machine_guid)),
-    }.encode_to_vec();
+    }
+    .encode_to_vec();
     Ok(OidbEnvelope {
         command: Some(0x9a2),
         service: Some(8),
         body: Some(body.into()),
         reserved: Some(1),
         ..Default::default()
-    }.encode_to_vec().into())
+    }
+    .encode_to_vec()
+    .into())
 }
 
 pub(crate) fn decode(bytes: Bytes) -> Result<Response> {
     let envelope: OidbEnvelope = crate::proto::decode(bytes)?;
-    if envelope.command != Some(0x9a2)
-        || envelope.service != Some(8)
-    {
-        return Err(Error::Malformed("Unexpected file transfer OIDB envelope".into()));
+    if envelope.command != Some(0x9a2) || envelope.service != Some(8) {
+        return Err(Error::Malformed(
+            "Unexpected file transfer OIDB envelope".into(),
+        ));
     }
-    let code = envelope.code
+    let code = envelope
+        .code
         .ok_or_else(|| Error::Malformed("Missing file transfer OIDB result".into()))?;
     if code != 0 {
         return Err(Error::Server {
@@ -253,16 +292,26 @@ pub(crate) fn decode(bytes: Bytes) -> Result<Response> {
             message: "File transfer credential request rejected".into(),
         });
     }
-    let body = envelope.body.filter(|body| !body.is_empty())
+    let body = envelope
+        .body
+        .filter(|body| !body.is_empty())
         .ok_or_else(|| Error::Malformed("Missing file transfer response body".into()))?;
     let response: pb::FileTransSignResponse = crate::proto::decode(body)?;
-    let ticket = response.ticket
+    let ticket = response
+        .ticket
         .ok_or_else(|| Error::Malformed("Missing file transfer ticket".into()))?;
-    let sign = ticket.sign.filter(|sign| !sign.is_empty())
+    let sign = ticket
+        .sign
+        .filter(|sign| !sign.is_empty())
         .ok_or_else(|| Error::Malformed("Missing file transfer signature".into()))?;
-    let lifetime_seconds = ticket.lifetime_seconds.filter(|lifetime| *lifetime != 0)
+    let lifetime_seconds = ticket
+        .lifetime_seconds
+        .filter(|lifetime| *lifetime != 0)
         .ok_or_else(|| Error::Malformed("Missing file transfer ticket lifetime".into()))?;
-    Ok(Response { sign, lifetime_seconds })
+    Ok(Response {
+        sign,
+        lifetime_seconds,
+    })
 }
 
 #[cfg(test)]

@@ -1,0 +1,27 @@
+syntax = "proto3";
+package ios.signing;
+
+message DeviceTokenItem {
+  int32 id = 1;
+  bytes data = 2;
+}
+
+message DeviceTokenRequest {
+  repeated DeviceTokenItem items = 1;
+  bytes previous_token = 2;
+  bytes native_payload = 3;
+}
+
+message DeviceTokenResponse {
+  bytes token = 1;
+  uint64 expires_at = 2;
+}
+
+message NativeTokenItem {
+  uint32 id = 1;
+  bytes data = 2;
+}
+
+message NativeTokenProperties {
+  repeated NativeTokenItem items = 1;
+}

@@ -42,7 +42,9 @@ pub struct Endpoint<'a> {
 
 impl Endpoint<'_> {
     pub fn is_unspecified(&self) -> bool {
-        self.host.parse::<IpAddr>().is_ok_and(|ip| ip.is_unspecified())
+        self.host
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.is_unspecified())
     }
 }
 
@@ -62,7 +64,9 @@ fn validate_host(host: &str) -> Result<()> {
                 && label.len() <= 63
                 && !label.starts_with('-')
                 && !label.ends_with('-')
-                && label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         })
     {
         return Err(invalid("Invalid network endpoint host"));
@@ -164,9 +168,11 @@ impl SsoServerInfo {
     }
 
     pub(crate) fn connect_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(
-            if self.timeout_seconds > 0 { self.timeout_seconds as u64 } else { 8 },
-        )
+        std::time::Duration::from_secs(if self.timeout_seconds > 0 {
+            self.timeout_seconds as u64
+        } else {
+            8
+        })
     }
 }
 
@@ -256,7 +262,10 @@ impl SsoServerLists {
         } else {
             self.list_11.as_slice()
         };
-        primary.iter().chain(ipv6).filter(|server| matches!(server.protocol, 0 | 1))
+        primary
+            .iter()
+            .chain(ipv6)
+            .filter(|server| matches!(server.protocol, 0 | 1))
     }
 }
 
@@ -393,7 +402,11 @@ mod tests {
 
     #[test]
     fn ip_direct_rejects_invalid_targets_but_preserves_ipv6_sentinel() {
-        for (host, port) in [("https://example.test/", 80), ("example.test", 0), ("example.test", 65536)] {
+        for (host, port) in [
+            ("https://example.test/", 80),
+            ("example.test", 0),
+            ("example.test", 65536),
+        ] {
             assert!(decode_get_ip_direct(response(Some(7), Some(0), host, port), 7).is_err());
         }
         let configuration = decode_get_ip_direct(response(Some(7), Some(0), "::", 80), 7).unwrap();
@@ -408,8 +421,10 @@ mod tests {
         assert!(push.acknowledgment.is_some());
         assert_eq!(push.sequence, Some(0));
         let push = decode_push(wire::config_push::request_fixture(99, 0)).unwrap();
-        assert!(matches!(push.body, ConfigPushBody::Unknown { kind: 99, .. }));
+        assert!(matches!(
+            push.body,
+            ConfigPushBody::Unknown { kind: 99, .. }
+        ));
         assert!(push.acknowledgment.is_none());
     }
-
 }

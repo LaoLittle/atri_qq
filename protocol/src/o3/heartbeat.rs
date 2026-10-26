@@ -22,7 +22,6 @@ pub(crate) enum Work {
     },
 }
 
-
 pub(crate) struct TaskReport {
     binding: SigningReport,
     header: pb::HeartbeatHeader,
@@ -267,7 +266,7 @@ impl Heartbeat {
                     identifier: response.identifier.clone(),
                 }
                 .encode_to_vec(),
-            ),
+            )?,
         )];
         let mut results = Vec::new();
         let mut jobs = Vec::new();
@@ -356,7 +355,7 @@ impl Heartbeat {
         }
         if !results.is_empty() {
             let report = TaskReport {
-                binding: signer.channel_report("taskReport", Vec::new()),
+                binding: signer.channel_report("taskReport", Vec::new())?,
                 header,
                 identifier: response.identifier,
                 results,
@@ -558,12 +557,19 @@ mod tests {
             task(11, b"empty-last", Vec::new()),
         ]);
         assert_eq!(
-            reports.iter().map(|report| report.method.as_str()).collect::<Vec<_>>(),
+            reports
+                .iter()
+                .map(|report| report.method.as_str())
+                .collect::<Vec<_>>(),
             ["taskAck", "taskReport"]
         );
         let report = pb::TaskReportRequest::decode(reports[1].body.as_slice()).unwrap();
         assert_eq!(
-            report.results.iter().map(|result| result.identifier.as_ref()).collect::<Vec<_>>(),
+            report
+                .results
+                .iter()
+                .map(|result| result.identifier.as_ref())
+                .collect::<Vec<_>>(),
             [
                 b"empty-first".as_slice(),
                 b"first-word".as_slice(),
@@ -589,7 +595,10 @@ mod tests {
             &calculation_tlv(second, 11)[8..],
             &crate::crypto::md5(b"XY")[..8]
         );
-        assert_eq!(&calculation_tlv(first, 11)[..8], &calculation_tlv(second, 11)[..8]);
+        assert_eq!(
+            &calculation_tlv(first, 11)[..8],
+            &calculation_tlv(second, 11)[..8]
+        );
         let runtime = fixture.heartbeat.material.as_ref().unwrap().runtime;
         assert_eq!(&first[207..211], &runtime[..4]);
         assert_eq!(&second[207..211], &runtime[..4]);
@@ -605,7 +614,10 @@ mod tests {
         let report = pb::TaskReportRequest::decode(reports[1].body.as_slice()).unwrap();
         assert_eq!(&report.results[0].body[207..211], &runtime[..4]);
         assert_eq!(&report.results[0].body[203..207], &2u32.to_be_bytes());
-        assert_eq!(&report.results[0].body[211..215], &0x90ab_cdefu32.to_le_bytes());
+        assert_eq!(
+            &report.results[0].body[211..215],
+            &0x90ab_cdefu32.to_le_bytes()
+        );
     }
 
     #[tokio::test(start_paused = true)]

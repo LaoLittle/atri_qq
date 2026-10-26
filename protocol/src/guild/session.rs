@@ -102,14 +102,22 @@ impl Session {
         result
     }
 
-    pub(crate) fn ingest_info_push(&self, generation: u64, push: &proto::message_sync::InfoSyncPush) -> Result<()> {
+    pub(crate) fn ingest_info_push(
+        &self,
+        generation: u64,
+        push: &proto::message_sync::InfoSyncPush,
+    ) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         if state.generation != Some(generation) || state.complete || state.error.is_some() {
             return Ok(());
         }
         let result = state.ingest_info(push);
-        if let Err(error) = &result { state.error = Some(error.clone()); }
-        if state.complete || state.error.is_some() { self.changed.send_replace(()); }
+        if let Err(error) = &result {
+            state.error = Some(error.clone());
+        }
+        if state.complete || state.error.is_some() {
+            self.changed.send_replace(());
+        }
         result
     }
 
@@ -264,7 +272,6 @@ impl State {
 fn decode_name(bytes: Bytes) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -605,20 +612,31 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn unrelated_partial_failure_does_not_terminate_guild() {
         let session = started();
-        session.ingest(
-            GENERATION,
-            &packet(INFO_SYNC_PUSH, proto::message_sync::InfoSyncPush {
-                result: Some(0x05f5e3c0),
-                request_random: Some(RANDOM),
-                stage: Some(1),
-                guild: Some(proto::guild::GuildFirstViewData {
-                    in_tab_nodes: vec![node(55, Some("Synthetic guild"), &[(56, Some("General"), Some(1))])],
-                    ..initial()
-                }),
-                ..Default::default()
-            }),
-        ).unwrap();
-        session.ingest(GENERATION, &info(4, Some(Default::default()))).unwrap();
+        session
+            .ingest(
+                GENERATION,
+                &packet(
+                    INFO_SYNC_PUSH,
+                    proto::message_sync::InfoSyncPush {
+                        result: Some(0x05f5e3c0),
+                        request_random: Some(RANDOM),
+                        stage: Some(1),
+                        guild: Some(proto::guild::GuildFirstViewData {
+                            in_tab_nodes: vec![node(
+                                55,
+                                Some("Synthetic guild"),
+                                &[(56, Some("General"), Some(1))],
+                            )],
+                            ..initial()
+                        }),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .unwrap();
+        session
+            .ingest(GENERATION, &info(4, Some(Default::default())))
+            .unwrap();
         let snapshot = session.snapshot(GENERATION).unwrap();
         assert_eq!(snapshot.guilds[0].id, 55);
         assert_eq!(snapshot.guilds[0].name, "Synthetic guild");

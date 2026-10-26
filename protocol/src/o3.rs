@@ -40,6 +40,7 @@ pub const CANONICAL_REPORT_MODULE_PATHS: &[&str] = &[
     "/opt/QQ/resources/app/application.asar/544.background.js",
     "/opt/QQ/resources/app/application.asar/790.background.js",
     "/opt/QQ/resources/app/application.asar/86.background.js",
+    "/opt/QQ/resources/app/application.asar/875.background.js",
     "/opt/QQ/resources/app/application.asar/app_launcher/index.js",
     "/opt/QQ/resources/app/application.asar/app_launcher/launcher.js",
     "/opt/QQ/resources/app/application.asar/background.js",
@@ -180,6 +181,38 @@ fn boot_time_text(source: &[u8], now: i64) -> Option<Vec<u8>> {
         .map(|seconds| seconds.to_string().into_bytes())
 }
 
+fn root_filesystem_capacity() -> Option<Vec<u8>> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = rustix::fs::statfs("/").ok()?;
+        let bytes = std::num::Wrapping(status.f_bsize as u64) * std::num::Wrapping(status.f_blocks);
+        Some(bytes.0.to_string().into_bytes())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+fn session_login_name() -> Option<Vec<u8>> {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe extern "C" {
+            fn getlogin_r(name: *mut std::ffi::c_char, len: usize) -> std::ffi::c_int;
+        }
+        let mut name = [0u8; 256];
+        if unsafe { getlogin_r(name.as_mut_ptr().cast(), name.len()) } != 0 {
+            return None;
+        }
+        let end = name.iter().position(|byte| *byte == 0)?;
+        (end != 0).then(|| name[..end].to_vec())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 pub(crate) fn validate_local_identity(machine_id: &str) -> Result<()> {
     if machine_id.is_empty() || machine_id.as_bytes().contains(&0) {
         return Err(Error::Malformed(
@@ -194,11 +227,12 @@ pub fn local_device_properties(
     application_uuid: &str,
 ) -> Result<DeviceProperties> {
     validate_local_identity(machine_id)?;
+    let mut filesystem_capacity = root_filesystem_capacity();
+    let mut login_name = session_login_name();
     let mut system_machine_id = read_property_file("/etc/machine-id");
     let mut boot_id = read_property_file("/proc/sys/kernel/random/boot_id");
-    let mut boot_time = read_property_file("/proc/uptime").and_then(|source| {
-        boot_time_text(&source, i64::try_from(unix_seconds().ok()?).ok()?)
-    });
+    let mut boot_time = read_property_file("/proc/uptime")
+        .and_then(|source| boot_time_text(&source, i64::try_from(unix_seconds().ok()?).ok()?));
     let mut kernel_version = read_property_file("/proc/sys/kernel/version");
     let mut system_uuid = read_property_file("/etc/uuid");
     let mut memory_total = std::fs::read("/proc/meminfo")
@@ -212,6 +246,7 @@ pub fn local_device_properties(
         .map(|id| {
             let value = match id {
                 0 => b"5".to_vec(),
+                4 => filesystem_capacity.take().unwrap_or_else(|| b"-1".to_vec()),
                 5 => memory_total.take().unwrap_or_else(|| b"-1".to_vec()),
                 16 => machine_id.as_bytes().to_vec(),
                 24 if !application_uuid.is_empty() => application_uuid.as_bytes().to_vec(),
@@ -220,6 +255,7 @@ pub fn local_device_properties(
                 27 => boot_time.take().unwrap_or_else(|| b"-1".to_vec()),
                 28 => kernel_version.take().unwrap_or_else(|| b"-1".to_vec()),
                 30 => system_uuid.take().unwrap_or_else(|| b"-1".to_vec()),
+                35 => login_name.take().unwrap_or_else(|| b"-1".to_vec()),
                 41 => hostname.take().unwrap_or_else(|| b"-1".to_vec()),
                 _ => b"-1".to_vec(),
             };

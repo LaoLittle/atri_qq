@@ -894,7 +894,10 @@ async fn member_list_decodes_binary_rich_cards_without_losing_other_members() {
     let operations = Operations::new(client);
     let members = operations.fetch_members(123, false).await.unwrap();
     assert_eq!(
-        members.iter().map(|member| member.card.as_deref()).collect::<Vec<_>>(),
+        members
+            .iter()
+            .map(|member| member.card.as_deref())
+            .collect::<Vec<_>>(),
         vec![Some("普通名片"), Some("彩色名片")]
     );
     assert_eq!(operations.resolve_uid(123, None).await.unwrap(), "u_plain");
@@ -907,19 +910,25 @@ fn member_card_format_and_presence_are_not_guessed_from_bytes() {
         rich: Some(false),
         card: Some(Bytes::from_static(b"\x0a\x03abc")),
     };
-    assert_eq!(decode_member_card(plain).unwrap().as_deref(), Some("\n\u{3}abc"));
+    assert_eq!(
+        decode_member_card(plain).unwrap().as_deref(),
+        Some("\n\u{3}abc")
+    );
     assert_eq!(
         decode_member_card(protocol::MemberCard {
             rich: Some(true),
             card: None,
-        }).unwrap(),
+        })
+        .unwrap(),
         None
     );
     assert_eq!(
         decode_member_card(protocol::MemberCard {
             rich: Some(true),
             card: Some(Bytes::new()),
-        }).unwrap().as_deref(),
+        })
+        .unwrap()
+        .as_deref(),
         Some("")
     );
 }

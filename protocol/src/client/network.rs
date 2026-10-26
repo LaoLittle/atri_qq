@@ -12,7 +12,10 @@ impl Client {
             return None;
         }
         let (session, configuration) = inner.ip_direct_configuration.as_ref()?;
-        inner.credentials.is_current(session).then(|| configuration.clone())
+        inner
+            .credentials
+            .is_current(session)
+            .then(|| configuration.clone())
     }
 
     pub fn cached_sso_configuration(&self) -> Option<Arc<SsoConfiguration>> {
@@ -23,7 +26,8 @@ impl Client {
         if let Some(configuration) = self.cached_ip_direct_configuration() {
             return Ok(configuration);
         }
-        self.refresh_ip_direct_configuration(self.connection_generation()).await
+        self.refresh_ip_direct_configuration(self.connection_generation())
+            .await
     }
 
     pub(crate) async fn refresh_ip_direct_configuration(
@@ -37,14 +41,16 @@ impl Client {
             }
             (inner.credentials.session()?, inner.state.keystore.uin)
         };
-        let response = self.request_inner(
-            network::GET_IP_DIRECT_COMMAND,
-            network::GetIpDirectRequest.encode(),
-            RequestType::D2,
-            Encryption::D2,
-            self.config.timeout,
-            Some(RequestBinding::Credentials(&session)),
-        ).await?;
+        let response = self
+            .request_inner(
+                network::GET_IP_DIRECT_COMMAND,
+                network::GetIpDirectRequest.encode(),
+                RequestType::D2,
+                Encryption::D2,
+                self.config.timeout,
+                Some(RequestBinding::Credentials(&session)),
+            )
+            .await?;
         let configuration = Arc::new(network::decode_get_ip_direct(response, account)?);
         let mut inner = self.inner.lock().unwrap();
         if !Self::current_online(&inner, generation) || !inner.credentials.is_current(&session) {
@@ -60,13 +66,18 @@ impl Client {
             match configuration {
                 Ok(configuration) => {
                     let mut inner = self.inner.lock().unwrap();
-                    if inner.generation != generation || inner.connection.is_none() || inner.kick_reason.is_some() {
+                    if inner.generation != generation
+                        || inner.connection.is_none()
+                        || inner.kick_reason.is_some()
+                    {
                         return Err(Error::Disconnected);
                     }
                     inner.sso_configuration = Some(Arc::new(configuration));
                     inner.server_cursor = 0;
                 }
-                Err(error) => tracing::warn!(%error, "Rejected SSO server configuration; preserving control acknowledgment"),
+                Err(error) => {
+                    tracing::warn!(%error, "Rejected SSO server configuration; preserving control acknowledgment")
+                }
             }
         }
         Ok(push.acknowledgment)
@@ -80,7 +91,9 @@ impl Client {
         if self.config.server_selection != ServerSelection::Configured
             && let Some(configuration) = configuration
         {
-            let servers = configuration.servers.tcp_servers(self.config.server_selection);
+            let servers = configuration
+                .servers
+                .tcp_servers(self.config.server_selection);
             let capacity = servers.size_hint().1.unwrap_or(0);
             let mut candidates = Vec::with_capacity(capacity);
             let mut seen = std::collections::HashSet::with_capacity(capacity);
@@ -100,16 +113,26 @@ impl Client {
                     }
                     {
                         let mut inner = self.inner.lock().unwrap();
-                        if inner.sso_configuration.as_ref().is_some_and(|current| Arc::ptr_eq(current, &configuration)) {
+                        if inner
+                            .sso_configuration
+                            .as_ref()
+                            .is_some_and(|current| Arc::ptr_eq(current, &configuration))
+                        {
                             inner.server_cursor = (index + 1) % candidates.len();
                         }
                     }
                     if let Ok(Ok(socket)) = tokio::time::timeout(
                         server.connect_timeout(),
                         TcpStream::connect((endpoint.host, endpoint.port)),
-                    ).await {
+                    )
+                    .await
+                    {
                         let mut inner = self.inner.lock().unwrap();
-                        if inner.sso_configuration.as_ref().is_some_and(|current| Arc::ptr_eq(current, &configuration)) {
+                        if inner
+                            .sso_configuration
+                            .as_ref()
+                            .is_some_and(|current| Arc::ptr_eq(current, &configuration))
+                        {
                             inner.server_cursor = index;
                         }
                         return Ok(socket);
@@ -117,7 +140,9 @@ impl Client {
                 }
             }
         }
-        TcpStream::connect((self.config.host.as_str(), self.config.port)).await.map_err(Into::into)
+        TcpStream::connect((self.config.host.as_str(), self.config.port))
+            .await
+            .map_err(Into::into)
     }
 }
 
@@ -168,7 +193,8 @@ mod tests {
                     ..Default::default()
                 },
                 Keystore::default(),
-            ).unwrap();
+            )
+            .unwrap();
             client.inner.lock().unwrap().sso_configuration = Some(configuration.clone());
             client.connect().await.unwrap();
             let expected = match selection {
@@ -176,8 +202,13 @@ mod tests {
                 ServerSelection::Wifi => &wifi,
                 ServerSelection::Mobile => unreachable!(),
             };
-            let (socket, _) = tokio::time::timeout(Duration::from_secs(2), expected.accept()).await.unwrap().unwrap();
-            client.close_transport("Synthetic server selection finished".into()).await;
+            let (socket, _) = tokio::time::timeout(Duration::from_secs(2), expected.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            client
+                .close_transport("Synthetic server selection finished".into())
+                .await;
             drop(socket);
         }
     }

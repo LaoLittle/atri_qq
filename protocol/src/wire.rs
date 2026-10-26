@@ -189,9 +189,12 @@ pub(crate) mod config_push {
             return Err(malformed("Unsupported JCE request envelope"));
         }
         let mut data = Data::decode(std::mem::take(&mut packet.buffer.0)).map_err(invalid)?;
-        let body = data.entries.remove(entry)
+        let body = data
+            .entries
+            .remove(entry)
             .and_then(|mut entries| entries.remove(entry_type))
-            .ok_or_else(|| malformed("Missing JCE request body"))?.0;
+            .ok_or_else(|| malformed("Missing JCE request body"))?
+            .0;
         if body.first() != Some(&0x0a) || body.last() != Some(&0x0b) {
             return Err(malformed("Invalid JCE request struct"));
         }
@@ -569,32 +572,27 @@ pub(crate) fn encode_sso(
     encryption: Encryption,
     state: &SessionState,
     signature: Option<signing_engine::SecureInfo>,
+    ios_transport: Option<(&IosTransportResources, &[u8])>,
 ) -> Result<Bytes> {
     use prost::Message;
     if body.len() > MAX_FRAME_SIZE - 4096 || command.len() > 1024 * 1024 {
         return Err(malformed("SSO request exceeds limit"));
     }
     let store = &state.keystore;
-    let mut head = Writer::new();
-    match kind {
-        RequestType::D2 => {
-            head.i32(sequence);
-            head.u32(state.profile.sub_app_id);
-            head.u32(2052);
-            head.u8(2);
-            head.zeros(11);
-            head.p32(&store.a2)?;
-            head.p32(command)?;
-            head.p32([])?;
-            head.p32(hex::encode(&store.guid))?;
-            head.p32([])?;
-            head.pref(&state.profile.version, 2, true)?;
+    let ios_transport = if state.profile.platform.is_ios() {
+        let (resources, cookie) = ios_transport.ok_or_else(|| {
+            Error::Authentication("iOS requests require actual transport resources".into())
+        })?;
+        resources.validate()?;
+        if command == "PushService.get" && resources.push_service_get_statistics.is_none() {
+            return Err(Error::Authentication(
+                "PushService.get requires actual iOS transport statistics".into(),
+            ));
         }
-        RequestType::Simple => {
-            head.p32(command)?;
-            head.p32([])?;
-        }
-    }
+        Some((resources, cookie))
+    } else {
+        None
+    };
     let reserve = sso::Reserved {
         trace_parent: Some(format!(
             "01-{}-{}-01",
@@ -609,14 +607,20 @@ pub(crate) fn encode_sso(
         }),
         ..Default::default()
     };
-    head.p32(reserve.encode_to_vec())?;
-    let mut payload = Writer::new();
-    payload.p32(head.data)?;
-    payload.p32(body)?;
+    let reserve = reserve.encode_to_vec();
+    let payload = encode_sso_payload(
+        command,
+        sequence,
+        &body,
+        kind,
+        state,
+        ios_transport,
+        &reserve,
+    )?;
     let encrypted = match encryption {
-        Encryption::None => payload.data,
-        Encryption::D2 => crypto::tea_encrypt(&payload.data, &store.d2_key)?,
-        Encryption::Empty => crypto::tea_encrypt(&payload.data, &[0; 16])?,
+        Encryption::None => payload,
+        Encryption::D2 => crypto::tea_encrypt(&payload, &store.d2_key)?,
+        Encryption::Empty => crypto::tea_encrypt(&payload, &[0; 16])?,
     };
     let mut envelope = Writer::new();
     envelope.u32(kind as u32);
@@ -629,8 +633,20 @@ pub(crate) fn encode_sso(
         })?,
         RequestType::Simple => envelope.i32(sequence),
     }
-    envelope.u8(0);
-    envelope.p32(store.uin.to_string())?;
+    match ios_transport.map(|(resources, _)| &resources.account) {
+        Some(IosTransportAccount::Uin { account_type }) => {
+            envelope.u8(*account_type);
+            envelope.p32(store.uin.to_string())?;
+        }
+        Some(IosTransportAccount::Explicit { account_type, text }) => {
+            envelope.u8(*account_type);
+            envelope.p32(text)?;
+        }
+        None => {
+            envelope.u8(0);
+            envelope.p32(store.uin.to_string())?;
+        }
+    }
     envelope.bytes(encrypted);
     if envelope.data.len() > MAX_FRAME_SIZE - 4 {
         return Err(malformed("SSO frame exceeds limit"));
@@ -638,6 +654,93 @@ pub(crate) fn encode_sso(
     let mut frame = Writer::new();
     frame.p32(envelope.data)?;
     Ok(frame.data.into())
+}
+
+fn encode_sso_payload(
+    command: &str,
+    sequence: i32,
+    body: &[u8],
+    kind: RequestType,
+    state: &SessionState,
+    ios_transport: Option<(&IosTransportResources, &[u8])>,
+    reserve: &[u8],
+) -> Result<Vec<u8>> {
+    let store = &state.keystore;
+    let mut head = Writer::new();
+    match (ios_transport, kind) {
+        (Some((resources, cookie)), RequestType::D2) => {
+            head.i32(sequence);
+            head.u32(state.profile.sub_app_id);
+            head.u32(0x20027635);
+            head.u8(resources.network_type);
+            head.bytes(resources.effective_flags);
+            head.p32(&store.a2)?;
+            head.p32(command)?;
+            head.p32(cookie)?;
+            head.p32(store.ios_msf_imei.as_bytes())?;
+            head.p32(&resources.account_record_0x80.0)?;
+            let mut trailer = String::new();
+            if command == "PushService.get" {
+                let statistics = resources.push_service_get_statistics.ok_or_else(|| {
+                    Error::Authentication(
+                        "PushService.get requires actual iOS transport statistics".into(),
+                    )
+                })?;
+                use std::fmt::Write;
+                write!(
+                    trailer,
+                    "{},{},{}",
+                    statistics.count, statistics.elapsed, statistics.value
+                )
+                .expect("writing to a String cannot fail");
+            }
+            trailer.push('|');
+            trailer.push_str(&resources.carrier_mcc);
+            trailer.push_str(&resources.carrier_mnc);
+            trailer.push_str("|I");
+            trailer.push_str(&resources.cf_bundle_version);
+            head.pref(trailer, 2, true)?;
+        }
+        (Some((_, cookie)), RequestType::Simple) => {
+            head.p32(command)?;
+            head.p32(cookie)?;
+        }
+        (None, RequestType::D2) => {
+            head.i32(sequence);
+            head.u32(state.profile.sub_app_id);
+            head.u32(2052);
+            head.u8(2);
+            head.zeros(11);
+            head.p32(&store.a2)?;
+            head.p32(command)?;
+            head.p32([])?;
+            head.p32(hex::encode(&store.guid))?;
+            head.p32([])?;
+            head.pref(&state.profile.version, 2, true)?;
+        }
+        (None, RequestType::Simple) => {
+            head.p32(command)?;
+            head.p32([])?;
+        }
+    }
+    if let Some((resources, _)) = ios_transport {
+        let template = resources.reserved.as_bytes();
+        let length = template
+            .len()
+            .checked_add(reserve.len())
+            .and_then(|n| n.checked_add(4))
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| malformed("iOS reserved header length overflow"))?;
+        head.u32(length);
+        head.bytes(template);
+        head.bytes(reserve);
+    } else {
+        head.p32(reserve)?;
+    }
+    let mut payload = Writer::new();
+    payload.p32(head.data)?;
+    payload.p32(body)?;
+    Ok(payload.data)
 }
 pub(crate) fn decode_sso(frame: Bytes, keys: &[&[u8]]) -> Result<(IncomingPacket, String)> {
     let length = frame.len();
@@ -743,6 +846,93 @@ pub fn bounded_zlib(input: &[u8], limit: usize) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn native_oracle_transport() -> IosTransportResources {
+        IosTransportResources {
+            network_type: 2,
+            effective_flags: [1, 2, 3, 4, 5, 6, 7, 8, 9, 2, 4],
+            account_record_0x80: IosAccountRecord80(Bytes::from_static(b"binary\x80record")),
+            carrier_mcc: "460".into(),
+            carrier_mnc: "01".into(),
+            cf_bundle_version: "12345".into(),
+            account: IosTransportAccount::Uin { account_type: 0 },
+            reserved: IosReservedTemplate::new(Bytes::from_static(&[0x48, 1])).unwrap(),
+            push_service_get_statistics: None,
+        }
+    }
+
+    #[test]
+    fn mobile_full_and_trim_inner_match_executed_native_serializer_oracles() {
+        let resources = native_oracle_transport();
+        let expected = hex::decode(concat!(
+            "0000008b000000492008064820027635020102030405060708090204",
+            "0000000d62696e617279006132",
+            "0000001e417661746172496e666f5376722e51514865616455726c526571",
+            "0000000cff00636f6f6b6965",
+            "0000001273796e7468657469632d696d6569",
+            "0000001162696e617279807265636f7264",
+            "000f7c34363030317c49313233343500000006480100000007010203",
+        ))
+        .unwrap();
+        let native_zero_key_ciphertext = hex::decode(concat!(
+            "3dce7a965c16d0291d224ab2e5153e1d2fda29789097fcc7f482243cd710c0de",
+            "1d55289029bacd2d92e7f5a70db62b5b8131fa05133eb5c45c655eec9796ab3d",
+            "d1d0876c2d7ab39a0945c85e331008f5c1a4562e61ba794bc612fbd96cf59ef7",
+            "6dd888ee4ad5753f0e9ec594f95f8cd70a1a3a52c4d219874384c7ef44297bb4",
+            "9b25e4d187172521e0f485d59a5e6553adaf79ddc292b0b99a6bac3e5f544208",
+        ))
+        .unwrap();
+        assert_eq!(native_zero_key_ciphertext.len(), 160);
+        assert_eq!(
+            crypto::tea_decrypt(&native_zero_key_ciphertext, &[0; 16]).unwrap(),
+            expected
+        );
+        let expected_trim = hex::decode(concat!(
+            "000000340000001e417661746172496e666f5376722e51514865616455726c526571",
+            "0000000cff00636f6f6b696500000006480100000007010203",
+        ))
+        .unwrap();
+        for profile in [Profile::iphone(), Profile::ipad()] {
+            let state = SessionState {
+                profile,
+                keystore: Keystore {
+                    a2: b"binary\0a2".to_vec(),
+                    ios_msf_imei: "synthetic-imei".into(),
+                    ..Default::default()
+                },
+                machine_id: "synthetic-machine".into(),
+                online: false,
+            };
+            let actual = encode_sso_payload(
+                "AvatarInfoSvr.QQHeadUrlReq",
+                73,
+                &[1, 2, 3],
+                RequestType::D2,
+                &state,
+                Some((&resources, b"\xff\0cookie")),
+                &[],
+            )
+            .unwrap();
+            if state.profile.platform == ClientPlatform::IPhone {
+                assert_eq!(actual, expected);
+            } else {
+                assert_eq!(&actual[..8], &expected[..8]);
+                assert_eq!(&actual[8..12], &537_396_819u32.to_be_bytes());
+                assert_eq!(&actual[12..], &expected[12..]);
+            }
+            let actual_trim = encode_sso_payload(
+                "AvatarInfoSvr.QQHeadUrlReq",
+                73,
+                &[1, 2, 3],
+                RequestType::Simple,
+                &state,
+                Some((&resources, b"\xff\0cookie")),
+                &[],
+            )
+            .unwrap();
+            assert_eq!(actual_trim, expected_trim);
+        }
+    }
+
     #[test]
     fn push_ack_echoes_only_requested_opaque_server_descriptors() {
         use prost::Message;

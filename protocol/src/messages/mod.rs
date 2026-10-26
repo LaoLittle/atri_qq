@@ -690,83 +690,87 @@ impl Messaging {
 }
 
 pub(crate) fn parse_common_message(raw: &[u8], state: &SessionState) -> Result<Message> {
-        let message: rpc::CommonMessage = decode(raw)?;
-        parse_decoded_common_message(raw, message, state)
+    let message: rpc::CommonMessage = decode(raw)?;
+    parse_decoded_common_message(raw, message, state)
 }
 
-pub(crate) fn parse_decoded_common_message(raw: &[u8], message: rpc::CommonMessage, state: &SessionState) -> Result<Message> {
-        let routing = message.routing_head.ok_or_else(|| missing(1))?;
-        let head = message.content_head.ok_or_else(|| missing(2))?;
-        let sender_uin = routing.sender_uin.unwrap_or_default();
-        let sender_uid = routing.sender_uid;
-        let recipient_uin = routing.recipient_uin.unwrap_or_default();
-        let recipient_uid = routing.recipient_uid;
-        let is_self = (!sender_uid.is_empty() && sender_uid == state.keystore.uid)
-            || (sender_uin != 0 && sender_uin == state.keystore.uin);
-        let (conversation, sender_name) = if head.message_type.unwrap_or_default() == 141 {
-            let c2c = routing.c2c.unwrap_or_default();
-            (
-                Conversation::Temporary {
-                    uin: recipient_uin,
-                    uid: recipient_uid.clone(),
-                    source: c2c.source.unwrap_or_default(),
+pub(crate) fn parse_decoded_common_message(
+    raw: &[u8],
+    message: rpc::CommonMessage,
+    state: &SessionState,
+) -> Result<Message> {
+    let routing = message.routing_head.ok_or_else(|| missing(1))?;
+    let head = message.content_head.ok_or_else(|| missing(2))?;
+    let sender_uin = routing.sender_uin.unwrap_or_default();
+    let sender_uid = routing.sender_uid;
+    let recipient_uin = routing.recipient_uin.unwrap_or_default();
+    let recipient_uid = routing.recipient_uid;
+    let is_self = (!sender_uid.is_empty() && sender_uid == state.keystore.uid)
+        || (sender_uin != 0 && sender_uin == state.keystore.uin);
+    let (conversation, sender_name) = if head.message_type.unwrap_or_default() == 141 {
+        let c2c = routing.c2c.unwrap_or_default();
+        (
+            Conversation::Temporary {
+                uin: recipient_uin,
+                uid: recipient_uid.clone(),
+                source: c2c.source.unwrap_or_default(),
+            },
+            c2c.sender_name,
+        )
+    } else if let Some(group) = routing.group {
+        (
+            Conversation::Group {
+                uin: group.uin.unwrap_or_default(),
+            },
+            group.sender_name,
+        )
+    } else {
+        (
+            Conversation::Friend {
+                uin: if is_self { recipient_uin } else { sender_uin },
+                uid: if is_self {
+                    recipient_uid.clone()
+                } else {
+                    sender_uid.clone()
                 },
-                c2c.sender_name,
-            )
-        } else if let Some(group) = routing.group {
-            (
-                Conversation::Group {
-                    uin: group.uin.unwrap_or_default(),
-                },
-                group.sender_name,
-            )
-        } else {
-            (
-                Conversation::Friend {
-                    uin: if is_self { recipient_uin } else { sender_uin },
-                    uid: if is_self {
-                        recipient_uid.clone()
-                    } else {
-                        sender_uid.clone()
-                    },
-                },
-                routing.c2c.map(|v| v.sender_name).unwrap_or_default(),
-            )
-        };
-        let decoded = decode_elements(&message.message_body, &conversation, state.keystore.uin)?;
-        let (sequence, client_sequence) = if matches!(conversation, Conversation::Group { .. }) {
-            (
-                head.sequence.unwrap_or_default(),
-                head.client_sequence.unwrap_or_default(),
-            )
-        } else {
-            (
-                head.client_sequence
-                    .filter(|sequence| *sequence != 0)
-                    .or(head.sequence)
-                    .unwrap_or_default(),
-                head.sequence.unwrap_or_default(),
-            )
-        };
-        Ok(Message {
-            conversation,
-            sender_uin,
-            sender_uid,
-            recipient_uin,
-            recipient_uid,
-            sender_name,
-            sequence,
-            client_sequence,
-            message_id: head.message_id.unwrap_or_default(),
-            random: head.random.unwrap_or_default() as u32,
-            time: head.time.unwrap_or_default() as i64,
-            is_self,
-            is_bot: None,
-            elements: decoded.elements,
-            metadata: decoded.metadata,
-            raw: raw.to_vec(),
-        })
-    }
+            },
+            routing.c2c.map(|v| v.sender_name).unwrap_or_default(),
+        )
+    };
+    let decoded = decode_elements(&message.message_body, &conversation, state.keystore.uin)?;
+    let (sequence, client_sequence) = if matches!(conversation, Conversation::Group { .. }) {
+        (
+            head.sequence.unwrap_or_default(),
+            head.client_sequence.unwrap_or_default(),
+        )
+    } else {
+        (
+            head.client_sequence
+                .filter(|sequence| *sequence != 0)
+                .or(head.sequence)
+                .unwrap_or_default(),
+            head.sequence.unwrap_or_default(),
+        )
+    };
+    Ok(Message {
+        conversation,
+        sender_uin,
+        sender_uid,
+        recipient_uin,
+        recipient_uid,
+        sender_name,
+        sequence,
+        client_sequence,
+        message_id: head.message_id.unwrap_or_default(),
+        random: head.random.unwrap_or_default() as u32,
+        time: head.time.unwrap_or_default() as i64,
+        is_self,
+        is_bot: None,
+        elements: decoded.elements,
+        metadata: decoded.metadata,
+        raw: raw.to_vec(),
+    })
+}
 impl Messaging {
     pub async fn call(&self, method: &str, args: ciborium::Value) -> Result<ciborium::Value> {
         match method {

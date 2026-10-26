@@ -25,6 +25,9 @@ const FILE_TELEMETRY_INTERVAL: Duration = Duration::from_secs(3600);
 mod commands {
     include!("signed_commands.rs");
 }
+
+mod session;
+pub use session::{IosSigningResources, SessionSigner};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SigningReport {
     pub method: String,
@@ -89,15 +92,19 @@ impl TokenResources for SigningResources {
         let properties = if let Some(properties) = &self.properties {
             properties.clone()
         } else {
-            let identity = self.local_identity.as_ref().ok_or_else(|| TokenError::Resource {
-                operation: "collect_properties",
-                message: "O3 session device resources have not been initialized".into(),
-            })?;
-            o3::local_device_properties(&identity.machine_id, &self.application_uuid)
-                .map_err(|_| TokenError::Resource {
+            let identity = self
+                .local_identity
+                .as_ref()
+                .ok_or_else(|| TokenError::Resource {
+                    operation: "collect_properties",
+                    message: "O3 session device resources have not been initialized".into(),
+                })?;
+            o3::local_device_properties(&identity.machine_id, &self.application_uuid).map_err(
+                |_| TokenError::Resource {
                     operation: "collect_properties",
                     message: "O3 application machine identity is invalid".into(),
-                })?
+                },
+            )?
         };
         o3::validate_properties(&properties)?;
         Ok(properties)
@@ -144,7 +151,7 @@ impl SignResources for SigningResources {
         })
     }
 }
-pub struct SessionSigner {
+struct DesktopSigner {
     signer: Signer,
     resources: SigningResources,
     account: Option<u64>,
@@ -152,12 +159,12 @@ pub struct SessionSigner {
     business_session_started: bool,
     telemetry_deadline: Option<Instant>,
 }
-impl Default for SessionSigner {
+impl Default for DesktopSigner {
     fn default() -> Self {
         Self::with_application_uuid(o3::generate_application_uuid())
     }
 }
-impl SessionSigner {
+impl DesktopSigner {
     pub(crate) fn with_application_uuid(application_uuid: String) -> Self {
         let mut signer = Signer::default();
         signer.initialize_desktop_resource();
@@ -200,9 +207,7 @@ impl SessionSigner {
         if local_identity_changed {
             o3::validate_local_identity(&state.machine_id)?;
             let guid = state.keystore.guid.as_slice().try_into().map_err(|_| {
-                Error::Malformed(
-                    "Signing context requires a sixteen-byte device GUID".into(),
-                )
+                Error::Malformed("Signing context requires a sixteen-byte device GUID".into())
             })?;
             self.resources.local_identity = Some(LocalDeviceIdentity {
                 machine_id: state.machine_id.clone(),
@@ -322,11 +327,15 @@ impl SessionSigner {
             && self.account == Some(state.keystore.uin)
             && self.signer.context().qua == state.profile.qua.as_bytes()
             && self.signer.context().machine_id == state.machine_id.as_bytes()
-            && self.resources.local_identity.as_ref().is_some_and(|identity| {
-                identity.machine_id == state.machine_id
-                    && identity.guid.as_slice() == state.keystore.guid.as_slice()
-                    && identity.device_name == state.keystore.device_name
-            })
+            && self
+                .resources
+                .local_identity
+                .as_ref()
+                .is_some_and(|identity| {
+                    identity.machine_id == state.machine_id
+                        && identity.guid.as_slice() == state.keystore.guid.as_slice()
+                        && identity.device_name == state.keystore.device_name
+                })
     }
 
     pub(crate) fn registration_complete(&mut self, state: &SessionState) -> Result<()> {
@@ -356,7 +365,10 @@ impl SessionSigner {
             self.telemetry_deadline = None;
             return Ok(());
         }
-        if self.telemetry_deadline.is_none_or(|deadline| deadline > now) {
+        if self
+            .telemetry_deadline
+            .is_none_or(|deadline| deadline > now)
+        {
             return Ok(());
         }
         self.telemetry_deadline = Some(now + FILE_TELEMETRY_INTERVAL);
@@ -406,6 +418,7 @@ impl SessionSigner {
                 signing_engine::Signature::Full(_) => {
                     signing_engine::Signature::Full(random_bytes(48).try_into().unwrap())
                 }
+                signature @ signing_engine::Signature::Ios(_) => signature,
             };
             rand::rngs::SysRng
                 .try_fill_bytes(&mut signature.token)
@@ -537,7 +550,9 @@ impl SessionSigner {
         self.signer
             .tokens
             .account_token(&self.signer.context().uin)
-            .map_or((0, None), |token| (token.bytes.len(), Some(token.expires_at)))
+            .map_or((0, None), |token| {
+                (token.bytes.len(), Some(token.expires_at))
+            })
     }
     pub fn complete_xwid(&mut self, acquisition: XwidAcquisition) {
         self.signer.tokens.complete_xwid(acquisition)
@@ -557,6 +572,7 @@ impl SessionSigner {
 }
 #[cfg(test)]
 mod tests {
+    use super::DesktopSigner as SessionSigner;
     use super::*;
     use crate::models::{Keystore, Profile};
     fn state(uin: u64) -> SessionState {
@@ -777,7 +793,9 @@ mod tests {
     fn application_uuid_survives_account_and_guid_replacement() {
         use prost::Message;
         fn application_uuid(signer: &mut SessionSigner) -> Vec<u8> {
-            let answer = signer.answer_property_challenge(&24i16.to_be_bytes()).unwrap();
+            let answer = signer
+                .answer_property_challenge(&24i16.to_be_bytes())
+                .unwrap();
             signing_engine::proto::TokenReport::decode(answer.as_slice())
                 .unwrap()
                 .properties
@@ -788,17 +806,20 @@ mod tests {
         }
 
         let expected = b"00112233-4455-4677-8899-aabbccddeeff";
-        let mut signer = SessionSigner::with_application_uuid(
-            String::from_utf8(expected.to_vec()).unwrap(),
-        );
+        let mut signer =
+            SessionSigner::with_application_uuid(String::from_utf8(expected.to_vec()).unwrap());
         let mut session = state(1234);
-        signer.sign("wtlogin.login", 1, b"first", &session, false).unwrap();
+        signer
+            .sign("wtlogin.login", 1, b"first", &session, false)
+            .unwrap();
         assert_eq!(application_uuid(&mut signer), expected);
         session.keystore.uin = 5678;
         session.keystore.guid.fill(0x22);
         session.keystore.device_name = "replacement-device".into();
         session.machine_id = "replacement-application-machine".into();
-        signer.sign("wtlogin.login", 2, b"second", &session, false).unwrap();
+        signer
+            .sign("wtlogin.login", 2, b"second", &session, false)
+            .unwrap();
         assert_eq!(application_uuid(&mut signer), expected);
     }
 
@@ -991,7 +1012,12 @@ mod tests {
         signer.business_session_started(&first).unwrap();
         assert_ne!(signer.generation(), generation);
         assert_eq!(
-            signer.resources.reports.iter().filter(|report| report.method == "getToken").count(),
+            signer
+                .resources
+                .reports
+                .iter()
+                .filter(|report| report.method == "getToken")
+                .count(),
             1
         );
         issue_token(&mut signer);
@@ -1019,7 +1045,9 @@ mod tests {
         assert_eq!(signer.drain_reports().len(), 1);
         let deadline = signer.telemetry_deadline().unwrap();
         let token_status = signer.token_status();
-        signer.poll_telemetry_at(&state, deadline - Duration::from_nanos(1)).unwrap();
+        signer
+            .poll_telemetry_at(&state, deadline - Duration::from_nanos(1))
+            .unwrap();
         assert!(signer.drain_reports().is_empty());
         signer.poll_telemetry_at(&state, deadline).unwrap();
         let reports = signer.drain_reports();
@@ -1030,7 +1058,10 @@ mod tests {
         let late = deadline + FILE_TELEMETRY_INTERVAL * 5;
         signer.poll_telemetry_at(&state, late).unwrap();
         assert_eq!(signer.drain_reports().len(), 1);
-        assert_eq!(signer.telemetry_deadline(), Some(late + FILE_TELEMETRY_INTERVAL));
+        assert_eq!(
+            signer.telemetry_deadline(),
+            Some(late + FILE_TELEMETRY_INTERVAL)
+        );
     }
 
     #[test]
@@ -1044,7 +1075,9 @@ mod tests {
         signer.drain_reports();
         let deadline = signer.telemetry_deadline().unwrap();
         let inventory = vec!["/synthetic/new-module.js".to_string()];
-        signer.set_resources(None, None, Some(inventory.clone())).unwrap();
+        signer
+            .set_resources(None, None, Some(inventory.clone()))
+            .unwrap();
         assert_eq!(signer.telemetry_deadline(), Some(deadline));
         signer.poll_telemetry(&state).unwrap();
         assert!(signer.drain_reports().is_empty());
@@ -1070,7 +1103,10 @@ mod tests {
         signer.poll_telemetry(&state).unwrap();
         assert_eq!(signer.resources.reports.len(), 64);
         assert!(signer.poll_telemetry_at(&state, deadline).is_err());
-        assert_eq!(signer.telemetry_deadline(), Some(deadline + FILE_TELEMETRY_INTERVAL));
+        assert_eq!(
+            signer.telemetry_deadline(),
+            Some(deadline + FILE_TELEMETRY_INTERVAL)
+        );
         assert_eq!(signer.drain_token_reports().len(), 64);
     }
 

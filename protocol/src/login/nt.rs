@@ -3,10 +3,34 @@ use crate::{
     crypto::{self, Curve, Ecdh},
     models::*,
     proto::{self, auth},
-    wire::{Writer, malformed},
+    wire::malformed,
 };
 use bytes::Bytes;
 use prost::Message;
+use sha2::{Digest, Sha256};
+use std::{collections::BTreeMap, sync::LazyLock};
+
+const SERVER_PUBLIC: [u8; 65] = [
+    0x04, 0x9d, 0x14, 0x23, 0x33, 0x27, 0x35, 0x98, 0x0e, 0xda, 0xbe, 0x7e, 0x9e, 0xa4, 0x51, 0xb3,
+    0x39, 0x5b, 0x6f, 0x35, 0x25, 0x0d, 0xb8, 0xfc, 0x56, 0xf2, 0x58, 0x89, 0xf6, 0x28, 0xcb, 0xae,
+    0x3e, 0x8e, 0x73, 0x07, 0x79, 0x14, 0x07, 0x1e, 0xee, 0xbc, 0x10, 0x8f, 0x4e, 0x01, 0x70, 0x05,
+    0x77, 0x92, 0xbb, 0x17, 0xaa, 0x30, 0x3a, 0xf6, 0x52, 0x31, 0x3d, 0x17, 0xc1, 0xac, 0x81, 0x5e,
+    0x79,
+];
+const VERIFIER_KEY: [u8; 32] = [
+    0xe2, 0x73, 0x3b, 0xf4, 0x03, 0x14, 0x99, 0x13, 0xcb, 0xf8, 0x0c, 0x7a, 0x95, 0x16, 0x8b, 0xd4,
+    0xca, 0x69, 0x35, 0xee, 0x53, 0xcd, 0x39, 0x76, 0x4b, 0xee, 0xbe, 0x2e, 0x00, 0x7e, 0x3a, 0xee,
+];
+const SERVER_SIGNING_PUBLIC: [u8; 65] = [
+    0x04, 0x45, 0x39, 0x77, 0xb0, 0x48, 0xd0, 0xb7, 0x2c, 0x1a, 0x7d, 0x50, 0xc3, 0x6e, 0xbe, 0x88,
+    0x1b, 0x69, 0xbb, 0xdd, 0x51, 0xa5, 0xc6, 0x62, 0xd0, 0x8a, 0x1b, 0xaf, 0x12, 0x36, 0xce, 0x92,
+    0xcb, 0xb9, 0x54, 0x60, 0xf5, 0x73, 0xfe, 0x7a, 0x5b, 0x0e, 0xd9, 0xcc, 0xfe, 0xe0, 0x1e, 0xb4,
+    0xdf, 0xb6, 0xe6, 0xec, 0xfa, 0x16, 0xa0, 0x90, 0xe3, 0xed, 0x8f, 0x58, 0x47, 0xa9, 0xda, 0xf9,
+    0x84,
+];
+static SERVER_VERIFIER: LazyLock<crypto::P256Verifier> = LazyLock::new(|| {
+    crypto::P256Verifier::new(&SERVER_SIGNING_PUBLIC).expect("embedded NT server verification key")
+});
 
 #[derive(Clone, Copy)]
 pub(super) enum NtResponseKind {
@@ -25,6 +49,7 @@ pub(super) struct NtResult {
     pub jump_url: String,
     pub unusual_signature: Option<Bytes>,
     pub captcha_url: Option<String>,
+    pub long_cookie: Option<Bytes>,
 }
 impl NtResult {
     pub fn require_success(&self) -> Result<()> {
@@ -40,38 +65,56 @@ impl NtResult {
 }
 pub(super) struct NtLogin {
     ecdh: Ecdh,
+    ios_device: Option<IosDevice>,
     exchange_prepared: bool,
+    exchange_platform: ClientPlatform,
+    long_cookies: BTreeMap<String, Bytes>,
+    #[cfg(test)]
+    verifier_override: Option<crypto::P256Verifier>,
 }
 impl NtLogin {
     pub fn new() -> Result<Self> {
         Ok(Self {
             ecdh: Ecdh::new(Curve::P256)?,
+            ios_device: None,
             exchange_prepared: false,
+            exchange_platform: ClientPlatform::Linux,
+            long_cookies: BTreeMap::new(),
+            #[cfg(test)]
+            verifier_override: None,
         })
     }
-    pub fn key_exchange(&mut self, state: &SessionState, timestamp: u32) -> Result<Bytes> {
+    #[cfg(test)]
+    pub(super) fn with_verifier(verifier: crypto::P256Verifier) -> Result<Self> {
+        let mut codec = Self::new()?;
+        codec.verifier_override = Some(verifier);
+        Ok(codec)
+    }
+    pub fn with_device(device: Option<IosDevice>) -> Result<Self> {
+        let mut codec = Self::new()?;
+        codec.ios_device = device;
+        Ok(codec)
+    }
+    pub fn key_exchange(&mut self, state: &SessionState, timestamp: u64) -> Result<Bytes> {
         if self.exchange_prepared {
             self.ecdh = Ecdh::new(Curve::P256)?;
         }
         self.exchange_prepared = true;
-        let server=hex::decode("049d1423332735980edabe7e9ea451b3395b6f35250db8fc56f25889f628cbae3e8e73077914071eeebc108f4e0170057792bb17aa303af652313d17c1ac815e79").map_err(|e|malformed(e.to_string()))?;
-        let shared = self.ecdh.shared_secret(&server, false)?;
+        self.exchange_platform = state.profile.platform;
+        let shared = self.ecdh.shared_secret(&SERVER_PUBLIC, false)?;
         let secret = auth::KeyExchangeSecret {
             uin: Some(state.keystore.uin.to_string()),
             guid: Some(Bytes::copy_from_slice(&state.keystore.guid)),
         }
         .encode_to_vec();
         let encrypted = crypto::aes_gcm_encrypt(&secret, &shared)?;
-        let mut verify = Writer::new();
-        verify.bytes(self.ecdh.public_key());
-        verify.u32(1);
-        verify.bytes(&encrypted);
-        verify.u32(0);
-        verify.u32(timestamp);
-        let hash_key =
-            hex::decode("e2733bf403149913cbf80c7a95168bd4ca6935ee53cd39764beebe2e007e3aee")
-                .map_err(|e| malformed(e.to_string()))?;
-        let hash = crypto::aes_gcm_encrypt(&crypto::sha256(&verify.data), &hash_key)?;
+        let mut verify = Sha256::new();
+        verify.update(self.ecdh.public_key());
+        verify.update(1u32.to_be_bytes());
+        verify.update(&encrypted);
+        verify.update(timestamp.to_be_bytes());
+        let digest: [u8; 32] = verify.finalize().into();
+        let hash = crypto::aes_gcm_encrypt(&digest, &VERIFIER_KEY)?;
         Ok(auth::KeyExchangeRequest {
             public_key: Some(Bytes::copy_from_slice(self.ecdh.public_key())),
             r#type: Some(1),
@@ -82,7 +125,14 @@ impl NtLogin {
         .encode_to_vec()
         .into())
     }
-    pub fn decode_key_exchange(&self, data: Bytes) -> Result<(Vec<u8>, Vec<u8>)> {
+    pub fn decode_key_exchange(
+        &self,
+        data: Bytes,
+        previous: Option<&NtKeyExchangeSession>,
+    ) -> Result<NtKeyExchangeSession> {
+        if !self.exchange_prepared {
+            return Err(malformed("NT exchange response arrived before a request"));
+        }
         let p: auth::KeyExchangeResponse = proto::decode(data)?;
         let public = p
             .public_key
@@ -90,6 +140,18 @@ impl NtLogin {
         let encrypted = p
             .encrypted_secret
             .ok_or_else(|| malformed("Key exchange ciphertext missing"))?;
+        let signature = p
+            .signature
+            .ok_or_else(|| malformed("Key exchange server signature missing"))?;
+        let mut digest = Sha256::new();
+        digest.update(self.ecdh.public_key());
+        digest.update(&public);
+        digest.update(&encrypted);
+        let digest: [u8; 32] = digest.finalize().into();
+        let verifier = &*SERVER_VERIFIER;
+        #[cfg(test)]
+        let verifier = self.verifier_override.as_ref().unwrap_or(verifier);
+        verifier.verify_digest(&digest, &signature)?;
         let shared = self.ecdh.shared_secret(&public, false)?;
         let secret: auth::KeyExchangeSession =
             proto::decode(Bytes::from(crypto::aes_gcm_decrypt(&encrypted, &shared)?))?;
@@ -101,32 +163,78 @@ impl NtLogin {
             .key
             .filter(|v| matches!(v.len(), 16 | 24 | 32))
             .ok_or_else(|| malformed("Invalid key exchange session key"))?;
-        Ok((ticket.to_vec(), key.to_vec()))
+        let expire_seconds = secret.expire_seconds.unwrap_or(0);
+        match previous {
+            Some(previous) => previous.renew(key, ticket, expire_seconds),
+            None => NtKeyExchangeSession::new(self.exchange_platform, key, ticket, expire_seconds),
+        }
     }
-    pub fn encode(&self, body: &impl Message, state: &SessionState) -> Result<Bytes> {
+    pub fn encode(
+        &self,
+        body: &impl Message,
+        state: &SessionState,
+        kind: NtResponseKind,
+    ) -> Result<Bytes> {
+        let head = self.request_head(state, kind)?;
+        let k = &state.keystore;
+        let session = k
+            .key_exchange_session
+            .as_ref()
+            .ok_or_else(|| Error::Authentication("NT key exchange required".into()))?;
+        let (key, ticket) = session.material()?;
+        let common = auth::NtRequest {
+            head: Some(head),
+            body: Some(body.encode_to_vec().into()),
+        }
+        .encode_to_vec();
+        let encrypted = crypto::aes_gcm_encrypt(&common, key)?;
+        Ok(auth::NtForward {
+            ticket: Some(ticket.clone()),
+            encrypted: Some(encrypted.into()),
+            r#type: Some(1),
+        }
+        .encode_to_vec()
+        .into())
+    }
+    fn request_head(
+        &self,
+        state: &SessionState,
+        kind: NtResponseKind,
+    ) -> Result<auth::NtRequestHead> {
         let p = &state.profile;
         let k = &state.keystore;
-        if k.key_exchange_ticket.is_empty() {
-            return Err(Error::Authentication("NT key exchange required".into()));
-        }
-        let platform = match p.os.as_str() {
-            "Linux" => 7,
-            "Windows" => 4,
-            "Mac" | "macOS" => 5,
-            _ => 0,
+        let ios = p.platform.is_ios();
+        let os = if ios {
+            let device = self.ios_device.as_ref().ok_or_else(|| {
+                Error::Authentication("NT iOS login requires actual IosDevice resources".into())
+            })?;
+            device.validate()?;
+            device.system_version.clone()
+        } else {
+            p.os.clone()
         };
-        let head = auth::NtRequestHead {
+        let platform = match p.platform {
+            ClientPlatform::Linux => 7,
+            ClientPlatform::Windows => 4,
+            ClientPlatform::MacOS => 5,
+            ClientPlatform::IPhone | ClientPlatform::IPad => 1,
+        };
+        Ok(auth::NtRequestHead {
             account: Some(auth::NtAccountRequest {
                 uin: Some(k.uin.to_string()),
             }),
             client: Some(auth::NtClient {
-                os: Some(p.os.clone()),
+                os: Some(os),
                 device_name: Some(k.device_name.clone()),
                 platform: Some(platform),
                 guid: Some(Bytes::copy_from_slice(&k.guid)),
             }),
             app: Some(auth::NtApp {
-                kernel: Some(p.kernel.clone()),
+                kernel: Some(if ios {
+                    p.version.clone()
+                } else {
+                    p.kernel.clone()
+                }),
                 app_id: Some(p.app_id),
                 package_name: Some(p.package_name.clone()),
                 qua: Some(p.qua.clone()),
@@ -134,21 +242,20 @@ impl NtLogin {
             cookie: (!k.login_cookie.is_empty()).then(|| auth::NtCookie {
                 cookie: Some(Bytes::copy_from_slice(&k.login_cookie)),
             }),
-            security: Some(auth::NtSecurity { mode: Some(1) }),
-        };
-        let common = auth::NtRequest {
-            head: Some(head),
-            body: Some(body.encode_to_vec().into()),
-        }
-        .encode_to_vec();
-        let encrypted = crypto::aes_gcm_encrypt(&common, &k.key_exchange_key)?;
-        Ok(auth::NtForward {
-            ticket: Some(Bytes::copy_from_slice(&k.key_exchange_ticket)),
-            encrypted: Some(encrypted.into()),
-            r#type: Some(1),
-        }
-        .encode_to_vec()
-        .into())
+            security: (!ios).then_some(auth::NtSecurity { mode: Some(1) }),
+            long_cookie: matches!(kind, NtResponseKind::Password)
+                .then(|| {
+                    let mut account = itoa::Buffer::new();
+                    self.long_cookies
+                        .get(account.format(k.uin))
+                        .filter(|cookie| !cookie.is_empty())
+                        .cloned()
+                        .map(|cookie| auth::NtCookie {
+                            cookie: Some(cookie),
+                        })
+                })
+                .flatten(),
+        })
     }
     pub fn decode(
         &self,
@@ -161,10 +268,13 @@ impl NtLogin {
         let encrypted = forward
             .encrypted
             .ok_or_else(|| malformed("NT login forward ciphertext missing"))?;
-        let common: auth::NtResponse = proto::decode(Bytes::from(crypto::aes_gcm_decrypt(
-            &encrypted,
-            &store.key_exchange_key,
-        )?))?;
+        let (key, _) = store
+            .key_exchange_session
+            .as_ref()
+            .ok_or_else(|| Error::Authentication("NT key exchange required".into()))?
+            .material()?;
+        let common: auth::NtResponse =
+            proto::decode(Bytes::from(crypto::aes_gcm_decrypt(&encrypted, key)?))?;
         let head = common
             .head
             .ok_or_else(|| malformed("NT login response head missing"))?;
@@ -172,7 +282,11 @@ impl NtLogin {
         let code = error.code.unwrap_or_default();
         let body = match common.body {
             Some(body) => body,
-            None if code != 0 && matches!(kind, NtResponseKind::Refresh) => Bytes::new(),
+            None if code != 0
+                && matches!(kind, NtResponseKind::Refresh | NtResponseKind::Password) =>
+            {
+                Bytes::new()
+            }
             None => return Err(malformed("NT login response body missing")),
         };
         let (tickets, account, unusual_signature, captcha_url) = match kind {
@@ -254,7 +368,27 @@ impl NtLogin {
             jump_url: error.jump_url.unwrap_or_default(),
             unusual_signature,
             captcha_url,
+            long_cookie: head
+                .long_cookie
+                .and_then(|cookie| cookie.cookie)
+                .filter(|cookie| !cookie.is_empty()),
         })
+    }
+    pub fn finish_response(&mut self, kind: NtResponseKind, account: &str, result: &NtResult) {
+        if !matches!(kind, NtResponseKind::Password)
+            || account.is_empty()
+            || matches!(result.code, 0 | 140022008 | 140022010)
+        {
+            return;
+        }
+        match &result.long_cookie {
+            Some(cookie) => {
+                self.long_cookies.insert(account.to_owned(), cookie.clone());
+            }
+            None => {
+                self.long_cookies.remove(account);
+            }
+        }
     }
     fn save(t: &auth::NtTickets, k: &mut Keystore, generated_unix_seconds: u64) -> Result<()> {
         let a1 =
@@ -374,37 +508,263 @@ impl NtLogin {
                 "Password login requires a numeric UIN".into(),
             ));
         }
-        let mut key = Writer::new();
-        key.bytes(password_digest);
-        key.u64(k.uin);
-        let mut tgtgt = [0; 16];
-        rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut tgtgt)
-            .map_err(|error| Error::Crypto(format!("Password login entropy: {error}")))?;
-        let mut w = Writer::new();
-        w.u16(4);
-        w.u32(rand::random::<u32>() % (i32::MAX as u32));
-        w.u32(0);
-        w.u32(state.profile.app_id);
-        w.u32(8001);
-        w.u64(k.uin);
-        w.u32(super::unix_seconds());
-        w.u32(0);
-        w.u8(1);
-        w.bytes(password_digest);
-        w.bytes(tgtgt);
-        w.u32(0);
-        w.u8(1);
-        w.bytes(&k.guid);
-        w.u32(1);
-        w.u32(1);
-        w.p16(k.uin.to_string())?;
-        Ok(crypto::tea_encrypt(&w.data, &crypto::md5(&key.data))?.into())
+        let mut account = itoa::Buffer::new();
+        crypto::NtClientA1 {
+            app_id: state.profile.app_id,
+            account: account.format(k.uin),
+            salt: k.uin,
+            guid: &k.guid,
+            password_digest,
+        }
+        .encrypt(super::unix_seconds())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::Writer;
+
+    #[test]
+    fn exchange_session_wire_preserves_signed_sixty_four_bit_lifetimes() {
+        for lifetime in [i64::from(i32::MAX) + 1, i64::from(i32::MIN) - 1] {
+            let session = auth::KeyExchangeSession {
+                key: Some(Bytes::from_static(&[42; 16])),
+                ticket: Some(Bytes::from_static(b"synthetic-ticket")),
+                expire_seconds: Some(lifetime),
+            };
+            let decoded: auth::KeyExchangeSession =
+                proto::decode(Bytes::from(session.encode_to_vec())).unwrap();
+            assert_eq!(decoded.expire_seconds, Some(lifetime));
+        }
+    }
+
+    #[test]
+    fn ios_request_head_matches_native_serialization_without_desktop_security() {
+        let codec = NtLogin::with_device(Some(IosDevice {
+            system_version: "18.0".into(),
+            hardware_model: "iPhone17,1".into(),
+            system_name: "iOS".into(),
+        }))
+        .unwrap();
+        let golden = "0a080a06313233343536122c0a0431382e30121073796e7468657469632d64657669636518012210313131313131313131313131313131311a350a06392e332e373510101a0f636f6d2e74656e63656e742e6d71712a1856315f4950485f53515f392e332e37355f315f4150505f41";
+        for (json, bid) in [
+            (r#"{"platform":"IPhone"}"#, 537_396_808),
+            (r#"{"platform":"IPad"}"#, 537_396_819),
+        ] {
+            let profile: Profile = serde_json::from_str(json).unwrap();
+            assert_eq!(profile.sub_app_id, bid);
+            let mut state = SessionState {
+                profile,
+                keystore: Keystore {
+                    uin: 123456,
+                    guid: vec![0x31; 16],
+                    device_name: "synthetic-device".into(),
+                    key_exchange_session: Some(test_session()),
+                    ..Default::default()
+                },
+                machine_id: "synthetic-machine".into(),
+                online: false,
+            };
+            assert_eq!(
+                hex::encode(
+                    codec
+                        .request_head(&state, NtResponseKind::Password)
+                        .unwrap()
+                        .encode_to_vec()
+                ),
+                golden
+            );
+            let body = auth::NtRefreshTicketBody {
+                a1: Some(Bytes::from_static(b"synthetic-a1")),
+            };
+            let forward: auth::NtForward = proto::decode(
+                codec
+                    .encode(&body, &state, NtResponseKind::Refresh)
+                    .unwrap(),
+            )
+            .unwrap();
+            let common: auth::NtRequest = proto::decode(
+                crypto::aes_gcm_decrypt(&forward.encrypted.unwrap(), session_key(&state.keystore))
+                    .unwrap()
+                    .as_slice(),
+            )
+            .unwrap();
+            assert_eq!(hex::encode(common.head.unwrap().encode_to_vec()), golden);
+            assert_eq!(common.body.unwrap(), body.encode_to_vec());
+            state.keystore.login_cookie = b"synthetic-cookie".to_vec();
+            assert_eq!(
+                hex::encode(
+                    codec
+                        .request_head(&state, NtResponseKind::Password)
+                        .unwrap()
+                        .encode_to_vec()
+                ),
+                format!("{golden}2a120a1073796e7468657469632d636f6f6b6965"),
+            );
+            assert!(
+                NtLogin::new()
+                    .unwrap()
+                    .encode(&body, &state, NtResponseKind::Refresh)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn desktop_request_head_retains_linux_fields_and_security() {
+        let state = SessionState {
+            profile: serde_json::from_str("{}").unwrap(),
+            keystore: Keystore::default(),
+            machine_id: "synthetic-machine".into(),
+            online: false,
+        };
+        let head = NtLogin::new()
+            .unwrap()
+            .request_head(&state, NtResponseKind::Password)
+            .unwrap();
+        assert_eq!(head.client.as_ref().unwrap().platform, Some(7));
+        assert_eq!(head.client.unwrap().os.as_deref(), Some("Linux"));
+        assert_eq!(head.app.unwrap().kernel.as_deref(), Some("Linux"));
+        assert_eq!(head.security.unwrap().mode, Some(1));
+    }
+
+    #[test]
+    fn profile_overrides_reach_nt_headers_and_uncatalogued_platforms_require_complete_input() {
+        let codec = NtLogin::with_device(Some(IosDevice {
+            system_version: "18.0".into(),
+            hardware_model: "synthetic-hardware".into(),
+            system_name: "iOS".into(),
+        }))
+        .unwrap();
+        let state = SessionState {
+            profile: serde_json::from_str(
+                r#"{"platform":"IPad","qua":"explicit-qua","app_id":42,"version":"explicit-version","package_name":"explicit-package"}"#,
+            )
+            .unwrap(),
+            keystore: Keystore::default(),
+            machine_id: "synthetic-machine".into(),
+            online: false,
+        };
+        let head = codec
+            .request_head(&state, NtResponseKind::Password)
+            .unwrap();
+        assert_eq!(head.client.unwrap().platform, Some(1));
+        let app = head.app.unwrap();
+        assert_eq!(app.qua.as_deref(), Some("explicit-qua"));
+        assert_eq!(app.app_id, Some(42));
+        assert_eq!(app.kernel.as_deref(), Some("explicit-version"));
+        assert_eq!(app.package_name.as_deref(), Some("explicit-package"));
+        assert!(head.security.is_none());
+        for (platform, code) in [("Windows", 4), ("MacOS", 5)] {
+            let error = serde_json::from_str::<Profile>(&format!(r#"{{"platform":"{platform}"}}"#))
+                .unwrap_err();
+            assert!(error.to_string().contains("missing field `os`"));
+            let input = format!(
+                r#"{{"platform":"{platform}","os":"explicit-os","kernel":"explicit-kernel","qua":"explicit-qua","version":"explicit-version","package_name":"explicit-package","pt_version":"","sdk_version":"explicit-sdk","apk_signature_md5":null,"app_id":42,"sub_app_id":43,"sso_version":44,"client_version":45,"misc_bitmap":null,"main_sig_map":null,"sub_sig_map":null}}"#,
+            );
+            let explicit = SessionState {
+                profile: serde_json::from_str(&input).unwrap(),
+                ..state.clone()
+            };
+            let head = codec
+                .request_head(&explicit, NtResponseKind::Password)
+                .unwrap();
+            let client = head.client.unwrap();
+            assert_eq!(client.platform, Some(code));
+            assert_eq!(client.os.as_deref(), Some("explicit-os"));
+            let app = head.app.unwrap();
+            assert_eq!(app.kernel.as_deref(), Some("explicit-kernel"));
+            assert_eq!(app.qua.as_deref(), Some("explicit-qua"));
+            assert_eq!(app.app_id, Some(42));
+            assert_eq!(head.security.unwrap().mode, Some(1));
+            let missing_optional = input.replace(r#","sub_sig_map":null"#, "");
+            let error = serde_json::from_str::<Profile>(&missing_optional).unwrap_err();
+            assert!(error.to_string().contains("missing field `sub_sig_map`"));
+        }
+    }
+
+    #[test]
+    fn explicit_null_profile_resources_fail_at_wt_consumers_instead_of_restoring_defaults() {
+        let state = SessionState {
+            profile: serde_json::from_str("{}").unwrap(),
+            keystore: Keystore {
+                tgtgt_key: vec![0x31; 16],
+                ..Default::default()
+            },
+            machine_id: "synthetic-machine".into(),
+            online: false,
+        };
+        let mut codec = super::super::wt::WtLogin::new().unwrap();
+        assert!(codec.login(&state).is_ok());
+        for (field, message) in [
+            ("apk_signature_md5", "WT APK signature resource missing"),
+            ("misc_bitmap", "WT misc bitmap resource missing"),
+            ("main_sig_map", "WT main signature map resource missing"),
+            ("sub_sig_map", "WT sub signature map resource missing"),
+        ] {
+            let explicit = SessionState {
+                profile: serde_json::from_str(&format!(r#"{{"{field}":null}}"#)).unwrap(),
+                ..state.clone()
+            };
+            match codec.login(&explicit) {
+                Err(Error::Malformed(error)) => assert_eq!(error, message),
+                _ => panic!("explicitly absent {field} was not rejected by WT login"),
+            }
+        }
+    }
+
+    fn test_session() -> NtKeyExchangeSession {
+        NtKeyExchangeSession::new(
+            ClientPlatform::Linux,
+            Bytes::from_static(&[42; 16]),
+            Bytes::from_static(b"synthetic-exchange-ticket"),
+            3600,
+        )
+        .unwrap()
+    }
+
+    fn session_key(store: &Keystore) -> &[u8] {
+        store
+            .key_exchange_session
+            .as_ref()
+            .unwrap()
+            .material()
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn key_exchange_rejects_unauthenticated_but_decryptable_session() {
+        let mut codec = NtLogin::new().unwrap();
+        let state = SessionState {
+            profile: Profile::linux(),
+            keystore: Keystore::default(),
+            machine_id: "synthetic-machine".into(),
+            online: false,
+        };
+        codec.key_exchange(&state, 1_700_000_000).unwrap();
+        let mut scalar = [0; 32];
+        scalar[31] = 1;
+        let peer = Ecdh::from_private(Curve::P256, &scalar).unwrap();
+        let shared = peer.shared_secret(codec.ecdh.public_key(), false).unwrap();
+        let session = auth::KeyExchangeSession {
+            key: Some(Bytes::from_static(&[7; 32])),
+            ticket: Some(Bytes::from_static(b"synthetic-session-ticket")),
+            expire_seconds: Some(3600),
+        };
+        let response = auth::KeyExchangeResponse {
+            signature: None,
+            public_key: Some(Bytes::copy_from_slice(peer.public_key())),
+            encrypted_secret: Some(
+                crypto::aes_gcm_encrypt(&session.encode_to_vec(), &shared)
+                    .unwrap()
+                    .into(),
+            ),
+        }
+        .encode_to_vec();
+        assert!(codec.decode_key_exchange(response.into(), None).is_err());
+    }
 
     fn refresh_response(
         store: &Keystore,
@@ -421,6 +781,7 @@ mod tests {
                 cookie: Some(auth::NtCookie {
                     cookie: Some(Bytes::from_static(b"refresh-must-not-replace-login-cookie")),
                 }),
+                ..Default::default()
             }),
             body: (code == 0).then(|| {
                 auth::NtRefreshTicketResponseBody { tickets, account }
@@ -430,7 +791,7 @@ mod tests {
         };
         auth::NtForward {
             encrypted: Some(
-                crypto::aes_gcm_encrypt(&common.encode_to_vec(), &store.key_exchange_key)
+                crypto::aes_gcm_encrypt(&common.encode_to_vec(), session_key(store))
                     .unwrap()
                     .into(),
             ),
@@ -448,7 +809,7 @@ mod tests {
             a2: b"retained-a2".to_vec(),
             d2: b"retained-d2".to_vec(),
             d2_key: vec![3; 16],
-            key_exchange_key: vec![42; 16],
+            key_exchange_session: Some(test_session()),
             login_cookie: b"retained-login-cookie".to_vec(),
             wt_ticket_times: Some(WtTicketTimeMetadata {
                 next_refresh_unix_seconds: 604_900,
@@ -478,7 +839,8 @@ mod tests {
             None,
             0,
         );
-        codec.decode(response, &mut store, NtResponseKind::Refresh, 1_000)
+        codec
+            .decode(response, &mut store, NtResponseKind::Refresh, 1_000)
             .unwrap()
             .require_success()
             .unwrap();
@@ -516,7 +878,8 @@ mod tests {
                     None,
                     0,
                 );
-                codec.decode(response, &mut store, NtResponseKind::Refresh, 9_000)
+                codec
+                    .decode(response, &mut store, NtResponseKind::Refresh, 9_000)
                     .unwrap()
                     .require_success()
                     .unwrap();
@@ -583,7 +946,8 @@ mod tests {
             }),
             0,
         );
-        codec.decode(response, &mut store, NtResponseKind::Refresh, 1_000)
+        codec
+            .decode(response, &mut store, NtResponseKind::Refresh, 1_000)
             .unwrap()
             .require_success()
             .unwrap();
@@ -600,7 +964,8 @@ mod tests {
         let mut store = refresh_store();
         let retained = store.clone();
         let response = refresh_response(&store, None, None, 140022015);
-        let result = codec.decode(response, &mut store, NtResponseKind::Refresh, 1_000)
+        let result = codec
+            .decode(response, &mut store, NtResponseKind::Refresh, 1_000)
             .unwrap();
         assert_eq!(result.code, 140022015);
         assert!(store == retained);
@@ -640,7 +1005,7 @@ mod tests {
         };
         auth::NtForward {
             encrypted: Some(
-                crypto::aes_gcm_encrypt(&common.encode_to_vec(), &store.key_exchange_key)
+                crypto::aes_gcm_encrypt(&common.encode_to_vec(), session_key(store))
                     .unwrap()
                     .into(),
             ),
@@ -654,7 +1019,7 @@ mod tests {
     fn authenticated_ticket_rotation_selects_present_field12_without_merging_field16() {
         let codec = NtLogin::new().unwrap();
         let mut store = Keystore {
-            key_exchange_key: vec![42; 16],
+            key_exchange_session: Some(test_session()),
             wt_ticket_times: Some(WtTicketTimeMetadata {
                 next_refresh_unix_seconds: 604_900,
                 expire_unix_seconds: 2_592_100,
@@ -676,7 +1041,8 @@ mod tests {
         ] {
             let response =
                 time_metadata_response(&store, field12.clone(), Some(field16.clone()), 16, 0);
-            codec.decode(response, &mut store, NtResponseKind::Easy, 1_000)
+            codec
+                .decode(response, &mut store, NtResponseKind::Easy, 1_000)
                 .unwrap()
                 .require_success()
                 .unwrap();
@@ -711,7 +1077,8 @@ mod tests {
             assert_eq!(restored.nt_ticket_times, Some(times));
         }
         let response = time_metadata_response(&store, None, None, 16, 0);
-        codec.decode(response, &mut store, NtResponseKind::Easy, 1_000)
+        codec
+            .decode(response, &mut store, NtResponseKind::Easy, 1_000)
             .unwrap();
         assert_eq!(store.ticket_generated_unix_seconds, None);
         assert_eq!(store.wt_ticket_times, None);
@@ -727,7 +1094,7 @@ mod tests {
     fn rejected_or_invalid_ticket_rotation_never_publishes_new_time_metadata() {
         let codec = NtLogin::new().unwrap();
         let mut store = Keystore {
-            key_exchange_key: vec![42; 16],
+            key_exchange_session: Some(test_session()),
             nt_ticket_times: Some(NtTicketTimeMetadata {
                 field12: None,
                 field16: Some(NtTicketTimeValues {
@@ -762,7 +1129,7 @@ mod tests {
     fn nt_ticket_decryption_is_authenticated_and_transactional() {
         let codec = NtLogin::new().unwrap();
         let mut k = Keystore {
-            key_exchange_key: vec![42; 16],
+            key_exchange_session: Some(test_session()),
             ..Default::default()
         };
         let old = k.clone();
@@ -787,14 +1154,18 @@ mod tests {
             body: Some(body.encode_to_vec().into()),
         }
         .encode_to_vec();
-        let encrypted = crypto::aes_gcm_encrypt(&common, &k.key_exchange_key).unwrap();
+        let encrypted = crypto::aes_gcm_encrypt(&common, session_key(&k)).unwrap();
         let forward = auth::NtForward {
             encrypted: Some(encrypted.into()),
             ..Default::default()
         }
         .encode_to_vec()
         .into();
-        assert!(codec.decode(forward, &mut k, NtResponseKind::Easy, 1_000).is_err());
+        assert!(
+            codec
+                .decode(forward, &mut k, NtResponseKind::Easy, 1_000)
+                .is_err()
+        );
         assert!(k == old);
         let forward = auth::NtForward {
             encrypted: Some(Bytes::from_static(&[0; 28])),
@@ -802,7 +1173,11 @@ mod tests {
         }
         .encode_to_vec()
         .into();
-        assert!(codec.decode(forward, &mut k, NtResponseKind::Easy, 1_000).is_err());
+        assert!(
+            codec
+                .decode(forward, &mut k, NtResponseKind::Easy, 1_000)
+                .is_err()
+        );
         assert!(k == old);
     }
 
@@ -822,8 +1197,7 @@ mod tests {
         ] {
             let mut store = Keystore {
                 a1: b"retained-a1".to_vec(),
-                key_exchange_key: vec![42; 16],
-                key_exchange_ticket: b"synthetic-exchange-ticket".to_vec(),
+                key_exchange_session: Some(test_session()),
                 ..Default::default()
             };
             let common = auth::NtResponse {
@@ -833,18 +1207,20 @@ mod tests {
                         ..Default::default()
                     }),
                     cookie: Some(decoded.clone()),
+                    ..Default::default()
                 }),
                 body: Some(Bytes::new()),
             };
             let response = auth::NtForward {
                 encrypted: Some(
-                    crypto::aes_gcm_encrypt(&common.encode_to_vec(), &store.key_exchange_key)
+                    crypto::aes_gcm_encrypt(&common.encode_to_vec(), session_key(&store))
                         .unwrap()
                         .into(),
                 ),
                 ..Default::default()
             };
-            let result = codec.decode(response.encode_to_vec().into(), &mut store, kind, 1_000)
+            let result = codec
+                .decode(response.encode_to_vec().into(), &mut store, kind, 1_000)
                 .unwrap();
             assert_eq!(result.code, code);
             assert_eq!(store.a1, b"retained-a1");
@@ -855,14 +1231,15 @@ mod tests {
                 machine_id: "synthetic-machine".into(),
                 online: false,
             };
-            let request: auth::NtForward =
-                proto::decode(codec.encode(&auth::NtLoginBody::default(), &state).unwrap())
-                    .unwrap();
-            let clear = crypto::aes_gcm_decrypt(
-                &request.encrypted.unwrap(),
-                &state.keystore.key_exchange_key,
+            let request: auth::NtForward = proto::decode(
+                codec
+                    .encode(&auth::NtLoginBody::default(), &state, kind)
+                    .unwrap(),
             )
             .unwrap();
+            let clear =
+                crypto::aes_gcm_decrypt(&request.encrypted.unwrap(), session_key(&state.keystore))
+                    .unwrap();
             let request: auth::NtRequest = proto::decode(clear.as_slice()).unwrap();
             let forwarded = request.head.unwrap().cookie.unwrap();
             assert_eq!(forwarded.cookie, Some(cookie.clone()));
@@ -886,7 +1263,7 @@ mod tests {
             st_key: b"retained-st-key".to_vec(),
             st_web: b"retained-http-ticket".to_vec(),
             no_pic_sig: b"retained-no-pic".to_vec(),
-            key_exchange_key: vec![42; 16],
+            key_exchange_session: Some(test_session()),
             ..Default::default()
         };
         let retained = store.clone();
@@ -910,13 +1287,19 @@ mod tests {
         };
         let response = auth::NtForward {
             encrypted: Some(
-                crypto::aes_gcm_encrypt(&common.encode_to_vec(), &store.key_exchange_key)
+                crypto::aes_gcm_encrypt(&common.encode_to_vec(), session_key(&store))
                     .unwrap()
                     .into(),
             ),
             ..Default::default()
         };
-        codec.decode(response.encode_to_vec().into(), &mut store, NtResponseKind::Easy, 1_000)
+        codec
+            .decode(
+                response.encode_to_vec().into(),
+                &mut store,
+                NtResponseKind::Easy,
+                1_000,
+            )
             .unwrap()
             .require_success()
             .unwrap();
@@ -946,7 +1329,7 @@ mod tests {
             machine_id: "synthetic-machine".into(),
             online: false,
         };
-        let timestamp = 1_712_345_678;
+        let timestamp = u64::from(u32::MAX) + 123;
         let request: auth::KeyExchangeRequest =
             proto::decode(codec.key_exchange(&state, timestamp).unwrap()).unwrap();
         let public = request.public_key.unwrap();
@@ -964,36 +1347,54 @@ mod tests {
         verify.bytes(&public);
         verify.u32(1);
         verify.bytes(&encrypted);
-        verify.u32(0);
-        verify.u32(timestamp);
+        verify.u64(timestamp);
         let hash_key =
             hex::decode("e2733bf403149913cbf80c7a95168bd4ca6935ee53cd39764beebe2e007e3aee")
                 .unwrap();
         let hash = crypto::aes_gcm_decrypt(&request.encrypted_hash.unwrap(), &hash_key).unwrap();
         assert_eq!(hash, crypto::sha256(&verify.data));
-        verify.data.truncate(verify.data.len() - 4);
-        verify.u32(timestamp + 1);
+        verify.data.truncate(verify.data.len() - 8);
+        verify.u64(timestamp + 1);
         assert_ne!(hash, crypto::sha256(&verify.data));
     }
 
     #[test]
     fn renewed_key_exchange_rejects_previous_exchange_ciphertext() {
-        fn reply(peer: &Ecdh, public: &[u8], ticket: &'static [u8]) -> Bytes {
+        use p256::ecdsa::{Signature, SigningKey, signature::hazmat::PrehashSigner};
+
+        let signing_key = SigningKey::from_slice(&[1; 32]).unwrap();
+        let reply = |peer: &Ecdh, public: &[u8], ticket: &'static [u8]| {
             let shared = peer.shared_secret(public, false).unwrap();
             let secret = auth::KeyExchangeSession {
                 key: Some(Bytes::from_static(&[7; 16])),
                 ticket: Some(Bytes::from_static(ticket)),
+                expire_seconds: Some(3600),
             }
             .encode_to_vec();
-            auth::KeyExchangeResponse {
-                encrypted_secret: Some(crypto::aes_gcm_encrypt(&secret, &shared).unwrap().into()),
-                public_key: Some(Bytes::copy_from_slice(peer.public_key())),
-            }
-            .encode_to_vec()
-            .into()
-        }
+            let encrypted = crypto::aes_gcm_encrypt(&secret, &shared).unwrap();
+            let digest =
+                crypto::sha256(&[public, peer.public_key(), encrypted.as_slice()].concat());
+            let signature: Signature = signing_key.sign_prehash(&digest).unwrap();
+            Bytes::from(
+                auth::KeyExchangeResponse {
+                    encrypted_secret: Some(encrypted.into()),
+                    signature: Some(Bytes::copy_from_slice(signature.to_der().as_bytes())),
+                    public_key: Some(Bytes::copy_from_slice(peer.public_key())),
+                }
+                .encode_to_vec(),
+            )
+        };
 
-        let mut codec = NtLogin::new().unwrap();
+        let mut codec = NtLogin::with_verifier(
+            crypto::P256Verifier::new(
+                signing_key
+                    .verifying_key()
+                    .to_encoded_point(false)
+                    .as_bytes(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         let state = SessionState {
             profile: Profile::linux(),
             keystore: Keystore::default(),
@@ -1005,50 +1406,45 @@ mod tests {
             proto::decode(codec.key_exchange(&state, 1_712_345_678).unwrap()).unwrap();
         let old_reply = reply(&peer, first.public_key.as_ref().unwrap(), b"old-exchange");
         assert_eq!(
-            codec.decode_key_exchange(old_reply.clone()).unwrap().0,
-            b"old-exchange"
+            codec
+                .decode_key_exchange(old_reply.clone(), None)
+                .unwrap()
+                .material()
+                .unwrap()
+                .1,
+            b"old-exchange".as_slice()
         );
         let second: auth::KeyExchangeRequest =
             proto::decode(codec.key_exchange(&state, 1_712_345_679).unwrap()).unwrap();
         assert_ne!(first.public_key, second.public_key);
-        assert!(codec.decode_key_exchange(old_reply).is_err());
+        assert!(codec.decode_key_exchange(old_reply, None).is_err());
         let current_reply = reply(
             &peer,
             second.public_key.as_ref().unwrap(),
             b"current-exchange",
         );
-        let (ticket, key) = codec.decode_key_exchange(current_reply).unwrap();
-        assert_eq!(ticket, b"current-exchange");
+        let session = codec
+            .decode_key_exchange(current_reply.clone(), None)
+            .unwrap();
+        let (key, ticket) = session.material().unwrap();
+        assert_eq!(ticket, b"current-exchange".as_slice());
         assert_eq!(key, [7; 16]);
-    }
-
-    #[test]
-    fn typed_key_exchange_preserves_authenticated_session_material() {
-        let codec = NtLogin::new().unwrap();
-        let peer = Ecdh::new(Curve::P256).unwrap();
-        let shared = peer.shared_secret(codec.ecdh.public_key(), false).unwrap();
-        let secret = auth::KeyExchangeSession {
-            key: Some(Bytes::from_static(&[7; 16])),
-            ticket: Some(Bytes::from_static(b"exchange-ticket")),
-        }
-        .encode_to_vec();
-        let mut reply = auth::KeyExchangeResponse {
-            encrypted_secret: Some(crypto::aes_gcm_encrypt(&secret, &shared).unwrap().into()),
-            public_key: Some(Bytes::copy_from_slice(peer.public_key())),
-        }
-        .encode_to_vec();
-        reply.extend_from_slice(&[0x12, 72]);
-        reply.extend_from_slice(&[0xa5; 72]);
-        let (ticket, key) = codec.decode_key_exchange(reply.into()).unwrap();
-        assert_eq!(ticket, b"exchange-ticket");
-        assert_eq!(key, [7; 16]);
+        let mut tampered: auth::KeyExchangeResponse = proto::decode(current_reply).unwrap();
+        let mut encrypted = tampered.encrypted_secret.take().unwrap().to_vec();
+        encrypted[12] ^= 1;
+        tampered.encrypted_secret = Some(encrypted.into());
+        assert!(
+            codec
+                .decode_key_exchange(tampered.encode_to_vec().into(), None)
+                .is_err()
+        );
     }
 
     #[test]
     fn easy_login_protection_accepts_ciphertext_only_forward_without_replacing_tickets() {
         let codec = NtLogin::new().unwrap();
         let mut store = Keystore {
-            key_exchange_key: vec![42; 16],
+            key_exchange_session: Some(test_session()),
             a1: b"existing-a1".to_vec(),
             a2: b"existing-a2".to_vec(),
             d2: b"existing-d2".to_vec(),
@@ -1068,19 +1464,26 @@ mod tests {
                     ..Default::default()
                 }),
                 cookie: None,
+                ..Default::default()
             }),
             body: Some(body.encode_to_vec().into()),
         };
         let forward = auth::NtForward {
             encrypted: Some(
-                crypto::aes_gcm_encrypt(&common.encode_to_vec(), &store.key_exchange_key)
+                crypto::aes_gcm_encrypt(&common.encode_to_vec(), session_key(&store))
                     .unwrap()
                     .into(),
             ),
             ticket: None,
             r#type: None,
         };
-        let result = codec.decode(forward.encode_to_vec().into(), &mut store, NtResponseKind::Easy, 1_000)
+        let result = codec
+            .decode(
+                forward.encode_to_vec().into(),
+                &mut store,
+                NtResponseKind::Easy,
+                1_000,
+            )
             .unwrap();
         assert_eq!(result.code, 140022011);
         assert!(result.require_success().is_err());
@@ -1095,7 +1498,7 @@ mod tests {
     fn expired_easy_identity_preserves_error_without_inventing_device_verification() {
         let codec = NtLogin::new().unwrap();
         let mut store = Keystore {
-            key_exchange_key: vec![42; 16],
+            key_exchange_session: Some(test_session()),
             a1: b"existing-a1".to_vec(),
             a2: b"existing-a2".to_vec(),
             d2: b"existing-d2".to_vec(),
@@ -1113,6 +1516,7 @@ mod tests {
                     ..Default::default()
                 }),
                 cookie: None,
+                ..Default::default()
             }),
             body: Some(
                 auth::NtEasyLoginResponseBody::default()
@@ -1122,13 +1526,19 @@ mod tests {
         };
         let forward = auth::NtForward {
             encrypted: Some(
-                crypto::aes_gcm_encrypt(&common.encode_to_vec(), &store.key_exchange_key)
+                crypto::aes_gcm_encrypt(&common.encode_to_vec(), session_key(&store))
                     .unwrap()
                     .into(),
             ),
             ..Default::default()
         };
-        let result = codec.decode(forward.encode_to_vec().into(), &mut store, NtResponseKind::Easy, 1_000)
+        let result = codec
+            .decode(
+                forward.encode_to_vec().into(),
+                &mut store,
+                NtResponseKind::Easy,
+                1_000,
+            )
             .unwrap();
         assert_eq!(result.code, 140022015);
         assert!(result.unusual_signature.is_none());
@@ -1147,7 +1557,7 @@ mod tests {
     fn password_response_updates_tickets_account_and_cookie_together() {
         let codec = NtLogin::new().unwrap();
         let mut k = Keystore {
-            key_exchange_key: vec![42; 16],
+            key_exchange_session: Some(test_session()),
             ..Default::default()
         };
         let body = auth::NtPasswordResponseBody {
@@ -1177,20 +1587,22 @@ mod tests {
                 cookie: Some(auth::NtCookie {
                     cookie: Some(Bytes::from_static(b"session-cookie")),
                 }),
+                ..Default::default()
             }),
             body: Some(body.encode_to_vec().into()),
         }
         .encode_to_vec();
         let forward = auth::NtForward {
             encrypted: Some(
-                crypto::aes_gcm_encrypt(&common, &k.key_exchange_key)
+                crypto::aes_gcm_encrypt(&common, session_key(&k))
                     .unwrap()
                     .into(),
             ),
             ..Default::default()
         }
         .encode_to_vec();
-        codec.decode(forward.into(), &mut k, NtResponseKind::Password, 1_000)
+        codec
+            .decode(forward.into(), &mut k, NtResponseKind::Password, 1_000)
             .unwrap()
             .require_success()
             .unwrap();
@@ -1243,7 +1655,7 @@ mod tests {
         let codec = NtLogin::new().unwrap();
         let mut store = Keystore {
             uin: 123456,
-            key_exchange_key: vec![42; 16],
+            key_exchange_session: Some(test_session()),
             ..Default::default()
         };
         let body = auth::NtPasswordVerificationResponseBody {
@@ -1267,14 +1679,20 @@ mod tests {
         .encode_to_vec();
         let forward = auth::NtForward {
             encrypted: Some(
-                crypto::aes_gcm_encrypt(&common, &store.key_exchange_key)
+                crypto::aes_gcm_encrypt(&common, session_key(&store))
                     .unwrap()
                     .into(),
             ),
             ..Default::default()
         }
         .encode_to_vec();
-        codec.decode(forward.into(), &mut store, NtResponseKind::PasswordVerification, 1_000)
+        codec
+            .decode(
+                forward.into(),
+                &mut store,
+                NtResponseKind::PasswordVerification,
+                1_000,
+            )
             .unwrap()
             .require_success()
             .unwrap();
@@ -1282,5 +1700,487 @@ mod tests {
         assert_eq!(store.uid, "u_verified");
         assert_eq!(store.a1, b"verified-a1");
         assert_eq!(store.d2_key, [7; 16]);
+    }
+
+    fn long_cookie_state(uin: u64) -> SessionState {
+        SessionState {
+            profile: Profile::linux(),
+            keystore: Keystore {
+                uin,
+                key_exchange_session: Some(test_session()),
+                ..Default::default()
+            },
+            machine_id: "synthetic-machine".into(),
+            online: false,
+        }
+    }
+
+    fn long_cookie_response(
+        store: &Keystore,
+        kind: NtResponseKind,
+        code: u64,
+        long_cookie: Option<auth::NtCookie>,
+    ) -> Bytes {
+        let tickets = (code == 0).then(|| auth::NtTickets {
+            a1: Some(Bytes::from_static(b"synthetic-a1")),
+            a2: Some(Bytes::from_static(b"synthetic-a2")),
+            d2: Some(Bytes::from_static(b"synthetic-d2")),
+            d2_key: Some(Bytes::from_static(&[7; 16])),
+            ..Default::default()
+        });
+        let account = Some(auth::NtAccount {
+            uin: Some(999999),
+            ..Default::default()
+        });
+        let body = match kind {
+            NtResponseKind::Password => auth::NtPasswordResponseBody {
+                tickets,
+                account,
+                ..Default::default()
+            }
+            .encode_to_vec(),
+            NtResponseKind::Easy => auth::NtEasyLoginResponseBody {
+                tickets,
+                ..Default::default()
+            }
+            .encode_to_vec(),
+            NtResponseKind::Refresh => auth::NtRefreshTicketResponseBody {
+                tickets,
+                account: None,
+            }
+            .encode_to_vec(),
+            NtResponseKind::NewDevice => {
+                auth::NtNewDeviceResponseBody { tickets, account }.encode_to_vec()
+            }
+            NtResponseKind::PasswordVerification => {
+                auth::NtPasswordVerificationResponseBody { tickets, account }.encode_to_vec()
+            }
+        };
+        let common = auth::NtResponse {
+            head: Some(auth::NtResponseHead {
+                error: Some(auth::NtError {
+                    code: Some(code),
+                    ..Default::default()
+                }),
+                cookie: Some(auth::NtCookie {
+                    cookie: Some(Bytes::from_static(b"challenge-cookie-five")),
+                }),
+                long_cookie,
+            }),
+            body: Some(body.into()),
+        };
+        auth::NtForward {
+            encrypted: Some(
+                crypto::aes_gcm_encrypt(&common.encode_to_vec(), session_key(store))
+                    .unwrap()
+                    .into(),
+            ),
+            ..Default::default()
+        }
+        .encode_to_vec()
+        .into()
+    }
+
+    fn consume_long_cookie_response(
+        codec: &mut NtLogin,
+        state: &mut SessionState,
+        kind: NtResponseKind,
+        response: Bytes,
+    ) -> Result<NtResult> {
+        let requested_account = state.keystore.uin.to_string();
+        let result = codec.decode(response, &mut state.keystore, kind, 1_000)?;
+        codec.finish_response(kind, &requested_account, &result);
+        Ok(result)
+    }
+
+    fn encoded_login_head(
+        codec: &NtLogin,
+        state: &SessionState,
+        kind: NtResponseKind,
+    ) -> auth::NtRequestHead {
+        let forward: auth::NtForward = proto::decode(
+            codec
+                .encode(&auth::NtLoginBody::default(), state, kind)
+                .unwrap(),
+        )
+        .unwrap();
+        let clear =
+            crypto::aes_gcm_decrypt(&forward.encrypted.unwrap(), session_key(&state.keystore))
+                .unwrap();
+        let request: auth::NtRequest = proto::decode(clear.as_slice()).unwrap();
+        request.head.unwrap()
+    }
+
+    #[test]
+    fn long_cookie_has_native_wire_presence_and_is_consumed_by_the_next_password_request() {
+        let cookie = Bytes::from_static(b"\xff\x00\xc0\x80");
+        let head: auth::NtResponseHead =
+            proto::decode(Bytes::from_static(b"\x42\x06\x0a\x04\xff\x00\xc0\x80")).unwrap();
+        assert_eq!(
+            head.long_cookie.as_ref().unwrap().cookie.as_ref(),
+            Some(&cookie)
+        );
+        assert_eq!(head.encode_to_vec(), b"\x42\x06\x0a\x04\xff\x00\xc0\x80");
+        let mut codec = NtLogin::new().unwrap();
+        let mut state = long_cookie_state(123456);
+        assert!(
+            encoded_login_head(&codec, &state, NtResponseKind::Password)
+                .long_cookie
+                .is_none()
+        );
+        let response = long_cookie_response(
+            &state.keystore,
+            NtResponseKind::Password,
+            140022015,
+            head.long_cookie,
+        );
+        let result = consume_long_cookie_response(
+            &mut codec,
+            &mut state,
+            NtResponseKind::Password,
+            response,
+        )
+        .unwrap();
+        assert_eq!(result.long_cookie, Some(cookie.clone()));
+        assert_eq!(state.keystore.uin, 123456);
+        let head = encoded_login_head(&codec, &state, NtResponseKind::Password);
+        assert_eq!(head.long_cookie.unwrap().cookie, Some(cookie));
+        assert_eq!(
+            head.cookie.unwrap().cookie.as_deref(),
+            Some(b"challenge-cookie-five".as_slice()),
+        );
+        assert!(
+            encoded_login_head(&codec, &state, NtResponseKind::Easy)
+                .long_cookie
+                .is_none()
+        );
+        state.keystore.login_cookie.clear();
+        assert!(
+            encoded_login_head(&codec, &state, NtResponseKind::Password)
+                .long_cookie
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn long_cookie_final_failure_collapses_missing_and_empty_to_removal() {
+        for absent in [
+            None,
+            Some(auth::NtCookie { cookie: None }),
+            Some(auth::NtCookie {
+                cookie: Some(Bytes::new()),
+            }),
+        ] {
+            let mut codec = NtLogin::new().unwrap();
+            let mut state = long_cookie_state(123456);
+            let response = long_cookie_response(
+                &state.keystore,
+                NtResponseKind::Password,
+                140022015,
+                Some(auth::NtCookie {
+                    cookie: Some(Bytes::from_static(b"old-eight")),
+                }),
+            );
+            consume_long_cookie_response(
+                &mut codec,
+                &mut state,
+                NtResponseKind::Password,
+                response,
+            )
+            .unwrap();
+            let response =
+                long_cookie_response(&state.keystore, NtResponseKind::Password, 140022015, absent);
+            let result = consume_long_cookie_response(
+                &mut codec,
+                &mut state,
+                NtResponseKind::Password,
+                response,
+            )
+            .unwrap();
+            assert!(result.long_cookie.is_none());
+            assert!(
+                encoded_login_head(&codec, &state, NtResponseKind::Password)
+                    .long_cookie
+                    .is_none()
+            );
+            assert_eq!(state.keystore.login_cookie, b"challenge-cookie-five");
+        }
+    }
+
+    #[test]
+    fn long_cookie_is_isolated_by_request_account_and_codec_lifetime() {
+        let mut codec = NtLogin::new().unwrap();
+        let mut first = long_cookie_state(123456);
+        let mut second = long_cookie_state(654321);
+        for (state, cookie) in [
+            (&mut first, Bytes::from_static(b"first-eight")),
+            (&mut second, Bytes::from_static(b"second-eight")),
+        ] {
+            let response = long_cookie_response(
+                &state.keystore,
+                NtResponseKind::Password,
+                140022015,
+                Some(auth::NtCookie {
+                    cookie: Some(cookie),
+                }),
+            );
+            consume_long_cookie_response(&mut codec, state, NtResponseKind::Password, response)
+                .unwrap();
+        }
+        for (state, cookie) in [
+            (&first, b"first-eight".as_slice()),
+            (&second, b"second-eight".as_slice()),
+        ] {
+            assert_eq!(
+                encoded_login_head(&codec, state, NtResponseKind::Password)
+                    .long_cookie
+                    .unwrap()
+                    .cookie
+                    .as_deref(),
+                Some(cookie),
+            );
+            assert!(
+                encoded_login_head(&NtLogin::new().unwrap(), state, NtResponseKind::Password,)
+                    .long_cookie
+                    .is_none()
+            );
+        }
+        assert!(
+            encoded_login_head(&codec, &long_cookie_state(999999), NtResponseKind::Password,)
+                .long_cookie
+                .is_none()
+        );
+        let response =
+            long_cookie_response(&first.keystore, NtResponseKind::Password, 140022015, None);
+        consume_long_cookie_response(&mut codec, &mut first, NtResponseKind::Password, response)
+            .unwrap();
+        assert!(
+            encoded_login_head(&codec, &first, NtResponseKind::Password)
+                .long_cookie
+                .is_none()
+        );
+        assert!(
+            encoded_login_head(&codec, &second, NtResponseKind::Password)
+                .long_cookie
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn long_cookie_ignores_password_challenges_success_and_other_rpc_responses() {
+        for (kind, code) in [
+            (NtResponseKind::Password, 0),
+            (NtResponseKind::Password, 140022008),
+            (NtResponseKind::Password, 140022010),
+            (NtResponseKind::Easy, 140022015),
+            (NtResponseKind::Refresh, 140022015),
+            (NtResponseKind::NewDevice, 140022015),
+            (NtResponseKind::PasswordVerification, 140022015),
+        ] {
+            for cookie in [
+                None,
+                Some(auth::NtCookie {
+                    cookie: Some(Bytes::from_static(b"must-not-replace-eight")),
+                }),
+            ] {
+                let mut codec = NtLogin::new().unwrap();
+                let mut state = long_cookie_state(123456);
+                let response = long_cookie_response(
+                    &state.keystore,
+                    NtResponseKind::Password,
+                    140022015,
+                    Some(auth::NtCookie {
+                        cookie: Some(Bytes::from_static(b"retained-eight")),
+                    }),
+                );
+                consume_long_cookie_response(
+                    &mut codec,
+                    &mut state,
+                    NtResponseKind::Password,
+                    response,
+                )
+                .unwrap();
+                let response = long_cookie_response(&state.keystore, kind, code, cookie.clone());
+                let result =
+                    consume_long_cookie_response(&mut codec, &mut state, kind, response).unwrap();
+                assert_eq!(result.long_cookie, cookie.and_then(|cookie| cookie.cookie));
+                state.keystore.uin = 123456;
+                assert_eq!(
+                    encoded_login_head(&codec, &state, NtResponseKind::Password)
+                        .long_cookie
+                        .unwrap()
+                        .cookie
+                        .as_deref(),
+                    Some(b"retained-eight".as_slice()),
+                );
+                assert!(
+                    encoded_login_head(
+                        &codec,
+                        &long_cookie_state(999999),
+                        NtResponseKind::Password,
+                    )
+                    .long_cookie
+                    .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn long_cookie_local_response_errors_and_empty_account_do_not_remove_cached_value() {
+        let mut codec = NtLogin::new().unwrap();
+        let mut state = long_cookie_state(123456);
+        let response = long_cookie_response(
+            &state.keystore,
+            NtResponseKind::Password,
+            140022015,
+            Some(auth::NtCookie {
+                cookie: Some(Bytes::from_static(b"retained-eight")),
+            }),
+        );
+        let result = consume_long_cookie_response(
+            &mut codec,
+            &mut state,
+            NtResponseKind::Password,
+            response,
+        )
+        .unwrap();
+        codec.finish_response(NtResponseKind::Password, "", &result);
+        assert!(!codec.long_cookies.contains_key(""));
+        let invalid_body = auth::NtResponse {
+            head: Some(auth::NtResponseHead {
+                error: Some(auth::NtError {
+                    code: Some(140022015),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            body: Some(Bytes::from_static(b"\xff")),
+        };
+        let invalid_body = auth::NtForward {
+            encrypted: Some(
+                crypto::aes_gcm_encrypt(
+                    &invalid_body.encode_to_vec(),
+                    session_key(&state.keystore),
+                )
+                .unwrap()
+                .into(),
+            ),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let invalid_ciphertext = auth::NtForward {
+            encrypted: Some(Bytes::from_static(b"invalid-authentication-tag")),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        for response in [vec![0xff], invalid_body, invalid_ciphertext] {
+            assert!(
+                consume_long_cookie_response(
+                    &mut codec,
+                    &mut state,
+                    NtResponseKind::Password,
+                    response.into(),
+                )
+                .is_err()
+            );
+            assert_eq!(
+                encoded_login_head(&codec, &state, NtResponseKind::Password)
+                    .long_cookie
+                    .unwrap()
+                    .cookie
+                    .as_deref(),
+                Some(b"retained-eight".as_slice()),
+            );
+        }
+        codec.long_cookies.insert("123456".into(), Bytes::new());
+        assert!(
+            encoded_login_head(&codec, &state, NtResponseKind::Password)
+                .long_cookie
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn mobile_uin_password_replays_long_cookie_for_each_profile() {
+        for profile in [Profile::iphone(), Profile::ipad()] {
+            let mut codec = NtLogin::with_device(Some(IosDevice {
+                system_version: "18.0".into(),
+                hardware_model: "synthetic-model".into(),
+                system_name: "iOS".into(),
+            }))
+            .unwrap();
+            let mut state = long_cookie_state(123456);
+            state.profile = profile;
+            let response = long_cookie_response(
+                &state.keystore,
+                NtResponseKind::Password,
+                140022015,
+                Some(auth::NtCookie {
+                    cookie: Some(Bytes::from_static(b"mobile-eight")),
+                }),
+            );
+            consume_long_cookie_response(
+                &mut codec,
+                &mut state,
+                NtResponseKind::Password,
+                response,
+            )
+            .unwrap();
+            let head = encoded_login_head(&codec, &state, NtResponseKind::Password);
+            assert_eq!(head.account.unwrap().uin.as_deref(), Some("123456"));
+            assert_eq!(
+                head.long_cookie.unwrap().cookie.as_deref(),
+                Some(b"mobile-eight".as_slice())
+            );
+            assert!(head.security.is_none());
+        }
+    }
+
+    #[test]
+    fn valid_head_only_final_password_failure_removes_long_cookie() {
+        let mut codec = NtLogin::new().unwrap();
+        let mut state = long_cookie_state(123456);
+        let response = long_cookie_response(
+            &state.keystore,
+            NtResponseKind::Password,
+            140022015,
+            Some(auth::NtCookie {
+                cookie: Some(Bytes::from_static(b"old-eight")),
+            }),
+        );
+        consume_long_cookie_response(&mut codec, &mut state, NtResponseKind::Password, response)
+            .unwrap();
+        let common = auth::NtResponse {
+            head: Some(auth::NtResponseHead {
+                error: Some(auth::NtError {
+                    code: Some(140022015),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            body: None,
+        };
+        let response = auth::NtForward {
+            encrypted: Some(
+                crypto::aes_gcm_encrypt(&common.encode_to_vec(), session_key(&state.keystore))
+                    .unwrap()
+                    .into(),
+            ),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        consume_long_cookie_response(
+            &mut codec,
+            &mut state,
+            NtResponseKind::Password,
+            response.into(),
+        )
+        .unwrap();
+        assert!(
+            encoded_login_head(&codec, &state, NtResponseKind::Password)
+                .long_cookie
+                .is_none()
+        );
     }
 }

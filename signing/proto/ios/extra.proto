@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package ios.signing;
+
+message SecurityExtra {
+  bytes command_value = 1;
+  bytes qua = 2;
+  bytes raw_xwid = 3;
+}
+
+message SecureAccessBody {
+  repeated bytes selected_values = 3;
+}
+
+message EstablishShareKeyBody {
+  repeated bytes selected_values = 6;
+}

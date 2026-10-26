@@ -29,10 +29,27 @@ pub(crate) struct LoginCodecs {
     registered_session: bool,
 }
 impl LoginCodecs {
+    #[cfg(test)]
     fn new() -> Result<Self> {
         Ok(Self {
             wt: WtLogin::new()?,
             nt: NtLogin::new()?,
+            registered_session: false,
+        })
+    }
+    fn for_config(config: &ClientConfig) -> Result<Self> {
+        if config.profile.platform.is_ios() {
+            config
+                .ios_device
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::Authentication("iOS login requires actual IosDevice resources".into())
+                })?
+                .validate()?;
+        }
+        Ok(Self {
+            wt: WtLogin::new()?,
+            nt: NtLogin::with_device(config.ios_device.clone())?,
             registered_session: false,
         })
     }
@@ -64,6 +81,16 @@ pub(crate) async fn login(client: &Arc<Client>) -> Result<UserInfo> {
     if state.online {
         return Ok(UserInfo::from(&state.keystore));
     }
+    if state.profile.platform.is_ios() {
+        info_sync_for_config(&state, false, &client.config)?;
+        if state.keystore.a1.is_empty()
+            && client.config.password.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(Error::Unsupported(
+                "iOS local QR login is not established; provide a native A1 ticket or numeric-UIN password credentials".into(),
+            ));
+        }
+    }
     let mut guard = LoginGuard {
         client,
         armed: true,
@@ -76,7 +103,7 @@ pub(crate) async fn login(client: &Arc<Client>) -> Result<UserInfo> {
     }
     let mut codecs = client.codecs.lock().await;
     if codecs.is_none() {
-        *codecs = Some(LoginCodecs::new()?)
+        *codecs = Some(LoginCodecs::for_config(&client.config)?)
     }
     let codecs = codecs.as_mut().unwrap();
     let result = run_login(client, codecs).await;
@@ -109,10 +136,10 @@ async fn run_login(client: &Arc<Client>, codecs: &mut LoginCodecs) -> Result<()>
     let state = client.snapshot().await;
     if !state.keystore.a1.is_empty() {
         let original_a1 = Bytes::from(state.keystore.a1);
-        key_exchange(client, &mut codecs.nt).await?;
+        client.clear_nt_login_cookie();
         let result = nt_call(
             client,
-            &codecs.nt,
+            &mut codecs.nt,
             "SsoNTLoginEasyLogin",
             &auth::NtLoginBody {
                 a1: Some(original_a1.clone()),
@@ -178,15 +205,18 @@ pub(crate) async fn refresh_tickets_for_generation(
     }
     let mut codecs = client.codecs.lock().await;
     if codecs.is_none() {
-        *codecs = Some(LoginCodecs::new()?);
+        *codecs = Some(LoginCodecs::for_config(&client.config)?);
     }
     let codec = &mut codecs.as_mut().unwrap().nt;
     let mut state = client.snapshot().await;
-    if state.keystore.key_exchange_ticket.is_empty()
-        || !matches!(state.keystore.key_exchange_key.len(), 16 | 24 | 32)
+    if !state
+        .keystore
+        .key_exchange_session
+        .as_ref()
+        .is_some_and(NtKeyExchangeSession::is_reusable)
     {
         let expected = state.keystore.clone();
-        let request = codec.key_exchange(&state, client.server_time_seconds()?)?;
+        let request = codec.key_exchange(&state, client.nt_key_exchange_time()?)?;
         let response = client
             .request_nt_maintenance(
                 generation,
@@ -194,10 +224,9 @@ pub(crate) async fn refresh_tickets_for_generation(
                 request,
             )
             .await?;
-        let (ticket, key) = codec.decode_key_exchange(response)?;
-        state.keystore.key_exchange_ticket = ticket;
-        state.keystore.key_exchange_key = key;
-        state.keystore.login_cookie.clear();
+        let session =
+            codec.decode_key_exchange(response, state.keystore.key_exchange_session.as_ref())?;
+        state.keystore.key_exchange_session = Some(session);
         client.commit_nt_maintenance_state(generation, &expected, state)?;
         state = client.snapshot().await;
     }
@@ -209,6 +238,7 @@ pub(crate) async fn refresh_tickets_for_generation(
             a1: Some(Bytes::copy_from_slice(&state.keystore.a1)),
         },
         &state,
+        NtResponseKind::Refresh,
     )?;
     let response = client
         .request_nt_maintenance(
@@ -243,7 +273,7 @@ pub(crate) async fn refresh_tickets_for_generation(
 }
 async fn key_exchange(client: &Client, codec: &mut NtLogin) -> Result<()> {
     let state = client.snapshot().await;
-    let request = codec.key_exchange(&state, client.server_time_seconds()?)?;
+    let request = codec.key_exchange(&state, client.nt_key_exchange_time()?)?;
     let response = client
         .call(
             "trpc.login.ecdh.EcdhService.SsoKeyExchange",
@@ -251,25 +281,34 @@ async fn key_exchange(client: &Client, codec: &mut NtLogin) -> Result<()> {
             Encryption::Empty,
         )
         .await?;
-    let (ticket, key) = codec.decode_key_exchange(response)?;
+    let session =
+        codec.decode_key_exchange(response, state.keystore.key_exchange_session.as_ref())?;
     let mut state = client.snapshot().await;
-    state.keystore.key_exchange_ticket = ticket;
-    state.keystore.key_exchange_key = key;
-    // Cookies belong to an NT authentication attempt, not restored tickets.
-    state.keystore.login_cookie.clear();
+    state.keystore.key_exchange_session = Some(session);
     client.replace_state(state).await;
     Ok(())
 }
 async fn nt_call(
     client: &Client,
-    codec: &NtLogin,
+    codec: &mut NtLogin,
     method: &str,
     body: &impl Message,
     kind: NtResponseKind,
 ) -> Result<NtResult> {
-    let state = client.snapshot().await;
+    let mut state = client.snapshot().await;
+    if !state
+        .keystore
+        .key_exchange_session
+        .as_ref()
+        .is_some_and(NtKeyExchangeSession::is_reusable)
+    {
+        key_exchange(client, codec).await?;
+        state = client.snapshot().await;
+    }
     let requested_uin = state.keystore.uin;
-    let request = codec.encode(body, &state)?;
+    let mut requested_account = itoa::Buffer::new();
+    let requested_account = requested_account.format(requested_uin);
+    let request = codec.encode(body, &state, kind)?;
     let response = client
         .call(
             &format!("trpc.login.ecdh.EcdhService.{method}"),
@@ -284,6 +323,9 @@ async fn nt_call(
         kind,
         u64::from(client.server_time_seconds()?),
     )?;
+    if state.profile.platform.is_ios() {
+        codec.finish_response(kind, requested_account, &result);
+    }
     let cached_a1_invalidated = state.keystore.uin == requested_uin
         && !state.keystore.a1.is_empty()
         && result.code != 0
@@ -589,7 +631,7 @@ async fn qr_login(client: &Client, codecs: &mut LoginCodecs, mode: QrLoginMode) 
                         };
                         nt_call(
                             client,
-                            &codecs.nt,
+                            &mut codecs.nt,
                             method,
                             &auth::NtUnusualLoginBody {
                                 a1: Some(a1),
@@ -652,11 +694,7 @@ async fn password_login(client: &Client, codecs: &mut LoginCodecs, password: &st
         ));
     }
     state.keystore.login_cookie.clear();
-    let needs_exchange = state.keystore.key_exchange_ticket.is_empty();
     client.replace_state(state).await;
-    if needs_exchange {
-        key_exchange(client, &mut codecs.nt).await?
-    }
     let password_digest = crypto::md5(password.as_bytes());
     let mut captcha: Option<(String, String, String)> = None;
     loop {
@@ -673,7 +711,7 @@ async fn password_login(client: &Client, codecs: &mut LoginCodecs, password: &st
         };
         let result = nt_call(
             client,
-            &codecs.nt,
+            &mut codecs.nt,
             "SsoNTLoginPasswordLogin",
             &body,
             NtResponseKind::Password,
@@ -701,7 +739,7 @@ async fn password_login(client: &Client, codecs: &mut LoginCodecs, password: &st
                 let (ticket, random) = tokio::select! {_ = cancel.cancelled()=>return Err(Error::Disconnected),answer=rx=>answer.map_err(|_|Error::Disconnected)?};
                 captcha = Some((ticket, random, sid));
             }
-            140022010 => return new_device_login(client, &codecs.nt, &result.jump_url).await,
+            140022010 => return new_device_login(client, &mut codecs.nt, &result.jump_url).await,
             140022011 => {
                 let signature = result
                     .unusual_signature
@@ -759,6 +797,54 @@ pub(crate) fn registration_confirmed(response: &auth::InfoSyncResponse) -> bool 
         .and_then(|p| p.message.as_deref())
         == Some("register success")
 }
+pub(crate) fn info_sync_for_config(
+    state: &SessionState,
+    reconnect: bool,
+    config: &ClientConfig,
+) -> Result<auth::InfoSyncRequest> {
+    if !state.profile.platform.is_ios() {
+        return Ok(info_sync(state, reconnect));
+    }
+    let device = config.ios_device.as_ref().ok_or_else(|| {
+        Error::Authentication("iOS registration requires actual IosDevice resources".into())
+    })?;
+    device.validate()?;
+    let resources = config.ios_registration.as_ref().ok_or_else(|| {
+        Error::Unsupported(
+            "iOS registration requires native initial/reconnect InfoSync resources, including GUID text, locale and notification settings".into(),
+        )
+    })?;
+    let mut request = if reconnect {
+        resources.reconnect.clone()
+    } else {
+        resources.initial.clone()
+    };
+    if request.sync_flag != Some(1759) {
+        return Err(Error::Unsupported(
+            "The shared InfoSync coordinator requires a native iOS template with sync_flag 1759"
+                .into(),
+        ));
+    }
+    let register = request
+        .register
+        .as_mut()
+        .ok_or_else(|| malformed("iOS InfoSync resource has no registration"))?;
+    if register.guid.as_deref().is_none_or(str::is_empty) {
+        return Err(malformed(
+            "iOS registration requires the native GUID string",
+        ));
+    }
+    register.version = Some(state.profile.version.clone());
+    register.device = Some(auth::RegisterDevice {
+        name: Some(state.keystore.device_name.clone()),
+        kernel: Some(device.hardware_model.clone()),
+        os_version: Some(device.system_version.clone()),
+        brand: Some("apple".into()),
+        os: Some(device.system_name.clone()),
+    });
+    Ok(request)
+}
+
 pub(crate) fn info_sync(state: &SessionState, reconnect: bool) -> auth::InfoSyncRequest {
     auth::InfoSyncRequest {
         sync_flag: Some(1759),
@@ -866,7 +952,7 @@ async fn new_device_request(
     };
     tokio::select! {_ = cancel.cancelled()=>Err(Error::Disconnected),result=request=>result}
 }
-async fn new_device_login(client: &Client, codec: &NtLogin, jump: &str) -> Result<()> {
+async fn new_device_login(client: &Client, codec: &mut NtLogin, jump: &str) -> Result<()> {
     let state = client.snapshot().await;
     let jump = reqwest::Url::parse(jump)
         .or_else(|_| reqwest::Url::parse(&format!("https://qq.com/?{jump}")))
@@ -934,6 +1020,86 @@ async fn new_device_login(client: &Client, codec: &NtLogin, jump: &str) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ios_registration_requires_explicit_resources_and_injects_actual_device_fields() {
+        for profile in [Profile::iphone(), Profile::ipad()] {
+            let state = SessionState {
+                profile: profile.clone(),
+                keystore: Keystore {
+                    device_name: "actual-device-name".into(),
+                    ..Default::default()
+                },
+                machine_id: "synthetic-machine".into(),
+                online: false,
+            };
+            let mut config = ClientConfig {
+                profile,
+                ios_device: Some(IosDevice {
+                    system_version: "18.1".into(),
+                    hardware_model: "actual-uname-machine".into(),
+                    system_name: "actual-system-name".into(),
+                }),
+                ..Default::default()
+            };
+            assert!(info_sync_for_config(&state, false, &config).is_err());
+            let template = |guid: &str, locale, notify| auth::InfoSyncRequest {
+                sync_flag: Some(1759),
+                register: Some(auth::RegisterInfo {
+                    guid: Some(guid.into()),
+                    locale: Some(locale),
+                    mute: Some(1),
+                    business: Some(auth::RegisterBusiness {
+                        notify_switch: Some(notify),
+                        message_switch: None,
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            config.ios_registration = Some(IosRegistration {
+                initial: template("native-guid-text", 1033, 1),
+                reconnect: template("native-reconnect-guid-text", 1028, 2),
+            });
+            for reconnect in [false, true] {
+                let request = info_sync_for_config(&state, reconnect, &config).unwrap();
+                let request: auth::InfoSyncRequest =
+                    proto::decode(Bytes::from(request.encode_to_vec())).unwrap();
+                let register = request.register.unwrap();
+                assert_eq!(
+                    register.guid.as_deref(),
+                    Some(if reconnect {
+                        "native-reconnect-guid-text"
+                    } else {
+                        "native-guid-text"
+                    })
+                );
+                assert_eq!(register.version.as_deref(), Some("9.3.75"));
+                assert_eq!(register.locale, Some(if reconnect { 1028 } else { 1033 }));
+                assert_eq!(register.mute, Some(1));
+                assert_eq!(
+                    register.business.unwrap().notify_switch,
+                    Some(if reconnect { 2 } else { 1 })
+                );
+                assert_eq!(
+                    register.device.unwrap(),
+                    auth::RegisterDevice {
+                        name: Some("actual-device-name".into()),
+                        kernel: Some("actual-uname-machine".into()),
+                        os_version: Some("18.1".into()),
+                        brand: Some("apple".into()),
+                        os: Some("actual-system-name".into()),
+                    }
+                );
+                assert!(register.flags.is_none());
+                assert!(register.vendor_type.is_none());
+            }
+            config.ios_registration.as_mut().unwrap().initial.sync_flag = Some(1);
+            assert!(info_sync_for_config(&state, false, &config).is_err());
+            config.ios_device = None;
+            assert!(info_sync_for_config(&state, true, &config).is_err());
+        }
+    }
     #[test]
     fn login_diagnostics_redact_urls_without_changing_the_server_context() {
         let original =
@@ -1019,28 +1185,6 @@ mod tests {
         let business = register.business.unwrap();
         assert_eq!(business.notify_switch, Some(0));
         assert_eq!(business.message_switch, Some(0));
-    }
-
-    #[test]
-    fn heartbeat_carries_previous_server_time_not_battery_status() {
-        let request = auth::HeartbeatRequest {
-            r#type: Some(1),
-            state: Some(auth::HeartbeatState {
-                status: Some(0),
-                field2: Some(0),
-            }),
-            local_silence: Some(0),
-            server_time: Some(4_000_000_001),
-        };
-        assert_eq!(
-            request.encode_to_vec(),
-            [
-                0x08, 1, 0x12, 4, 0x08, 0, 0x10, 0, 0x18, 0, 0x20, 0x81, 0xd0, 0xac, 0xf3, 0x0e
-            ],
-        );
-        let response: auth::HeartbeatResponse =
-            proto::decode(Bytes::from_static(&[0x18, 0xe8, 0x02])).unwrap();
-        assert_eq!(response.interval_seconds, Some(360));
     }
 
     fn qr_confirmation_payload(key: Option<&[u8]>) -> Bytes {

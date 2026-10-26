@@ -684,19 +684,50 @@ async fn background_peer_rotation_preserves_ack_and_applies_interval_at_next_wor
         body,
         &first_peer,
         b"before-rotation",
-        Some(pb::ChannelConfig { option2: 1, option4: 1, option6: 1, ..Default::default() }),
+        Some(pb::ChannelConfig {
+            option2: 1,
+            option4: 1,
+            option6: 1,
+            ..Default::default()
+        }),
         crate::o3::unix_seconds().unwrap() + 7200,
     );
-    client.receive(incoming(sequence, crate::o3::ESTABLISH_COMMAND, &reply, Some(&[0; 16])), 0).unwrap();
+    client
+        .receive(
+            incoming(
+                sequence,
+                crate::o3::ESTABLISH_COMMAND,
+                &reply,
+                Some(&[0; 16]),
+            ),
+            0,
+        )
+        .unwrap();
     let (sequence, heartbeat) = next_access(&client, &mut queue).await;
     assert_eq!(heartbeat.method.as_ref(), b"heartbeat");
     let tasks = pb::HeartbeatResponse {
         identifier: Bytes::from_static(b"rotation"),
         tasks: vec![
-            pb::HeartbeatTask { kind: 6, identifier: Bytes::from_static(b"interval"), payload: Bytes::copy_from_slice(&61u32.to_be_bytes()) },
-            pb::HeartbeatTask { kind: 9, identifier: Bytes::from_static(b"peer"), payload: Bytes::copy_from_slice(&encoded) },
-            pb::HeartbeatTask { kind: 7, identifier: Bytes::from_static(b"refresh"), ..Default::default() },
-            pb::HeartbeatTask { kind: 11, identifier: Bytes::from_static(b"calculation"), payload: Bytes::from_static(b"rotation payload") },
+            pb::HeartbeatTask {
+                kind: 6,
+                identifier: Bytes::from_static(b"interval"),
+                payload: Bytes::copy_from_slice(&61u32.to_be_bytes()),
+            },
+            pb::HeartbeatTask {
+                kind: 9,
+                identifier: Bytes::from_static(b"peer"),
+                payload: Bytes::copy_from_slice(&encoded),
+            },
+            pb::HeartbeatTask {
+                kind: 7,
+                identifier: Bytes::from_static(b"refresh"),
+                ..Default::default()
+            },
+            pb::HeartbeatTask {
+                kind: 11,
+                identifier: Bytes::from_static(b"calculation"),
+                payload: Bytes::from_static(b"rotation payload"),
+            },
         ],
     };
     answer_access(&client, sequence, &first_key, &tasks.encode_to_vec());
@@ -704,32 +735,83 @@ async fn background_peer_rotation_preserves_ack_and_applies_interval_at_next_wor
     assert_eq!(ack.method.as_ref(), b"taskAck");
     assert_eq!(ack.channel_uuid, first_uuid);
     let plain = crate::crypto::aes_gcm_decrypt(&ack.encrypted_body, &first_key).unwrap();
-    assert_eq!(pb::TaskAckRequest::decode(plain.as_slice()).unwrap().identifier.as_ref(), b"rotation");
+    assert_eq!(
+        pb::TaskAckRequest::decode(plain.as_slice())
+            .unwrap()
+            .identifier
+            .as_ref(),
+        b"rotation"
+    );
     let (sequence, body) = next_establish(&client, &mut queue).await;
     let request = pb::EstablishShareKeyRequest::decode(body.clone()).unwrap();
-    assert_eq!(request.key_identifier.as_ref(), hex::encode(encoded).as_bytes());
+    assert_eq!(
+        request.key_identifier.as_ref(),
+        hex::encode(encoded).as_bytes()
+    );
     let (reply, rotated_key, rotated_uuid) = establish_reply_with_config(
         body,
         &rotated_peer,
         b"after-rotation",
-        Some(pb::ChannelConfig { option2: 1, option4: 1, option6: 1, ..Default::default() }),
+        Some(pb::ChannelConfig {
+            option2: 1,
+            option4: 1,
+            option6: 1,
+            ..Default::default()
+        }),
         crate::o3::unix_seconds().unwrap() + 7200,
     );
-    client.receive(incoming(sequence, crate::o3::ESTABLISH_COMMAND, &reply, Some(&[0; 16])), 0).unwrap();
+    client
+        .receive(
+            incoming(
+                sequence,
+                crate::o3::ESTABLISH_COMMAND,
+                &reply,
+                Some(&[0; 16]),
+            ),
+            0,
+        )
+        .unwrap();
     let (report_sequence, report) = next_access(&client, &mut queue).await;
     assert_eq!(report.method.as_ref(), b"taskReport");
     assert_eq!(report.channel_uuid, rotated_uuid);
     let plain = crate::crypto::aes_gcm_decrypt(&report.encrypted_body, &rotated_key).unwrap();
     let report = pb::TaskReportRequest::decode(plain.as_slice()).unwrap();
-    assert_eq!(report.results.iter().map(|r| r.identifier.as_ref()).collect::<Vec<_>>(), [b"interval".as_slice(), b"peer".as_slice(), b"refresh".as_slice(), b"calculation".as_slice()]);
-    assert!(report.results[..3].iter().all(|result| result.body.is_empty()));
+    assert_eq!(
+        report
+            .results
+            .iter()
+            .map(|r| r.identifier.as_ref())
+            .collect::<Vec<_>>(),
+        [
+            b"interval".as_slice(),
+            b"peer".as_slice(),
+            b"refresh".as_slice(),
+            b"calculation".as_slice()
+        ]
+    );
+    assert!(
+        report.results[..3]
+            .iter()
+            .all(|result| result.body.is_empty())
+    );
     assert_eq!(report.results[3].body.len(), 215);
-    let empty = pb::HeartbeatResponse { identifier: Bytes::from_static(b"done"), ..Default::default() }.encode_to_vec();
+    let empty = pb::HeartbeatResponse {
+        identifier: Bytes::from_static(b"done"),
+        ..Default::default()
+    }
+    .encode_to_vec();
     answer_access(&client, ack_sequence, &first_key, &empty);
     answer_access(&client, report_sequence, &rotated_key, &empty);
     tokio::task::yield_now().await;
     assert_eq!(token(&client), b"after-rotation");
-    let deadline = client.inner.lock().unwrap().o3.heartbeat.deadline().unwrap();
+    let deadline = client
+        .inner
+        .lock()
+        .unwrap()
+        .o3
+        .heartbeat
+        .deadline()
+        .unwrap();
     tokio::time::pause();
     tokio::time::advance(deadline - Instant::now() - Duration::from_secs(1)).await;
     assert!(queue.try_recv().is_err());
@@ -744,11 +826,7 @@ async fn background_peer_rotation_preserves_ack_and_applies_interval_at_next_wor
     client.terminate("synthetic rotation regression complete".into());
 }
 
-fn blocked_calculation_runtime() -> (
-    tokio::runtime::Runtime,
-    oneshot::Sender<()>,
-    JoinHandle<()>,
-) {
+fn blocked_calculation_runtime() -> (tokio::runtime::Runtime, oneshot::Sender<()>, JoinHandle<()>) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .max_blocking_threads(1)
@@ -764,12 +842,7 @@ fn blocked_calculation_runtime() -> (
     (runtime, release, blocker)
 }
 
-async fn calculation_client() -> (
-    Arc<Client>,
-    mpsc::Receiver<Outgoing>,
-    [u8; 32],
-    i32,
-) {
+async fn calculation_client() -> (Arc<Client>, mpsc::Receiver<Outgoing>, [u8; 32], i32) {
     let (client, mut queue) = queued_client();
     let (public, peer) = peer();
     client.start_signing_work(0, crate::o3::Channel::with_peer(public));
@@ -833,7 +906,10 @@ fn blocked_task11_keeps_ack_signing_and_network_completion_live_until_ordered_re
         assert_eq!(ack.method.as_ref(), b"taskAck");
         let plain = crate::crypto::aes_gcm_decrypt(&ack.encrypted_body, &key).unwrap();
         assert_eq!(
-            pb::TaskAckRequest::decode(plain.as_slice()).unwrap().identifier.as_ref(),
+            pb::TaskAckRequest::decode(plain.as_slice())
+                .unwrap()
+                .identifier
+                .as_ref(),
             b"calculation-batch"
         );
         let (refresh_sequence, refresh) = next_access(&client, &mut queue).await;
@@ -862,11 +938,23 @@ fn blocked_task11_keeps_ack_signing_and_network_completion_live_until_ordered_re
         let report = pb::TaskReportRequest::decode(plain.as_slice()).unwrap();
         assert_eq!(report.identifier.as_ref(), b"calculation-batch");
         assert_eq!(
-            report.results.iter().map(|result| result.identifier.as_ref()).collect::<Vec<_>>(),
-            [b"calculation".as_slice(), b"refresh".as_slice(), b"interval".as_slice()]
+            report
+                .results
+                .iter()
+                .map(|result| result.identifier.as_ref())
+                .collect::<Vec<_>>(),
+            [
+                b"calculation".as_slice(),
+                b"refresh".as_slice(),
+                b"interval".as_slice()
+            ]
         );
         assert_eq!(report.results[0].body.len(), 215);
-        assert!(report.results[1..].iter().all(|result| result.body.is_empty()));
+        assert!(
+            report.results[1..]
+                .iter()
+                .all(|result| result.body.is_empty())
+        );
         answer_access(&client, sequence, &key, &[]);
         client.terminate("synthetic calculation concurrency complete".into());
     });
@@ -900,11 +988,20 @@ fn cancelled_or_stale_task11_cannot_publish_into_a_changed_session() {
             match replacement {
                 0 => {
                     bind(&client);
-                    client.inner.lock().unwrap().signer.refresh_token_task().unwrap();
+                    client
+                        .inner
+                        .lock()
+                        .unwrap()
+                        .signer
+                        .refresh_token_task()
+                        .unwrap();
                     client.signing_work.notify_one();
                     let (_, body) = next_establish(&client, &mut queue).await;
                     assert_eq!(
-                        pb::EstablishShareKeyRequest::decode(body).unwrap().method.as_ref(),
+                        pb::EstablishShareKeyRequest::decode(body)
+                            .unwrap()
+                            .method
+                            .as_ref(),
                         b"getToken"
                     );
                 }
@@ -920,13 +1017,22 @@ fn cancelled_or_stale_task11_cannot_publish_into_a_changed_session() {
                         let mut inner = client.inner.lock().unwrap();
                         inner.generation = 1;
                         inner.cancel = CancellationToken::new();
-                        inner.connection = Some(Connection { generation: 1, sender });
+                        inner.connection = Some(Connection {
+                            generation: 1,
+                            sender,
+                        });
                     }
                     queue = receiver;
                     let (public, _) = peer();
                     client.start_signing_work(1, crate::o3::Channel::with_peer(public));
                     client.mark_signing_ticket_complete().unwrap();
-                    client.inner.lock().unwrap().signer.refresh_token_task().unwrap();
+                    client
+                        .inner
+                        .lock()
+                        .unwrap()
+                        .signer
+                        .refresh_token_task()
+                        .unwrap();
                     client.signing_work.notify_one();
                     let (_, refresh) = next_access(&client, &mut queue).await;
                     assert_eq!(refresh.method.as_ref(), b"getToken");
@@ -937,7 +1043,9 @@ fn cancelled_or_stale_task11_cannot_publish_into_a_changed_session() {
             blocker.await.unwrap();
             tokio::task::spawn_blocking(|| ()).await.unwrap();
             assert!(
-                tokio::time::timeout(Duration::from_millis(100), queue.recv()).await.is_err(),
+                tokio::time::timeout(Duration::from_millis(100), queue.recv())
+                    .await
+                    .is_err(),
                 "stale task report escaped replacement {replacement}"
             );
             client.terminate("synthetic stale calculation complete".into());

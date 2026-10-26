@@ -122,16 +122,15 @@ impl Channel {
                 .expect("thirty-three bytes encode into sixty-six hex bytes");
             crypto::decode_peer(encoded)
         };
-        self.retired[self.next_retired] =
-            match std::mem::replace(&mut self.state, State::Vacant) {
-                State::Established(channel) => Some(Retired {
-                    key: channel.key,
-                    uuid: channel.uuid,
-                    parameter: channel.parameter,
-                    generation: self.generation,
-                }),
-                _ => None,
-            };
+        self.retired[self.next_retired] = match std::mem::replace(&mut self.state, State::Vacant) {
+            State::Established(channel) => Some(Retired {
+                key: channel.key,
+                uuid: channel.uuid,
+                parameter: channel.parameter,
+                generation: self.generation,
+            }),
+            _ => None,
+        };
         self.next_retired = (self.next_retired + 1) % self.retired.len();
         self.generation = self.generation.wrapping_add(1);
         self.peer = peer;
@@ -833,7 +832,10 @@ mod tests {
         assert_eq!(current.command, ESTABLISH_COMMAND);
         let current_uuid = current.uuid;
         let outer = pb::EstablishShareKeyRequest::decode(current.body.clone()).unwrap();
-        assert_eq!(outer.key_identifier.as_ref(), hex::encode(encoded).as_bytes());
+        assert_eq!(
+            outer.key_identifier.as_ref(),
+            hex::encode(encoded).as_bytes()
+        );
         assert_eq!(
             server_key(&replacement_key, &outer.client_public_key),
             current.key
@@ -954,7 +956,12 @@ mod tests {
         let inner = inner_response(&channel, &key, &current);
         let response = establish_response(&current, inner);
         assert_eq!(
-            channel.complete(current, response, 100).unwrap().config.unwrap().option6,
+            channel
+                .complete(current, response, 100)
+                .unwrap()
+                .config
+                .unwrap()
+                .option6,
             4
         );
     }

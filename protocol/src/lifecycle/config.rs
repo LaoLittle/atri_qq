@@ -89,7 +89,13 @@ pub(super) fn build(
         continuation: Some(pb::ConfigContinuation {
             last_index: Some(if exact || cold { -1 } else { 0 }),
         }),
-        fetch_type: Some(if exact { 2 } else if cold { 5 } else { 8 }),
+        fetch_type: Some(if exact {
+            2
+        } else if cold {
+            5
+        } else {
+            8
+        }),
         client: Some(pb::ConfigVersion {
             version: Some(profile.version.clone()),
         }),
@@ -235,7 +241,9 @@ pub(super) fn apply(state: &mut ConfigState, body: Bytes) -> Result<Option<i32>>
 fn apply_exact(state: &mut ConfigState, body: Bytes) -> Result<Option<i32>> {
     let response: pb::ConfigResponse = decode(body)?;
     if response.state.is_none() {
-        return Err(Error::Malformed("Configuration response has no server state".into()));
+        return Err(Error::Malformed(
+            "Configuration response has no server state".into(),
+        ));
     }
     let mut candidate = state.clone();
     let interval = apply_groups(&mut candidate, response.groups)?;
