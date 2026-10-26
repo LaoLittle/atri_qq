@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 mod club;
 pub(crate) mod config;
 pub(crate) mod maintenance;
+pub(crate) mod personal_events;
 pub(crate) mod status;
 
 const CLUB_DEFAULT_INTERVAL: Duration = Duration::from_secs(300);
@@ -18,6 +19,7 @@ pub(crate) async fn run(weak: Weak<Client>, generation: u64, cancel: Cancellatio
         run_config(weak.clone(), generation, cancel.clone()),
         status::run(weak.clone(), generation, cancel.clone()),
         run_network(weak.clone(), generation, cancel.clone()),
+        personal_events::run(weak.clone(), generation, cancel.clone()),
         maintenance::run(weak, generation, cancel),
     );
 }

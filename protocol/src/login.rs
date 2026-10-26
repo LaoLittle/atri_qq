@@ -733,19 +733,9 @@ async fn require_online(client: &Arc<Client>) -> Result<()> {
 }
 async fn online(client: &Arc<Client>, reconnect: bool) -> Result<bool> {
     let generation = client.connection_generation();
-    let state = client.snapshot().await;
-    let request_random = rand::random::<u32>() % (i32::MAX as u32);
-    client.guild_session.begin(generation, request_random);
-    let response = match client
-        .call(
-            "trpc.msg.register_proxy.RegisterProxy.SsoInfoSync",
-            info_sync(&state, reconnect, request_random),
-            Encryption::D2,
-        )
-        .await
-    {
-        Ok(p) => p,
-        Err(Error::Server { .. }) => {
+    let (binding, registration) = match client.start_message_sync(reconnect).await {
+        Ok(registration) => registration,
+        Err(Error::Authentication(_) | Error::Server { .. }) => {
             client.guild_session.close(generation);
             return Ok(false);
         }
@@ -754,33 +744,25 @@ async fn online(client: &Arc<Client>, reconnect: bool) -> Result<bool> {
             return Err(error);
         }
     };
-    let response: auth::InfoSyncResponse = proto::decode(response).inspect_err(|_| {
-        client.guild_session.close(generation);
-    })?;
-    if !registration_confirmed(&response) {
-        client.guild_session.close(generation);
-        return Ok(false);
-    }
-    client.confirm_online(generation)?;
-    let registration = response.register.as_ref().unwrap();
+    client.confirm_message_sync_online(&binding)?;
     client.start_heartbeat(
         registration.server_time.unwrap_or(0),
         registration.heartbeat_interval_seconds.unwrap_or(360),
     );
-    client.start_maintenance(generation)?;
+    client.start_maintenance(binding.generation)?;
     Ok(true)
 }
-fn registration_confirmed(response: &auth::InfoSyncResponse) -> bool {
+pub(crate) fn registration_confirmed(response: &auth::InfoSyncResponse) -> bool {
     response
         .register
         .as_ref()
         .and_then(|p| p.message.as_deref())
         == Some("register success")
 }
-fn info_sync(state: &SessionState, reconnect: bool, request_random: u32) -> Bytes {
+pub(crate) fn info_sync(state: &SessionState, reconnect: bool) -> auth::InfoSyncRequest {
     auth::InfoSyncRequest {
         sync_flag: Some(1759),
-        request_random: Some(request_random),
+        request_random: None,
         current_active_status: Some(2),
         group_last_message_time: Some(0),
         sync: Some(auth::SyncState {
@@ -833,8 +815,6 @@ fn info_sync(state: &SessionState, reconnect: bool, request_random: u32) -> Byte
         }),
         extension: Some(Bytes::new()),
     }
-    .encode_to_vec()
-    .into()
 }
 
 #[derive(Deserialize)]
@@ -1003,6 +983,7 @@ mod tests {
                 heartbeat_interval_seconds: Some(360),
                 field5: Some(40),
             }),
+            ..Default::default()
         }
         .encode_to_vec();
         response.extend_from_slice(&[0x20, 3, 0x30, 52, 0x48, 33, 0x80, 0x01, 1, 0x8a, 0x01, 0]);
@@ -1022,7 +1003,7 @@ mod tests {
             machine_id: "synthetic-machine".into(),
             online: false,
         };
-        let sync: auth::InfoSyncRequest = proto::decode(info_sync(&state, true, 7)).unwrap();
+        let sync = info_sync(&state, true);
         assert_eq!(sync.extension, Some(Bytes::new()));
         let guild_sync = sync.guild_sync.unwrap();
         assert_eq!(guild_sync.pull_scene, Some(2));

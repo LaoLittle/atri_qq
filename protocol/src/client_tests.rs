@@ -1871,3 +1871,192 @@ async fn canceled_file_transfer_acquisition_does_not_block_the_next_demand() {
     assert!(queue.try_recv().is_err());
     client.terminate("Synthetic file transfer scenario finished".into());
 }
+
+fn synchronized_message(group: Option<u64>, sequence: u64, time: u64) -> Bytes {
+    use crate::{messages::{MessageElement, encode_elements}, proto::messages as pb};
+    pb::CommonMessage {
+        routing_head: Some(pb::RoutingHead {
+            sender_uin: Some(7),
+            sender_uid: "u_synthetic_peer".into(),
+            group: group.map(|uin| pb::CommonGroup { uin: Some(uin), ..Default::default() }),
+            ..Default::default()
+        }),
+        content_head: Some(pb::ContentHead {
+            message_type: Some(if group.is_some() { 82 } else { 166 }),
+            sequence: Some(sequence),
+            client_sequence: Some(sequence + 1000),
+            time: Some(time),
+            ..Default::default()
+        }),
+        message_body: encode_elements(&[MessageElement::Text("ping".into())], &[]).unwrap().into(),
+    }.encode_to_vec().into()
+}
+
+#[tokio::test]
+async fn localhost_first_view_group_additional_and_partial_retry_consume_without_live_replay() {
+    use crate::{message_sync::{self as sync, Source}, proto::message_sync as pb};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut framed = Framed::new(socket, SsoFrameCodec);
+        let (sequence, command, body, _) = outgoing_d2(framed.next().await.unwrap().unwrap(), &[0; 16]);
+        assert_eq!(command, sync::INFO_COMMAND);
+        let request: auth::InfoSyncRequest = crate::proto::decode(body).unwrap();
+        assert_eq!(request.sync_flag, Some(1759));
+        assert!(request.register.is_some());
+        let random = request.request_random.unwrap();
+        let response = auth::InfoSyncResponse {
+            request_random: Some(random),
+            register: Some(auth::InfoSyncRegisterResponse { message: Some("register success".into()), ..Default::default() }),
+            ..Default::default()
+        };
+        framed.send(incoming(sequence, &command, &response.encode_to_vec(), Some(&[0; 16]))).await.unwrap();
+        let nodes = pb::InfoSyncPush {
+            request_random: Some(random),
+            stage: Some(5),
+            groups: vec![pb::GroupNode { group_uin: Some(55), message_seq: Some(120), total_seq: Some(140), message_time: Some(222), ..Default::default() }],
+            ..Default::default()
+        };
+        framed.send(incoming(-1, sync::INFO_PUSH, &nodes.encode_to_vec(), Some(&[0; 16]))).await.unwrap();
+        let first = pb::InfoSyncPush {
+            request_random: Some(random),
+            result: Some(0x05f5e3c0),
+            stage: Some(2),
+            c2c_messages: Some(pb::C2cMessages {
+                current_cookie: Some(Bytes::from_static(b"current\0opaque")),
+                previous_cookie: Some(Bytes::from_static(b"independent-previous")),
+                conversations: vec![pb::C2cConversation { last_message_time: Some(99999), messages: vec![synchronized_message(None, 1, 111)], ..Default::default() }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        framed.send(incoming(-2, sync::INFO_PUSH, &first.encode_to_vec(), Some(&[0; 16]))).await.unwrap();
+        let end = pb::InfoSyncPush { request_random: Some(random), stage: Some(4), ..Default::default() };
+        framed.send(incoming(-3, sync::INFO_PUSH, &end.encode_to_vec(), Some(&[0; 16]))).await.unwrap();
+        let (sequence, command, body, _) = outgoing_d2(framed.next().await.unwrap().unwrap(), &[0; 16]);
+        assert_eq!(command, sync::GROUP_COMMAND);
+        let request: pb::GroupSyncRequest = crate::proto::decode(body).unwrap();
+        assert_eq!(request.groups.len(), 1);
+        assert_eq!((request.groups[0].begin_seq, request.groups[0].end_seq), (Some(106), Some(120)));
+        let response = pb::GroupSyncResponse { request_random: request.request_random, ..Default::default() };
+        framed.send(incoming(sequence, &command, &response.encode_to_vec(), Some(&[0; 16]))).await.unwrap();
+        let group = pb::GroupMsgPush {
+            request_random: request.request_random,
+            flag: Some(2),
+            groups: vec![pb::GroupMessageResult { group_uin: Some(55), server_end_seq: Some(120), messages: vec![synchronized_message(Some(55), 119, 222)], ..Default::default() }],
+        };
+        framed.send(incoming(-4, sync::GROUP_PUSH, &group.encode_to_vec(), Some(&[0; 16]))).await.unwrap();
+        let (sequence, command, body, _) = outgoing_d2(framed.next().await.unwrap().unwrap(), &[0; 16]);
+        assert_eq!(command, sync::INFO_COMMAND);
+        let retry: auth::InfoSyncRequest = crate::proto::decode(body).unwrap();
+        assert_eq!(retry.sync_flag, Some(1));
+        assert!(retry.register.is_none());
+        assert_ne!(retry.request_random, Some(random));
+        assert_eq!(retry.group_last_message_time, Some(222));
+        let state = retry.sync.unwrap();
+        assert_eq!(state.current_cookie.as_deref(), Some(b"current\0opaque".as_slice()));
+        assert_eq!(state.previous_cookie.as_deref(), Some(b"independent-previous".as_slice()));
+        assert_eq!(state.last_message_time, Some(111));
+        let response = auth::InfoSyncResponse { request_random: retry.request_random, ..Default::default() };
+        framed.send(incoming(sequence, &command, &response.encode_to_vec(), Some(&[0; 16]))).await.unwrap();
+        let stale = pb::InfoSyncPush {
+            request_random: Some(random),
+            stage: Some(2),
+            c2c_messages: Some(pb::C2cMessages { current_cookie: Some(Bytes::from_static(b"stale")), conversations: vec![pb::C2cConversation { messages: vec![synchronized_message(None, 2, 999)], ..Default::default() }], ..Default::default() }),
+            ..Default::default()
+        };
+        framed.send(incoming(-5, sync::INFO_PUSH, &stale.encode_to_vec(), Some(&[0; 16]))).await.unwrap();
+        let complete = pb::InfoSyncPush { request_random: retry.request_random, stage: Some(4), ..Default::default() };
+        framed.send(incoming(-6, sync::INFO_PUSH, &complete.encode_to_vec(), Some(&[0; 16]))).await.unwrap();
+        assert!(framed.next().await.is_none());
+    });
+    let client = Client::new(ClientConfig { host: "127.0.0.1".into(), port, timeout: Duration::from_secs(5), ..Default::default() }, Keystore::default()).unwrap();
+    let mut changed = client.message_sync_changes();
+    client.connect().await.unwrap();
+    let (_, registration) = timeout(Duration::from_secs(5), client.start_message_sync(false)).await.unwrap().unwrap();
+    assert_eq!(registration.message.as_deref(), Some("register success"));
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let snapshot = client.message_sync_snapshot();
+            if snapshot.protocol_complete && snapshot.additional_complete && snapshot.sent_flag == 1 { break; }
+            changed.changed().await.unwrap();
+        }
+    }).await.unwrap();
+    let snapshot = client.message_sync_snapshot();
+    assert_eq!(snapshot.batches.len(), 2);
+    assert_eq!(snapshot.batches[0].source, Source::FirstView);
+    assert_eq!(snapshot.batches[1].source, Source::GroupAdditional);
+    assert_eq!(snapshot.batches.iter().map(|batch| batch.messages.len()).sum::<usize>(), 2);
+    assert_eq!(snapshot.checkpoint.c2c_last_message_time, 111);
+    assert_eq!(snapshot.checkpoint.group_last_message_time, 222);
+    assert_eq!(snapshot.checkpoint.groups[&55].received_message_seq, 119);
+    assert_eq!(snapshot.checkpoint.groups[&55].total_seq, 0);
+    let messaging = crate::messages::Messaging::new(client.clone(), Arc::new(crate::media::Media::new(client.clone())));
+    let events = messaging.decode_push(IncomingPacket { command: sync::INFO_PUSH.into(), sequence: -7, return_code: 0, body: pb::InfoSyncPush::default().encode_to_vec().into(), header: Default::default() }).await;
+    assert!(!events.iter().any(|event| matches!(event, crate::messages::PushEvent::Message { .. })));
+    let value = messaging.call("sync_snapshot", ciborium::Value::Null).await.unwrap();
+    let mut bytes = Vec::new();
+    ciborium::into_writer(&value, &mut bytes).unwrap();
+    let exposed: sync::Snapshot = ciborium::from_reader(bytes.as_slice()).unwrap();
+    assert_eq!(exposed.batches[0].source, Source::FirstView);
+    client.close_transport("Synthetic message synchronization finished".into()).await;
+    timeout(Duration::from_secs(3), server).await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn message_sync_retry_waits_weakly_and_identity_replacement_cancels_queued_work() {
+    let (client, mut queue) = queued_client();
+    let session = client.snapshot().await;
+    let (binding, action) = client.message_sync.begin(0, &session, &client.cancellation(), crate::login::info_sync(&session, false));
+    let request = client.message_sync.prepare(&binding, action).unwrap();
+    let actions = client.message_sync.direct(&binding, &request, Err(Error::Timeout));
+    client.spawn_message_sync_actions(binding, actions);
+    tokio::task::yield_now().await;
+    let mut replacement = session.clone();
+    replacement.keystore.uid = "u_synthetic_replacement".into();
+    client.replace_state(replacement).await;
+    tokio::time::advance(Duration::from_secs(4)).await;
+    tokio::task::yield_now().await;
+    assert!(queue.try_recv().is_err());
+    let session = client.snapshot().await;
+    let (binding, action) = client.message_sync.begin(0, &session, &client.cancellation(), crate::login::info_sync(&session, false));
+    let request = client.message_sync.prepare(&binding, action).unwrap();
+    let actions = client.message_sync.direct(&binding, &request, Err(Error::Timeout));
+    client.spawn_message_sync_actions(binding, actions);
+    tokio::task::yield_now().await;
+    let weak = Arc::downgrade(&client);
+    drop(client);
+    assert!(weak.upgrade().is_none());
+    assert!(queue.recv().await.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn kick_cancels_message_sync_retry_before_any_late_send_or_cookie_commit() {
+    let (client, mut queue) = queued_client();
+    let session = client.snapshot().await;
+    let (binding, action) = client.message_sync.begin(0, &session, &client.cancellation(), crate::login::info_sync(&session, false));
+    let request = client.message_sync.prepare(&binding, action).unwrap();
+    let actions = client.message_sync.direct(&binding, &request, Err(Error::Timeout));
+    client.spawn_message_sync_actions(binding.clone(), actions);
+    tokio::task::yield_now().await;
+    let kick = auth::Kick { message: Some("synthetic synchronization cancellation".into()), ..Default::default() };
+    client.receive(incoming(-1, "trpc.qq_new_tech.status_svc.StatusService.KickNT", &kick.encode_to_vec(), Some(&[0; 16])), 0).unwrap();
+    assert!(binding.cancel.is_cancelled());
+    let outgoing = queue.try_recv().unwrap();
+    let (_, command, _, _) = outgoing_d2(outgoing.frame, &[0; 16]);
+    assert_eq!(command, "trpc.qq_new_tech.status_svc.StatusService.UnRegister");
+    let crate::message_sync::Request::Info { body } = request else { panic!("expected InfoSync"); };
+    let late = crate::proto::message_sync::InfoSyncPush {
+        request_random: body.request_random, stage: Some(2),
+        c2c_messages: Some(crate::proto::message_sync::C2cMessages { current_cookie: Some(Bytes::from_static(b"late")), conversations: vec![crate::proto::message_sync::C2cConversation { messages: vec![synchronized_message(None, 1, 999)], ..Default::default() }], ..Default::default() }),
+        ..Default::default()
+    };
+    client.receive(incoming(-2, crate::message_sync::INFO_PUSH, &late.encode_to_vec(), Some(&[0; 16])), 0).unwrap();
+    tokio::time::advance(Duration::from_secs(4)).await;
+    tokio::task::yield_now().await;
+    assert!(queue.try_recv().is_err());
+    assert!(client.message_sync_snapshot().checkpoint.current_cookie.is_empty());
+    assert!(client.message_sync_snapshot().batches.is_empty());
+    client.terminate("Synthetic kick synchronization scenario finished".into());
+}

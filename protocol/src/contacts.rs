@@ -2,6 +2,8 @@ mod announcements;
 pub use announcements::{AnnouncementPicture, GroupAnnouncement};
 mod models;
 pub use models::*;
+pub(crate) mod robot_ranges;
+pub use robot_ranges::{RobotUinRange, RobotUinRangesCache, RobotUinRangesSnapshot};
 
 use crate::{
     Error, Result,

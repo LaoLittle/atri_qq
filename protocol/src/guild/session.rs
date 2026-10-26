@@ -51,6 +51,13 @@ impl Session {
         self.changed.send_replace(());
     }
 
+    pub(crate) fn set_request_random(&self, generation: u64, request_random: u32) {
+        let mut state = self.state.lock().unwrap();
+        if state.generation == Some(generation) {
+            state.request_random = request_random;
+        }
+    }
+
     pub(crate) fn ingest(&self, generation: u64, packet: &IncomingPacket) -> Result<()> {
         if packet.command != INFO_SYNC_PUSH && packet.command != PUSH_PARAMS {
             return Ok(());
@@ -69,8 +76,8 @@ impl Session {
             if !was_pending {
                 return Ok(());
             }
-            proto::decode::<proto::guild::InfoSyncPush>(packet.body.as_ref())
-                .and_then(|push| state.ingest_info(push))
+            proto::decode::<proto::message_sync::InfoSyncPush>(packet.body.as_ref())
+                .and_then(|push| state.ingest_info(&push))
         } else {
             proto::decode::<proto::guild::PushParams>(packet.body.as_ref()).and_then(|push| {
                 if let Some(enabled) = push.guild.and_then(|guild| guild.enabled) {
@@ -92,6 +99,17 @@ impl Session {
         if was_pending && (state.complete || state.error.is_some()) {
             self.changed.send_replace(());
         }
+        result
+    }
+
+    pub(crate) fn ingest_info_push(&self, generation: u64, push: &proto::message_sync::InfoSyncPush) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        if state.generation != Some(generation) || state.complete || state.error.is_some() {
+            return Ok(());
+        }
+        let result = state.ingest_info(push);
+        if let Err(error) = &result { state.error = Some(error.clone()); }
+        if state.complete || state.error.is_some() { self.changed.send_replace(()); }
         result
     }
 
@@ -168,12 +186,11 @@ impl State {
         }
     }
 
-    fn ingest_info(&mut self, push: proto::guild::InfoSyncPush) -> Result<()> {
+    fn ingest_info(&mut self, push: &proto::message_sync::InfoSyncPush) -> Result<()> {
         if push.request_random.unwrap_or_default() != self.request_random {
             return Ok(());
         }
-        check_result(push.result, push.error.as_deref(), "Guild synchronization")?;
-        let Some(guild) = push.guild else {
+        let Some(guild) = &push.guild else {
             return Ok(());
         };
         if let Some(result) = guild.result {
@@ -193,12 +210,12 @@ impl State {
         if matches!(push.stage, Some(3 | 4)) && self.initial_result != Some(1) {
             return Ok(());
         }
-        for node in guild.in_tab_nodes {
-            self.merge_node(&node)?;
+        for node in &guild.in_tab_nodes {
+            self.merge_node(node)?;
         }
-        if let Some(extra) = guild.extra {
-            for node in extra.normal_nodes {
-                self.merge_node(&node)?;
+        if let Some(extra) = &guild.extra {
+            for node in &extra.normal_nodes {
+                self.merge_node(node)?;
             }
         }
         if push.stage == Some(4) && self.initial_result == Some(1) {
@@ -248,20 +265,6 @@ fn decode_name(bytes: Bytes) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-fn check_result(result: Option<u32>, error: Option<&[u8]>, operation: &str) -> Result<()> {
-    let result = result.unwrap_or(0);
-    if result == 0 {
-        return Ok(());
-    }
-    let error = error.filter(|error| !error.is_empty());
-    Err(Error::Server {
-        code: result as i32,
-        message: error.map_or_else(
-            || format!("{operation} failed"),
-            |error| String::from_utf8_lossy(error).into_owned(),
-        ),
-    })
-}
 
 #[cfg(test)]
 mod tests {
@@ -286,7 +289,7 @@ mod tests {
     fn info(stage: u32, guild: Option<proto::guild::GuildFirstViewData>) -> IncomingPacket {
         packet(
             INFO_SYNC_PUSH,
-            proto::guild::InfoSyncPush {
+            proto::message_sync::InfoSyncPush {
                 stage: Some(stage),
                 request_random: Some(RANDOM),
                 guild,
@@ -466,7 +469,7 @@ mod tests {
                     GENERATION,
                     &packet(
                         INFO_SYNC_PUSH,
-                        proto::guild::InfoSyncPush {
+                        proto::message_sync::InfoSyncPush {
                             request_random,
                             result: Some(5),
                             stage: Some(1),
@@ -550,7 +553,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn transport_refusal_does_not_require_a_decodable_business_body() {
         let session = started();
-        let mut failed = packet(INFO_SYNC_PUSH, proto::guild::InfoSyncPush::default());
+        let mut failed = packet(INFO_SYNC_PUSH, proto::message_sync::InfoSyncPush::default());
         failed.body = bytes::Bytes::from_static(b"\x80");
         failed.return_code = 500;
         assert!(matches!(
@@ -572,7 +575,7 @@ mod tests {
                 GENERATION,
                 &packet(
                     INFO_SYNC_PUSH,
-                    proto::guild::InfoSyncPush {
+                    proto::message_sync::InfoSyncPush {
                         stage: Some(1),
                         guild: Some(proto::guild::GuildFirstViewData {
                             result: Some(6),
@@ -588,7 +591,7 @@ mod tests {
                 GENERATION,
                 &packet(
                     INFO_SYNC_PUSH,
-                    proto::guild::InfoSyncPush {
+                    proto::message_sync::InfoSyncPush {
                         stage: Some(4),
                         guild: Some(Default::default()),
                         ..Default::default()
@@ -600,32 +603,27 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn nonzero_response_status_is_terminal() {
-        for push in [proto::guild::InfoSyncPush {
-            result: Some(5),
-            guild: Some(initial()),
-            ..Default::default()
-        }] {
-            let session = started();
-            assert!(matches!(
-                session.ingest(
-                    GENERATION,
-                    &packet(
-                        INFO_SYNC_PUSH,
-                        proto::guild::InfoSyncPush {
-                            request_random: Some(RANDOM),
-                            stage: Some(1),
-                            ..push
-                        },
-                    ),
-                ),
-                Err(Error::Server { .. })
-            ));
-            assert!(matches!(
-                session.wait_ready(GENERATION, Duration::from_secs(1)).await,
-                Err(Error::Server { .. })
-            ));
-        }
+    async fn unrelated_partial_failure_does_not_terminate_guild() {
+        let session = started();
+        session.ingest(
+            GENERATION,
+            &packet(INFO_SYNC_PUSH, proto::message_sync::InfoSyncPush {
+                result: Some(0x05f5e3c0),
+                request_random: Some(RANDOM),
+                stage: Some(1),
+                guild: Some(proto::guild::GuildFirstViewData {
+                    in_tab_nodes: vec![node(55, Some("Synthetic guild"), &[(56, Some("General"), Some(1))])],
+                    ..initial()
+                }),
+                ..Default::default()
+            }),
+        ).unwrap();
+        session.ingest(GENERATION, &info(4, Some(Default::default()))).unwrap();
+        let snapshot = session.snapshot(GENERATION).unwrap();
+        assert_eq!(snapshot.guilds[0].id, 55);
+        assert_eq!(snapshot.guilds[0].name, "Synthetic guild");
+        assert_eq!(snapshot.guilds[0].channels[0].id, 56);
+        assert_eq!(snapshot.guilds[0].channels[0].name, "General");
     }
 
     #[tokio::test(start_paused = true)]

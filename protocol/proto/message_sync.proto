@@ -1,0 +1,90 @@
+syntax = "proto2";
+package atri.qq.message_sync;
+import "guild_sync.proto";
+
+message InfoSyncPush {
+  optional uint32 result = 1;
+  optional bytes error = 2;
+  optional uint32 stage = 3;
+  optional uint32 request_random = 4;
+  repeated GroupNode groups = 6;
+  optional GroupMessages group_messages = 7;
+  optional C2cMessages c2c_messages = 8;
+  optional atri.qq.guild.GuildFirstViewData guild = 9;
+  optional uint32 field_10 = 10;
+  optional bytes field_11 = 11;
+}
+message GroupNode {
+  optional uint64 group_uin = 1;
+  optional uint64 message_seq = 2;
+  optional uint64 read_seq = 3;
+  optional uint32 mask = 4;
+  optional uint64 message_time = 8;
+  optional bytes peer_name = 9;
+  optional uint32 field_10 = 10;
+  optional uint64 field_11 = 11;
+  optional bool all_message_expired = 12;
+  optional bool no_further_messages = 13;
+  optional uint64 service_max_event_seq = 14;
+  optional bool need_to_check_seq_on_aio_open = 15;
+  optional uint64 total_seq = 16;
+}
+message GroupMessages {
+  optional uint32 result = 1;
+  optional bytes error = 2;
+  repeated GroupMessageResult groups = 3;
+}
+message GroupMessageResult {
+  optional uint32 result = 1;
+  optional bytes error = 2;
+  optional uint64 group_uin = 3;
+  optional uint64 server_begin_seq = 4;
+  optional uint64 server_end_seq = 5;
+  repeated bytes messages = 6;
+  optional bool is_filtered = 7;
+}
+message C2cMessages {
+  optional uint32 result = 1;
+  optional bytes error = 2;
+  optional bytes current_cookie = 3;
+  repeated C2cConversation conversations = 4;
+  optional bytes previous_cookie = 5;
+  optional uint32 old_offline_message_flag = 6;
+}
+message C2cConversation {
+  optional uint64 peer_uin = 1;
+  optional bytes peer_uid = 2;
+  optional uint64 last_read_time = 3;
+  optional uint64 last_read_seq = 4;
+  optional uint64 last_message_time = 5;
+  optional uint64 last_message_seq = 6;
+  optional bool is_complete = 7;
+  repeated bytes messages = 8;
+  optional uint32 c2c_type = 9;
+  optional uint32 service_type = 10;
+  optional uint64 from_tiny_id = 11;
+  optional uint64 to_tiny_id = 12;
+}
+message GroupSyncRequest {
+  repeated GroupRange groups = 1;
+  optional uint32 request_random = 2;
+  optional uint32 field_3 = 3;
+}
+message GroupRange {
+  optional uint64 group_uin = 1;
+  optional uint64 begin_seq = 2;
+  optional uint64 end_seq = 3;
+  optional uint32 aio_message_count = 4;
+  optional uint64 end_total_seq = 5;
+  optional uint32 pull_system_message_count = 6;
+}
+message GroupSyncResponse {
+  optional uint32 result = 1;
+  optional bytes error = 2;
+  optional uint32 request_random = 3;
+}
+message GroupMsgPush {
+  optional uint32 flag = 1;
+  optional uint32 request_random = 2;
+  repeated GroupMessageResult groups = 3;
+}

@@ -15,6 +15,15 @@ impl ServerClock {
         self.unix_seconds_at(SystemTime::now())
     }
 
+    pub(crate) fn unix_millis(&self) -> Result<u64> {
+        let nanos = Self::wall_nanos(SystemTime::now()) + self.offset_nanos;
+        if nanos < 0 {
+            return Err(Error::Malformed("Server clock precedes Unix epoch".into()));
+        }
+        u64::try_from(nanos / 1_000_000)
+            .map_err(|_| Error::Malformed("Server clock exceeds u64 milliseconds".into()))
+    }
+
     fn unix_seconds_at(&self, wall_now: SystemTime) -> Result<u32> {
         let nanos = Self::wall_nanos(wall_now) + self.offset_nanos;
         if nanos < 0 {

@@ -1,0 +1,23 @@
+syntax = "proto2";
+package atri.qq.robot_ranges;
+
+message RobotUinRangeRequest {
+  optional uint32 just_fetch_msg_config = 5;
+  optional uint32 type = 6;
+  optional uint32 version = 7;
+  optional uint32 aio_keyword_version = 8;
+}
+
+message RobotUinRangeResponse {
+  optional RobotUinRangeConfig robot_config = 5;
+}
+
+message RobotUinRangeConfig {
+  optional uint32 version = 1;
+  repeated RobotUinRange ranges = 2;
+}
+
+message RobotUinRange {
+  optional uint64 min_uin = 1;
+  optional uint64 max_uin = 2;
+}

@@ -24,7 +24,10 @@ use tokio::{
 use tokio_util::{codec::Framed, sync::CancellationToken};
 
 mod file_transfer;
+mod message_sync;
 mod network;
+mod personal_events;
+mod robot_ranges;
 
 #[async_trait]
 pub trait ServiceClient: Send + Sync {
@@ -39,6 +42,9 @@ pub trait ServiceClient: Send + Sync {
     async fn snapshot(&self) -> SessionState;
     async fn replace_state(&self, state: SessionState);
     fn subscribe(&self) -> broadcast::Receiver<IncomingPacket>;
+    fn message_sync_snapshot(&self) -> Result<crate::message_sync::Snapshot> {
+        Err(Error::Unsupported("Message synchronization snapshots are unavailable".into()))
+    }
     async fn media_download_key(
         &self,
         _business_type: u32,
@@ -58,6 +64,7 @@ struct Pending {
     key: Vec<u8>,
     reply: oneshot::Sender<Result<Bytes>>,
     cancel: CancellationToken,
+    message_sync: Option<(Arc<crate::message_sync::Binding>, Arc<crate::message_sync::Request>)>,
 }
 enum RequestBinding<'a> {
     Connection(u64),
@@ -118,15 +125,19 @@ struct Inner {
     server_cursor: usize,
     file_transfer: credentials::file_transfer::Cache,
     file_transfer_worker: Option<Arc<credentials::file_transfer::Binding>>,
+    robot_ranges: crate::contacts::robot_ranges::State,
 }
 pub struct Client {
     pub(crate) config: ClientConfig,
     pub(crate) guild_session: Arc<crate::guild::Session>,
+    pub(crate) message_sync: Arc<crate::message_sync::Coordinator>,
+    pub(crate) personal_events: crate::personal_events::Coordinator,
     pub(crate) media_keys: Arc<crate::lifecycle::maintenance::Session>,
     inner: Mutex<Inner>,
     connect_gate: tokio::sync::Mutex<()>,
     friend_status_gate: tokio::sync::Mutex<()>,
     file_transfer_gate: tokio::sync::Mutex<()>,
+    robot_ranges_gate: tokio::sync::Mutex<()>,
     pub(crate) login_gate: tokio::sync::Mutex<()>,
     pub(crate) codecs: tokio::sync::Mutex<Option<login::LoginCodecs>>,
     pub(crate) captcha: Mutex<Option<oneshot::Sender<(String, String)>>>,
@@ -179,11 +190,14 @@ impl Client {
             keystore,
             online: false,
         };
-        let mut signer = SessionSigner::default();
+        let mut signer = SessionSigner::with_application_uuid(config.application_uuid.clone());
         signer.initialize(&state)?;
+        let guild_session = Arc::new(crate::guild::Session::default());
         Ok(Arc::new_cyclic(|weak| Self {
             config,
-            guild_session: Arc::new(crate::guild::Session::default()),
+            guild_session: guild_session.clone(),
+            message_sync: Arc::new(crate::message_sync::Coordinator::with_guild(guild_session.clone())),
+            personal_events: crate::personal_events::Coordinator::default(),
             media_keys: Arc::new(crate::lifecycle::maintenance::Session::default()),
             inner: Mutex::new(Inner {
                 state,
@@ -215,10 +229,12 @@ impl Client {
                 server_cursor: 0,
                 file_transfer: credentials::file_transfer::Cache::default(),
                 file_transfer_worker: None,
+                robot_ranges: crate::contacts::robot_ranges::State::default(),
             }),
             connect_gate: tokio::sync::Mutex::new(()),
             friend_status_gate: tokio::sync::Mutex::new(()),
             file_transfer_gate: tokio::sync::Mutex::new(()),
+            robot_ranges_gate: tokio::sync::Mutex::new(()),
             login_gate: tokio::sync::Mutex::new(()),
             codecs: tokio::sync::Mutex::new(None),
             captcha: Mutex::new(None),
@@ -254,6 +270,9 @@ impl Client {
         let account_changed = inner.state.keystore.uin != state.keystore.uin
             || inner.state.keystore.uid != state.keystore.uid;
         if account_changed {
+            self.message_sync.replace_identity(state.keystore.uin, &state.keystore.uid);
+            self.personal_events.replace_identity(state.keystore.uin, &state.keystore.uid);
+            inner.robot_ranges.clear();
             inner.ticket_refresh_failures = 0;
             inner.sso_configuration = None;
             inner.server_cursor = 0;
@@ -284,6 +303,8 @@ impl Client {
             if account_changed || !state.online {
                 inner.friend_statuses.clear();
                 self.guild_session.close(inner.generation);
+                self.message_sync.close(inner.generation);
+                self.personal_events.cancel();
                 self.media_keys.close(inner.generation);
                 inner.maintenance_cancel.cancel();
                 inner.maintenance_started = false;
@@ -320,8 +341,12 @@ impl Client {
             self.signing_work.notify_one();
         }
     }
+    #[cfg(test)]
     pub(crate) fn confirm_online(&self, generation: u64) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
+        self.confirm_online_locked(&mut inner, generation)
+    }
+    fn confirm_online_locked(&self, inner: &mut Inner, generation: u64) -> Result<()> {
         if inner.generation != generation
             || inner.connection.is_none()
             || inner.cancel.is_cancelled()
@@ -330,7 +355,7 @@ impl Client {
             return Err(Error::Disconnected);
         }
         if inner.state.keystore.uin != 0 {
-            let Inner { state, signer, .. } = &mut *inner;
+            let Inner { state, signer, .. } = inner;
             if let Err(error) = signer.business_session_started(state) {
                 tracing::warn!(%error, "O3 business session could not be bound");
             }
@@ -347,7 +372,7 @@ impl Client {
             &inner.state.keystore.uid,
             &cancel,
         );
-        Self::update_ticket_refresh_schedule(&mut inner);
+        Self::update_ticket_refresh_schedule(inner);
         self.emit(LoginEvent::Online {
             uin: inner.state.keystore.uin,
             uid: inner.state.keystore.uid.clone(),
@@ -667,6 +692,11 @@ impl Client {
             generation,
             cancel.clone(),
         ));
+        let robots = tokio::spawn(robot_ranges::run(
+            self.weak.clone(),
+            generation,
+            cancel.clone(),
+        ));
         let tickets = tokio::spawn(crate::ticket_refresh::run(
             self.weak.clone(),
             generation,
@@ -675,7 +705,7 @@ impl Client {
         self.tasks
             .lock()
             .unwrap()
-            .extend([refresh, lifecycle, tickets]);
+            .extend([refresh, lifecycle, tickets, robots]);
         Ok(())
     }
     fn credential_session(&self) -> Result<Arc<credentials::Session>> {
@@ -977,12 +1007,36 @@ impl Client {
                     message: extra,
                 })
             };
+            if let Some((binding, request)) = pending.message_sync {
+                let actions = self.message_sync.direct(&binding, &request, result);
+                let _ = pending.reply.send(Ok(Bytes::new()));
+                drop(i);
+                self.spawn_message_sync_actions(binding, actions);
+                return Ok(());
+            }
             let _ = pending.reply.send(result);
             return Ok(());
         }
+        let sync = if packet.return_code == 0 {
+            self.message_sync.ingest(generation, &i.state, &packet.command, packet.body.clone())
+        } else {
+            Ok((false, None, Vec::new()))
+        };
         drop(i);
-        if let Err(error) = self.guild_session.ingest(generation, &packet) {
-            tracing::warn!(%error, command = packet.command, "QQ guild synchronization push rejected");
+        match sync {
+            Ok((accepted, binding, actions)) => {
+                if accepted && packet.command != crate::message_sync::INFO_PUSH {
+                    if let Err(error) = self.guild_session.ingest(generation, &packet) {
+                        tracing::warn!(%error, command = packet.command, "QQ guild synchronization push rejected");
+                    }
+                }
+                if let Some(binding) = binding {
+                    self.spawn_message_sync_actions(binding, actions);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, command = packet.command, "QQ message synchronization push rejected");
+            }
         }
         if packet.return_code != 0 {
             return Err(Error::Server {
@@ -1062,6 +1116,8 @@ impl Client {
                 return Ok(());
             }
             inner.kick_reason = Some(reason);
+            self.message_sync.close(generation);
+            self.personal_events.cancel();
             inner.state.online = false;
             inner.signing_ready = false;
             inner.alive_cancel.cancel();
@@ -1326,6 +1382,7 @@ impl Client {
                     key,
                     reply: tx,
                     cancel: cancel.clone(),
+                    message_sync: None,
                 },
             );
             (sequence, id, sender, frame, cancel, rx)
@@ -1478,6 +1535,8 @@ impl Client {
             }
         }
         self.guild_session.close(generation);
+        self.message_sync.close(generation);
+        self.personal_events.cancel();
         self.media_keys.close(generation);
         self.captcha.lock().unwrap().take();
     }
@@ -2119,6 +2178,9 @@ impl ServiceClient for Client {
     }
     fn subscribe(&self) -> broadcast::Receiver<IncomingPacket> {
         Client::subscribe(self)
+    }
+    fn message_sync_snapshot(&self) -> Result<crate::message_sync::Snapshot> {
+        Ok(Client::message_sync_snapshot(self))
     }
     async fn media_download_key(
         &self,

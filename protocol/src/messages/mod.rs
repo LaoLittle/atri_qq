@@ -22,6 +22,7 @@ pub const MESSAGE_METHODS: &[&str] = &[
     "set_essence",
     "upload_forward",
     "download_forward",
+    "sync_snapshot",
 ];
 pub struct Messaging {
     client: Arc<dyn ServiceClient>,
@@ -684,7 +685,16 @@ impl Messaging {
         )
     }
     fn parse_message(&self, raw: &[u8], state: &SessionState) -> Result<Message> {
+        parse_common_message(raw, state)
+    }
+}
+
+pub(crate) fn parse_common_message(raw: &[u8], state: &SessionState) -> Result<Message> {
         let message: rpc::CommonMessage = decode(raw)?;
+        parse_decoded_common_message(raw, message, state)
+}
+
+pub(crate) fn parse_decoded_common_message(raw: &[u8], message: rpc::CommonMessage, state: &SessionState) -> Result<Message> {
         let routing = message.routing_head.ok_or_else(|| missing(1))?;
         let head = message.content_head.ok_or_else(|| missing(2))?;
         let sender_uin = routing.sender_uin.unwrap_or_default();
@@ -757,6 +767,7 @@ impl Messaging {
             raw: raw.to_vec(),
         })
     }
+impl Messaging {
     pub async fn call(&self, method: &str, args: ciborium::Value) -> Result<ciborium::Value> {
         match method {
             "send" => {
@@ -850,6 +861,7 @@ impl Messaging {
                 let a: A = from_args(args)?;
                 to_cbor(self.download_forward(&a.resource_id, a.is_group).await?)
             }
+            "sync_snapshot" => to_cbor(self.client.message_sync_snapshot()?),
             _ => Err(Error::Unsupported(format!(
                 "Unknown messaging method {method}"
             ))),

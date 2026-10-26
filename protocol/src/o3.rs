@@ -1,4 +1,4 @@
-use crate::{Error, Result, crypto as protocol_crypto, models::SessionState, proto};
+use crate::{Error, Result, models::SessionState, proto};
 use ::signing::token::{DeviceProperties, TokenError};
 use prost::Message;
 
@@ -65,46 +65,65 @@ pub fn validate_report_module_paths(paths: &[String]) -> Result<()> {
     Ok(())
 }
 
-pub fn local_device_properties(state: &SessionState) -> Result<DeviceProperties> {
-    if state.machine_id.is_empty() || state.machine_id.as_bytes().contains(&0) {
+pub fn generate_application_uuid() -> String {
+    let mut bytes = rand::random::<[u8; 16]>();
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let mut value = String::with_capacity(36);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for (index, byte) in bytes.into_iter().enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            value.push('-');
+        }
+        value.push(HEX[(byte >> 4) as usize] as char);
+        value.push(HEX[(byte & 15) as usize] as char);
+    }
+    value
+}
+
+fn normalize_local_text(mut value: Vec<u8>, padding: &[u8]) -> Vec<u8> {
+    if let (Some(first), Some(last)) = (
+        value.iter().position(|byte| !padding.contains(byte)),
+        value.iter().rposition(|byte| !padding.contains(byte)),
+    ) && last > first {
+        if first != 0 {
+            value.copy_within(first..=last, 0);
+        }
+        value.truncate(last - first + 1);
+    }
+    value
+}
+
+pub(crate) fn validate_local_identity(machine_id: &str) -> Result<()> {
+    if machine_id.is_empty() || machine_id.as_bytes().contains(&0) {
         return Err(Error::Malformed(
             "O3 requires a nonempty, NUL-free configured machine_id".into(),
         ));
     }
-    if state.keystore.guid.len() != 16 {
-        return Err(Error::Malformed(
-            "O3 local application UUID requires a sixteen-byte device GUID".into(),
-        ));
-    }
-    let mut properties: DeviceProperties = (0..=41).map(|id| (id, b"-1".to_vec())).collect();
-    properties.insert(0, b"5".to_vec());
-    properties.insert(16, state.machine_id.as_bytes().to_vec());
-    properties.insert(
-        25,
-        hex::encode(protocol_crypto::md5(state.machine_id.as_bytes())).into_bytes(),
-    );
-    let guid = hex::encode(&state.keystore.guid);
-    let uuid = format!(
-        "{}-{}-{}-{}-{}",
-        &guid[..8],
-        &guid[8..12],
-        &guid[12..16],
-        &guid[16..20],
-        &guid[20..]
-    );
-    properties.insert(39, uuid.into_bytes());
-    let hostname = if state.keystore.device_name.is_empty() {
-        "atri-local"
-    } else {
-        &state.keystore.device_name
-    };
-    if hostname.len() > 255 || hostname.as_bytes().contains(&0) {
-        return Err(Error::Malformed(
-            "O3 configured local hostname exceeds 255 bytes or contains NUL".into(),
-        ));
-    }
-    properties.insert(41, hostname.as_bytes().to_vec());
-    Ok(properties)
+    Ok(())
+}
+
+pub fn local_device_properties(machine_id: &str, application_uuid: &str) -> Result<DeviceProperties> {
+    validate_local_identity(machine_id)?;
+    let mut system_machine_id = std::fs::read("/etc/machine-id")
+        .ok()
+        .map(|value| normalize_local_text(value, b"\n\r\t "))
+        .filter(|value| !value.is_empty());
+    let mut hostname = hostname::get()
+        .ok()
+        .map(|value| normalize_local_text(value.into_encoded_bytes(), b"\r\n"))
+        .filter(|value| !value.is_empty());
+    Ok((0..=41).map(|id| {
+        let value = match id {
+            0 => b"5".to_vec(),
+            16 => machine_id.as_bytes().to_vec(),
+            24 if !application_uuid.is_empty() => application_uuid.as_bytes().to_vec(),
+            25 => system_machine_id.take().unwrap_or_else(|| b"-1".to_vec()),
+            41 => hostname.take().unwrap_or_else(|| b"-1".to_vec()),
+            _ => b"-1".to_vec(),
+        };
+        (id, value)
+    }).collect())
 }
 
 /// Validate resource bounds, not the truth or server acceptability of observations.

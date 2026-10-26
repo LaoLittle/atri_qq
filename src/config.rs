@@ -15,6 +15,7 @@ pub struct Config {
     pub uin: u64,
     pub password: String,
     pub machine_id: String,
+    pub application_uuid: String,
     pub qua: String,
     pub fresh_qr: bool,
     pub randomize_signature_for_testing: bool,
@@ -28,6 +29,7 @@ impl Default for Config {
             uin: 0,
             password: String::new(),
             machine_id: String::new(),
+            application_uuid: String::new(),
             qua: LINUX_QUA.into(),
             fresh_qr: false,
             randomize_signature_for_testing: false,
@@ -40,6 +42,7 @@ impl Default for Config {
 impl Config {
     pub async fn load(ctx: &Context) -> Result<Self, ApiError> {
         let mut config: Self = ctx.config().load_or_create(&Self::default()).await?;
+        let mut changed = false;
         if config.machine_id.is_empty() {
             let mut bytes = [0u8; 16];
             rand::rngs::SysRng
@@ -50,6 +53,13 @@ impl Config {
                 write!(&mut config.machine_id, "{byte:02x}")
                     .expect("writing to String cannot fail");
             }
+            changed = true;
+        }
+        if config.application_uuid.is_empty() {
+            config.application_uuid = atri_qq_protocol::o3::generate_application_uuid();
+            changed = true;
+        }
+        if changed {
             ctx.config().save(&config).await?;
         }
         if config.qua.is_empty() || config.timeout_seconds == 0 {
@@ -67,6 +77,7 @@ impl Config {
         ClientConfig {
             profile,
             machine_id: self.machine_id.clone(),
+            application_uuid: self.application_uuid.clone(),
             uin: self.uin,
             password: (!self.fresh_qr && !self.password.is_empty()).then(|| self.password.clone()),
             randomize_signature_for_testing: self.randomize_signature_for_testing,

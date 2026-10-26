@@ -49,6 +49,9 @@ message ContentHead {
   // Private server sequence (NT message sequence).
   optional uint64 client_sequence = 11;
   optional uint64 message_id = 12;
+  optional uint64 total_sequence = 29;
+  optional bool field_30 = 30;
+  optional uint64 field_31 = 31;
 }
 message MessageBody { bytes rich_text = 1; optional bytes content = 2; optional bytes encrypted_content = 3; }
 message RichText {

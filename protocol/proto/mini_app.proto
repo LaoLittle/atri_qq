@@ -1,0 +1,36 @@
+syntax = "proto2";
+package atri.qq.mini_app;
+
+message AdaptShareInfoRequest {
+  optional string sdk_id = 2;
+  optional ShareInfo body = 4;
+}
+
+message ShareInfo {
+  optional string app_id = 2;
+  optional string title = 3;
+  optional string description = 4;
+  optional uint32 scene = 6;
+  optional uint32 business_type = 8;
+  optional string picture_url = 9;
+  optional string jump_url = 11;
+  optional string icon_url = 12;
+  optional uint32 version_type = 13;
+  optional uint32 share_type = 14;
+  optional ShareTemplate template = 19;
+}
+
+message ShareTemplate {
+  optional string id = 1;
+  optional string data = 2;
+}
+
+message AdaptShareInfoResponse {
+  optional int32 code = 2;
+  optional string error_message = 3;
+  optional AdaptShareInfoContent content = 4;
+}
+
+message AdaptShareInfoContent {
+  optional string json = 2;
+}

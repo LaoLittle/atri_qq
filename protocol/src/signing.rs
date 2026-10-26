@@ -41,8 +41,6 @@ struct LocalDeviceIdentity {
     device_name: String,
 }
 
-/// Trusted external observations override the whole local map, never merge with it.
-/// None clears the override and restores the session's conservative local defaults.
 #[derive(Default)]
 pub struct SigningResources {
     pub properties: Option<DeviceProperties>,
@@ -50,7 +48,7 @@ pub struct SigningResources {
     pub report_module_paths: Option<Vec<String>>,
     report_resources_generation: u64,
     reports: VecDeque<SigningReport>,
-    local_properties: Option<DeviceProperties>,
+    application_uuid: String,
     local_identity: Option<LocalDeviceIdentity>,
     generation: u64,
 }
@@ -88,16 +86,21 @@ impl TokenResources for SigningResources {
         )))
     }
     fn collect_properties(&mut self) -> std::result::Result<DeviceProperties, TokenError> {
-        let properties = self
-            .properties
-            .as_ref()
-            .or(self.local_properties.as_ref())
-            .ok_or_else(|| TokenError::Resource {
+        let properties = if let Some(properties) = &self.properties {
+            properties.clone()
+        } else {
+            let identity = self.local_identity.as_ref().ok_or_else(|| TokenError::Resource {
                 operation: "collect_properties",
                 message: "O3 session device resources have not been initialized".into(),
             })?;
-        o3::validate_properties(properties)?;
-        Ok(properties.clone())
+            o3::local_device_properties(&identity.machine_id, &self.application_uuid)
+                .map_err(|_| TokenError::Resource {
+                    operation: "collect_properties",
+                    message: "O3 application machine identity is invalid".into(),
+                })?
+        };
+        o3::validate_properties(&properties)?;
+        Ok(properties)
     }
     fn send_report(
         &mut self,
@@ -151,19 +154,25 @@ pub struct SessionSigner {
 }
 impl Default for SessionSigner {
     fn default() -> Self {
+        Self::with_application_uuid(o3::generate_application_uuid())
+    }
+}
+impl SessionSigner {
+    pub(crate) fn with_application_uuid(application_uuid: String) -> Self {
         let mut signer = Signer::default();
         signer.initialize_desktop_resource();
         Self {
             signer,
-            resources: SigningResources::default(),
+            resources: SigningResources {
+                application_uuid,
+                ..Default::default()
+            },
             account: None,
             empty_token_reported: false,
             business_session_started: false,
             telemetry_deadline: None,
         }
     }
-}
-impl SessionSigner {
     pub fn requires_signature(command: &str) -> bool {
         commands::SIGNED_COMMANDS.contains(&command)
     }
@@ -189,13 +198,12 @@ impl SessionSigner {
                 .retain(|report| report.method != o3::REPORT_COMMAND);
         }
         if local_identity_changed {
-            let properties = o3::local_device_properties(state)?;
+            o3::validate_local_identity(&state.machine_id)?;
             let guid = state.keystore.guid.as_slice().try_into().map_err(|_| {
                 Error::Malformed(
-                    "O3 local application UUID requires a sixteen-byte device GUID".into(),
+                    "Signing context requires a sixteen-byte device GUID".into(),
                 )
             })?;
-            self.resources.local_properties = Some(properties);
             self.resources.local_identity = Some(LocalDeviceIdentity {
                 machine_id: state.machine_id.clone(),
                 guid,
@@ -761,49 +769,34 @@ mod tests {
         signer.initialize(&state).unwrap();
         assert_eq!(signer.resources.collect_properties().unwrap(), defaults);
     }
-    #[test]
-    fn local_property_challenges_follow_device_identity_updates() {
-        use prost::Message;
 
-        fn property(signer: &mut SessionSigner, id: i16) -> Vec<u8> {
-            let answer = signer.answer_property_challenge(&id.to_be_bytes()).unwrap();
+    #[test]
+    fn application_uuid_survives_account_and_guid_replacement() {
+        use prost::Message;
+        fn application_uuid(signer: &mut SessionSigner) -> Vec<u8> {
+            let answer = signer.answer_property_challenge(&24i16.to_be_bytes()).unwrap();
             signing_engine::proto::TokenReport::decode(answer.as_slice())
                 .unwrap()
                 .properties
-                .remove(0)
+                .into_iter()
+                .find(|property| property.id == 24)
+                .unwrap()
                 .value
         }
 
-        let mut signer = SessionSigner::default();
-        let mut state = state(1234);
-        signer.initialize(&state).unwrap();
-        state.machine_id = "updated-device-id".into();
-        signer.initialize(&state).unwrap();
-        assert_eq!(property(&mut signer, 16), b"updated-device-id");
-        state.keystore.guid.fill(0x22);
-        signer.initialize(&state).unwrap();
-        assert_eq!(
-            property(&mut signer, 39),
-            b"22222222-2222-2222-2222-222222222222"
+        let expected = b"00112233-4455-4677-8899-aabbccddeeff";
+        let mut signer = SessionSigner::with_application_uuid(
+            String::from_utf8(expected.to_vec()).unwrap(),
         );
-        state.keystore.device_name = "updated-device-name".into();
-        signer.initialize(&state).unwrap();
-        assert_eq!(property(&mut signer, 41), b"updated-device-name");
-        signer
-            .set_resources(
-                Some(DeviceProperties::from([(
-                    16,
-                    b"trusted-device-id".to_vec(),
-                )])),
-                None,
-                None,
-            )
-            .unwrap();
-        state.machine_id = "latest-device-id".into();
-        signer.initialize(&state).unwrap();
-        assert_eq!(property(&mut signer, 16), b"trusted-device-id");
-        signer.set_resources(None, None, None).unwrap();
-        assert_eq!(property(&mut signer, 16), b"latest-device-id");
+        let mut session = state(1234);
+        signer.sign("wtlogin.login", 1, b"first", &session, false).unwrap();
+        assert_eq!(application_uuid(&mut signer), expected);
+        session.keystore.uin = 5678;
+        session.keystore.guid.fill(0x22);
+        session.keystore.device_name = "replacement-device".into();
+        session.machine_id = "replacement-application-machine".into();
+        signer.sign("wtlogin.login", 2, b"second", &session, false).unwrap();
+        assert_eq!(application_uuid(&mut signer), expected);
     }
 
     #[test]

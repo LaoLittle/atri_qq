@@ -9,13 +9,6 @@ message GuildFirstViewRequest {
   optional uint64 last_msg_time = 1;
   optional uint64 last_pull_time = 2;
 }
-message InfoSyncPush {
-  optional uint32 result = 1;
-  optional bytes error = 2;
-  optional uint32 stage = 3;
-  optional uint32 request_random = 4;
-  optional GuildFirstViewData guild = 9;
-}
 message GuildFirstViewData {
   optional uint32 result = 1;
   optional bytes error = 2;

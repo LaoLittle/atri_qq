@@ -10,7 +10,7 @@ bytes = { version = "1", features = ["serde"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec", "rt"] }
 futures-util = { version = "0.3", features = ["sink"] }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_bytes = "0.11"
 serde_json = "1"
 ciborium = "0.2"
@@ -23,6 +23,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "s
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 webpki-roots = "1"
 rand = "0.10"
+hostname = "0.4"
 md-5 = "0.11"
 sha1 = "0.11"
 sha2 = "0.11"

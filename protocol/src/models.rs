@@ -53,6 +53,7 @@ impl Default for Profile {
 pub struct ClientConfig {
     pub profile: Profile,
     pub machine_id: String,
+    pub application_uuid: String,
     pub host: String,
     pub port: u16,
     pub server_selection: crate::network::ServerSelection,
@@ -66,6 +67,7 @@ impl std::fmt::Debug for ClientConfig {
         f.debug_struct("ClientConfig")
             .field("profile", &self.profile)
             .field("machine_id", &self.machine_id)
+            .field("application_uuid", &"<redacted>")
             .field("host", &self.host)
             .field("port", &self.port)
             .field("server_selection", &self.server_selection)
@@ -84,6 +86,7 @@ impl Default for ClientConfig {
         Self {
             profile: Profile::linux(),
             machine_id: hex::encode(random_bytes(16)),
+            application_uuid: crate::o3::generate_application_uuid(),
             host: "msfwifi.3g.qq.com".into(),
             port: 8080,
             server_selection: crate::network::ServerSelection::default(),
