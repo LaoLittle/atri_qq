@@ -1,0 +1,25 @@
+syntax = "proto2";
+package atri.qq.maintenance;
+
+import "media.proto";
+
+message DownloadKeyRequest {
+  optional atri.qq.media.MediaRequestHead head = 1;
+  optional DownloadKeyTypes download = 4;
+}
+message DownloadKeyTypes {
+  repeated uint32 types = 1 [packed = false];
+  optional uint32 trigger = 2;
+}
+message DownloadKeyResponse {
+  optional atri.qq.media.MediaRichResponseHead head = 1;
+  optional DownloadKeyResult download = 4;
+}
+message DownloadKeyResult { repeated DownloadKey keys = 1; }
+message DownloadKey {
+  optional string parameter = 1;
+  optional uint64 ttl_seconds = 2;
+  optional uint32 store_id = 3;
+  optional uint32 created_at = 4;
+  optional uint32 business_type = 5;
+}

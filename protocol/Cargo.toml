@@ -19,18 +19,21 @@ prost = "0.14"
 prost-reflect = "0.16.5"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-decode", "safe-encode"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-no-provider", "stream", "json", "multipart"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json", "multipart", "query"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 webpki-roots = "1"
-rand = "0.8"
-md-5 = "0.10"
-sha1 = "0.10"
-sha2 = "0.10"
-aes-gcm = "0.10"
+rand = "0.10"
+md-5 = "0.11"
+sha1 = "0.11"
+sha2 = "0.11"
+md4 = "0.11"
+sha3 = "0.12"
+crc32fast = "1"
+aes-gcm = "0.11"
 openssl = { version = "0.10", features = ["vendored"] }
 hex = "0.4"
-base64 = "0.22"
-quick-xml = "0.38"
+base64 = "0.23"
+quick-xml = "0.42"
 tracing = "0.1"
 signing = { package = "atri_qq_signing", path = "../signing" }
 atri_qq_silk = { path = "../silk" }
@@ -43,3 +46,4 @@ protoc-bin-vendored = "3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+rand_chacha = "0.10"

@@ -11,6 +11,7 @@ use prost::Message;
 #[derive(Clone, Copy)]
 pub(super) enum NtResponseKind {
     Easy,
+    Refresh,
     Password,
     NewDevice,
     PasswordVerification,
@@ -154,6 +155,7 @@ impl NtLogin {
         data: Bytes,
         store: &mut Keystore,
         kind: NtResponseKind,
+        generated_unix_seconds: u64,
     ) -> Result<NtResult> {
         let forward: auth::NtForward = proto::decode(data)?;
         let encrypted = forward
@@ -166,11 +168,13 @@ impl NtLogin {
         let head = common
             .head
             .ok_or_else(|| malformed("NT login response head missing"))?;
-        let body = common
-            .body
-            .ok_or_else(|| malformed("NT login response body missing"))?;
         let error = head.error.unwrap_or_default();
         let code = error.code.unwrap_or_default();
+        let body = match common.body {
+            Some(body) => body,
+            None if code != 0 && matches!(kind, NtResponseKind::Refresh) => Bytes::new(),
+            None => return Err(malformed("NT login response body missing")),
+        };
         let (tickets, account, unusual_signature, captcha_url) = match kind {
             NtResponseKind::Easy => {
                 let body: auth::NtEasyLoginResponseBody = proto::decode(body)?;
@@ -180,6 +184,10 @@ impl NtLogin {
                     body.protection.and_then(|p| p.signature),
                     None,
                 )
+            }
+            NtResponseKind::Refresh => {
+                let body: auth::NtRefreshTicketResponseBody = proto::decode(body)?;
+                (body.tickets, body.account, None, None)
             }
             NtResponseKind::Password => {
                 let body: auth::NtPasswordResponseBody = proto::decode(body)?;
@@ -200,14 +208,32 @@ impl NtLogin {
             }
         };
         let mut candidate = store.clone();
-        if let Some(cookie) = head.cookie.and_then(|p| p.cookie) {
-            candidate.login_cookie = cookie.to_vec()
+        if !matches!(kind, NtResponseKind::Refresh) {
+            if let Some(cookie) = head.cookie.and_then(|p| p.cookie) {
+                candidate.login_cookie = cookie.to_vec()
+            }
         }
         if code == 0 {
             let tickets =
                 tickets.ok_or_else(|| malformed("Successful NT response lacks tickets"))?;
-            Self::save(&tickets, &mut candidate)?;
-            if let Some(account) = account {
+            if matches!(kind, NtResponseKind::Refresh) {
+                if account.as_ref().is_some_and(|account| {
+                    account
+                        .uin
+                        .is_some_and(|uin| uin != 0 && uin != candidate.uin)
+                        || account.uid.as_ref().is_some_and(|uid| {
+                            !uid.is_empty() && !candidate.uid.is_empty() && uid != &candidate.uid
+                        })
+                }) {
+                    return Err(Error::Authentication(
+                        "NT ticket refresh belongs to another account".into(),
+                    ));
+                }
+                Self::save_refresh(&tickets, &mut candidate)?;
+            } else {
+                Self::save(&tickets, &mut candidate, generated_unix_seconds)?;
+            }
+            if let Some(account) = account.filter(|_| !matches!(kind, NtResponseKind::Refresh)) {
                 if let Some(uin) = account.uin.filter(|&uin| uin != 0) {
                     candidate.uin = uin
                 }
@@ -230,7 +256,7 @@ impl NtLogin {
             captcha_url,
         })
     }
-    fn save(t: &auth::NtTickets, k: &mut Keystore) -> Result<()> {
+    fn save(t: &auth::NtTickets, k: &mut Keystore, generated_unix_seconds: u64) -> Result<()> {
         let a1 =
             t.a1.as_ref()
                 .filter(|v| !v.is_empty())
@@ -293,7 +319,53 @@ impl NtLogin {
                 k.st_web = v.to_vec()
             }
         }
+        Self::save_times(t, k);
+        k.ticket_generated_unix_seconds = k
+            .nt_ticket_times
+            .and_then(|times| times.selected())
+            .map(|_| generated_unix_seconds);
         Ok(())
+    }
+
+    fn save_refresh(t: &auth::NtTickets, k: &mut Keystore) -> Result<()> {
+        let a1 =
+            t.a1.as_ref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| malformed("NT refresh A1 ticket missing"))?;
+        match (
+            t.d2.as_ref().filter(|value| !value.is_empty()),
+            t.d2_key.as_ref().filter(|value| !value.is_empty()),
+        ) {
+            (None, None) => {}
+            (Some(ticket), Some(key)) if key.len() == 16 => {
+                k.d2 = ticket.to_vec();
+                k.d2_key = key.to_vec();
+            }
+            _ => return Err(malformed("NT refresh D2 ticket/key pair is invalid")),
+        }
+        k.a1 = a1.to_vec();
+        if let Some(a2) = t.a2.as_ref().filter(|value| !value.is_empty()) {
+            k.a2 = a2.to_vec();
+        }
+        Self::save_times(t, k);
+        Ok(())
+    }
+
+    fn save_times(t: &auth::NtTickets, k: &mut Keystore) {
+        let values = |v: &auth::NtTicketTimeValues| NtTicketTimeValues {
+            raw_field1: v.raw_field1,
+            raw_field2: v.raw_field2,
+        };
+        k.nt_ticket_times = Some(NtTicketTimeMetadata {
+            field12: t.raw_time_field12.as_ref().map(values),
+            field16: t.raw_time_field16.as_ref().map(values),
+            received_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| {
+                    elapsed.as_millis().min(u64::MAX as u128) as u64
+                }),
+        });
+        k.wt_ticket_times = None;
     }
     pub fn password_a1(password_digest: &[u8; 16], state: &SessionState) -> Result<Bytes> {
         let k = &state.keystore;
@@ -306,7 +378,8 @@ impl NtLogin {
         key.bytes(password_digest);
         key.u64(k.uin);
         let mut tgtgt = [0; 16];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut tgtgt);
+        rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut tgtgt)
+            .map_err(|error| Error::Crypto(format!("Password login entropy: {error}")))?;
         let mut w = Writer::new();
         w.u16(4);
         w.u32(rand::random::<u32>() % (i32::MAX as u32));
@@ -332,6 +405,359 @@ impl NtLogin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn refresh_response(
+        store: &Keystore,
+        tickets: Option<auth::NtTickets>,
+        account: Option<auth::NtAccount>,
+        code: u64,
+    ) -> Bytes {
+        let common = auth::NtResponse {
+            head: Some(auth::NtResponseHead {
+                error: Some(auth::NtError {
+                    code: Some(code),
+                    ..Default::default()
+                }),
+                cookie: Some(auth::NtCookie {
+                    cookie: Some(Bytes::from_static(b"refresh-must-not-replace-login-cookie")),
+                }),
+            }),
+            body: (code == 0).then(|| {
+                auth::NtRefreshTicketResponseBody { tickets, account }
+                    .encode_to_vec()
+                    .into()
+            }),
+        };
+        auth::NtForward {
+            encrypted: Some(
+                crypto::aes_gcm_encrypt(&common.encode_to_vec(), &store.key_exchange_key)
+                    .unwrap()
+                    .into(),
+            ),
+            ..Default::default()
+        }
+        .encode_to_vec()
+        .into()
+    }
+
+    fn refresh_store() -> Keystore {
+        Keystore {
+            uin: 1234,
+            uid: "synthetic-refresh-identity".into(),
+            a1: b"previous-a1".to_vec(),
+            a2: b"retained-a2".to_vec(),
+            d2: b"retained-d2".to_vec(),
+            d2_key: vec![3; 16],
+            key_exchange_key: vec![42; 16],
+            login_cookie: b"retained-login-cookie".to_vec(),
+            wt_ticket_times: Some(WtTicketTimeMetadata {
+                next_refresh_unix_seconds: 604_900,
+                expire_unix_seconds: 2_592_100,
+            }),
+            ticket_generated_unix_seconds: Some(100),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn refresh_rotates_a1_and_time_without_dropping_omitted_transport_tickets() {
+        let codec = NtLogin::new().unwrap();
+        let mut store = refresh_store();
+        let retained = store.clone();
+        let response = refresh_response(
+            &store,
+            Some(auth::NtTickets {
+                a1: Some(Bytes::from_static(b"refreshed-a1")),
+                raw_time_field12: Some(auth::NtTicketTimeValues::default()),
+                raw_time_field16: Some(auth::NtTicketTimeValues {
+                    raw_field1: Some(2000),
+                    raw_field2: Some(3000),
+                }),
+                ..Default::default()
+            }),
+            None,
+            0,
+        );
+        codec.decode(response, &mut store, NtResponseKind::Refresh, 1_000)
+            .unwrap()
+            .require_success()
+            .unwrap();
+        assert_eq!(store.a1, b"refreshed-a1");
+        assert_eq!(store.a2, retained.a2);
+        assert_eq!(store.d2, retained.d2);
+        assert_eq!(store.d2_key, retained.d2_key);
+        assert_eq!(store.login_cookie, retained.login_cookie);
+        assert_eq!(store.wt_ticket_times, None);
+        assert_eq!(store.ticket_generated_unix_seconds, Some(100));
+        assert_eq!(store.next_ticket_refresh_unix_seconds(), Some(0));
+        assert_eq!(
+            store.nt_ticket_times.unwrap().next_refresh_unix_seconds(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn refresh_preserves_generation_without_inventing_missing_record_times() {
+        let codec = NtLogin::new().unwrap();
+        for generated in [None, Some(100)] {
+            let mut store = refresh_store();
+            store.ticket_generated_unix_seconds = generated;
+            for next in [Some(2_000), Some(3_000), None] {
+                let response = refresh_response(
+                    &store,
+                    Some(auth::NtTickets {
+                        a1: Some(Bytes::from_static(b"refreshed-a1")),
+                        raw_time_field16: next.map(|next| auth::NtTicketTimeValues {
+                            raw_field1: Some(next),
+                            raw_field2: Some(next + 1),
+                        }),
+                        ..Default::default()
+                    }),
+                    None,
+                    0,
+                );
+                codec.decode(response, &mut store, NtResponseKind::Refresh, 9_000)
+                    .unwrap()
+                    .require_success()
+                    .unwrap();
+                assert_eq!(store.ticket_generated_unix_seconds, generated);
+                assert_eq!(store.wt_ticket_times, None);
+                assert_eq!(store.next_ticket_refresh_unix_seconds(), next);
+            }
+        }
+    }
+
+    #[test]
+    fn refresh_rejects_incomplete_transport_keys_or_another_account_atomically() {
+        let codec = NtLogin::new().unwrap();
+        let mut store = refresh_store();
+        let retained = store.clone();
+        for (key_length, account) in [
+            (15, None),
+            (
+                16,
+                Some(auth::NtAccount {
+                    uin: Some(5678),
+                    ..Default::default()
+                }),
+            ),
+            (
+                16,
+                Some(auth::NtAccount {
+                    uid: Some("another-synthetic-identity".into()),
+                    ..Default::default()
+                }),
+            ),
+        ] {
+            let response = refresh_response(
+                &store,
+                Some(auth::NtTickets {
+                    a1: Some(Bytes::from_static(b"refreshed-a1")),
+                    d2: Some(Bytes::from_static(b"refreshed-d2")),
+                    d2_key: Some(vec![9; key_length].into()),
+                    ..Default::default()
+                }),
+                account,
+                0,
+            );
+            assert!(
+                codec
+                    .decode(response, &mut store, NtResponseKind::Refresh, 1_000)
+                    .is_err()
+            );
+            assert!(store == retained);
+        }
+        let response = refresh_response(
+            &store,
+            Some(auth::NtTickets {
+                a1: Some(Bytes::from_static(b"refreshed-a1")),
+                a2: Some(Bytes::from_static(b"refreshed-a2")),
+                d2: Some(Bytes::from_static(b"refreshed-d2")),
+                d2_key: Some(vec![9; 16].into()),
+                ..Default::default()
+            }),
+            Some(auth::NtAccount {
+                uin: Some(retained.uin),
+                uid: Some(retained.uid.clone()),
+                ..Default::default()
+            }),
+            0,
+        );
+        codec.decode(response, &mut store, NtResponseKind::Refresh, 1_000)
+            .unwrap()
+            .require_success()
+            .unwrap();
+        assert_eq!(store.a1, b"refreshed-a1");
+        assert_eq!(store.a2, b"refreshed-a2");
+        assert_eq!(store.d2, b"refreshed-d2");
+        assert_eq!(store.d2_key, [9; 16]);
+        assert_eq!(store.login_cookie, retained.login_cookie);
+    }
+
+    #[test]
+    fn rejected_refresh_without_body_does_not_change_live_tickets_or_challenge_cookie() {
+        let codec = NtLogin::new().unwrap();
+        let mut store = refresh_store();
+        let retained = store.clone();
+        let response = refresh_response(&store, None, None, 140022015);
+        let result = codec.decode(response, &mut store, NtResponseKind::Refresh, 1_000)
+            .unwrap();
+        assert_eq!(result.code, 140022015);
+        assert!(store == retained);
+    }
+
+    fn time_metadata_response(
+        store: &Keystore,
+        field12: Option<auth::NtTicketTimeValues>,
+        field16: Option<auth::NtTicketTimeValues>,
+        key_length: usize,
+        code: u64,
+    ) -> Bytes {
+        let common = auth::NtResponse {
+            head: Some(auth::NtResponseHead {
+                error: Some(auth::NtError {
+                    code: Some(code),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            body: Some(
+                auth::NtEasyLoginResponseBody {
+                    tickets: Some(auth::NtTickets {
+                        a1: Some(Bytes::from_static(b"synthetic-a1")),
+                        a2: Some(Bytes::from_static(b"synthetic-a2")),
+                        d2: Some(Bytes::from_static(b"synthetic-d2")),
+                        d2_key: Some(vec![7; key_length].into()),
+                        raw_time_field12: field12,
+                        raw_time_field16: field16,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }
+                .encode_to_vec()
+                .into(),
+            ),
+        };
+        auth::NtForward {
+            encrypted: Some(
+                crypto::aes_gcm_encrypt(&common.encode_to_vec(), &store.key_exchange_key)
+                    .unwrap()
+                    .into(),
+            ),
+            ..Default::default()
+        }
+        .encode_to_vec()
+        .into()
+    }
+
+    #[test]
+    fn authenticated_ticket_rotation_selects_present_field12_without_merging_field16() {
+        let codec = NtLogin::new().unwrap();
+        let mut store = Keystore {
+            key_exchange_key: vec![42; 16],
+            wt_ticket_times: Some(WtTicketTimeMetadata {
+                next_refresh_unix_seconds: 604_900,
+                expire_unix_seconds: 2_592_100,
+            }),
+            ticket_generated_unix_seconds: Some(100),
+            ..Default::default()
+        };
+        let field16 = auth::NtTicketTimeValues {
+            raw_field1: Some(1601),
+            raw_field2: Some(1602),
+        };
+        for field12 in [
+            None,
+            Some(auth::NtTicketTimeValues::default()),
+            Some(auth::NtTicketTimeValues {
+                raw_field1: Some(0),
+                raw_field2: None,
+            }),
+        ] {
+            let response =
+                time_metadata_response(&store, field12.clone(), Some(field16.clone()), 16, 0);
+            codec.decode(response, &mut store, NtResponseKind::Easy, 1_000)
+                .unwrap()
+                .require_success()
+                .unwrap();
+            let times = store.nt_ticket_times.unwrap();
+            assert_eq!(store.wt_ticket_times, None);
+            assert_eq!(store.ticket_generated_unix_seconds, Some(1_000));
+            assert_eq!(
+                store.next_ticket_refresh_unix_seconds(),
+                times.next_refresh_unix_seconds(),
+            );
+            assert_eq!(times.field12.is_some(), field12.is_some());
+            assert_eq!(
+                times.next_refresh_unix_seconds(),
+                Some(if field12.is_some() { 0 } else { 1601 })
+            );
+            assert_eq!(
+                times.selected(),
+                Some(match field12 {
+                    Some(v) => NtTicketTimeValues {
+                        raw_field1: v.raw_field1,
+                        raw_field2: v.raw_field2,
+                    },
+                    None => NtTicketTimeValues {
+                        raw_field1: Some(1601),
+                        raw_field2: Some(1602),
+                    },
+                })
+            );
+            assert!(times.received_unix_ms > 0);
+            let restored: Keystore =
+                serde_json::from_slice(&serde_json::to_vec(&store).unwrap()).unwrap();
+            assert_eq!(restored.nt_ticket_times, Some(times));
+        }
+        let response = time_metadata_response(&store, None, None, 16, 0);
+        codec.decode(response, &mut store, NtResponseKind::Easy, 1_000)
+            .unwrap();
+        assert_eq!(store.ticket_generated_unix_seconds, None);
+        assert_eq!(store.wt_ticket_times, None);
+        assert_eq!(store.next_ticket_refresh_unix_seconds(), None);
+        assert_eq!(store.nt_ticket_times.unwrap().selected(), None);
+        assert_eq!(
+            store.nt_ticket_times.unwrap().next_refresh_unix_seconds(),
+            None
+        );
+    }
+
+    #[test]
+    fn rejected_or_invalid_ticket_rotation_never_publishes_new_time_metadata() {
+        let codec = NtLogin::new().unwrap();
+        let mut store = Keystore {
+            key_exchange_key: vec![42; 16],
+            nt_ticket_times: Some(NtTicketTimeMetadata {
+                field12: None,
+                field16: Some(NtTicketTimeValues {
+                    raw_field1: Some(16),
+                    raw_field2: None,
+                }),
+                received_unix_ms: 1,
+            }),
+            ticket_generated_unix_seconds: Some(100),
+            ..Default::default()
+        };
+        let retained = store.clone();
+        for (key_length, code) in [(15, 0), (16, 140022008)] {
+            let response = time_metadata_response(
+                &store,
+                Some(auth::NtTicketTimeValues::default()),
+                None,
+                key_length,
+                code,
+            );
+            let result = codec.decode(response, &mut store, NtResponseKind::Easy, 1_000);
+            if code == 0 {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result.unwrap().code, code);
+            }
+            assert!(store == retained);
+        }
+    }
+
     #[test]
     fn nt_ticket_decryption_is_authenticated_and_transactional() {
         let codec = NtLogin::new().unwrap();
@@ -368,7 +794,7 @@ mod tests {
         }
         .encode_to_vec()
         .into();
-        assert!(codec.decode(forward, &mut k, NtResponseKind::Easy).is_err());
+        assert!(codec.decode(forward, &mut k, NtResponseKind::Easy, 1_000).is_err());
         assert!(k == old);
         let forward = auth::NtForward {
             encrypted: Some(Bytes::from_static(&[0; 28])),
@@ -376,7 +802,7 @@ mod tests {
         }
         .encode_to_vec()
         .into();
-        assert!(codec.decode(forward, &mut k, NtResponseKind::Easy).is_err());
+        assert!(codec.decode(forward, &mut k, NtResponseKind::Easy, 1_000).is_err());
         assert!(k == old);
     }
 
@@ -418,8 +844,7 @@ mod tests {
                 ),
                 ..Default::default()
             };
-            let result = codec
-                .decode(response.encode_to_vec().into(), &mut store, kind)
+            let result = codec.decode(response.encode_to_vec().into(), &mut store, kind, 1_000)
                 .unwrap();
             assert_eq!(result.code, code);
             assert_eq!(store.a1, b"retained-a1");
@@ -430,12 +855,9 @@ mod tests {
                 machine_id: "synthetic-machine".into(),
                 online: false,
             };
-            let request: auth::NtForward = proto::decode(
-                codec
-                    .encode(&auth::NtLoginBody::default(), &state)
-                    .unwrap(),
-            )
-            .unwrap();
+            let request: auth::NtForward =
+                proto::decode(codec.encode(&auth::NtLoginBody::default(), &state).unwrap())
+                    .unwrap();
             let clear = crypto::aes_gcm_decrypt(
                 &request.encrypted.unwrap(),
                 &state.keystore.key_exchange_key,
@@ -494,12 +916,7 @@ mod tests {
             ),
             ..Default::default()
         };
-        codec
-            .decode(
-                response.encode_to_vec().into(),
-                &mut store,
-                NtResponseKind::Easy,
-            )
+        codec.decode(response.encode_to_vec().into(), &mut store, NtResponseKind::Easy, 1_000)
             .unwrap()
             .require_success()
             .unwrap();
@@ -663,12 +1080,7 @@ mod tests {
             ticket: None,
             r#type: None,
         };
-        let result = codec
-            .decode(
-                forward.encode_to_vec().into(),
-                &mut store,
-                NtResponseKind::Easy,
-            )
+        let result = codec.decode(forward.encode_to_vec().into(), &mut store, NtResponseKind::Easy, 1_000)
             .unwrap();
         assert_eq!(result.code, 140022011);
         assert!(result.require_success().is_err());
@@ -716,12 +1128,7 @@ mod tests {
             ),
             ..Default::default()
         };
-        let result = codec
-            .decode(
-                forward.encode_to_vec().into(),
-                &mut store,
-                NtResponseKind::Easy,
-            )
+        let result = codec.decode(forward.encode_to_vec().into(), &mut store, NtResponseKind::Easy, 1_000)
             .unwrap();
         assert_eq!(result.code, 140022015);
         assert!(result.unusual_signature.is_none());
@@ -783,8 +1190,7 @@ mod tests {
             ..Default::default()
         }
         .encode_to_vec();
-        codec
-            .decode(forward.into(), &mut k, NtResponseKind::Password)
+        codec.decode(forward.into(), &mut k, NtResponseKind::Password, 1_000)
             .unwrap()
             .require_success()
             .unwrap();
@@ -868,12 +1274,7 @@ mod tests {
             ..Default::default()
         }
         .encode_to_vec();
-        codec
-            .decode(
-                forward.into(),
-                &mut store,
-                NtResponseKind::PasswordVerification,
-            )
+        codec.decode(forward.into(), &mut store, NtResponseKind::PasswordVerification, 1_000)
             .unwrap()
             .require_success()
             .unwrap();

@@ -517,3 +517,35 @@ async fn video_downloads_use_the_companion_index_without_rewriting_the_requested
         }
     }
 }
+
+#[test]
+fn image_rkeys_are_scoped_to_authenticated_nt_image_urls() {
+    let key = MediaDownloadKey {
+        business_type: 10,
+        store_id: 1,
+        parameter: "&rkey=synthetic-direct".into(),
+        created_at: 100,
+        ttl_seconds: 3420,
+    };
+    let url = reqwest::Url::parse("https://multimedia.nt.qq.com.cn/download?appid=1406&fileid=synthetic&spec=0&rkey=stale").unwrap();
+    let authorized = authorize_image_url(url, &key).unwrap();
+    let authorized = reqwest::Url::parse(&authorized).unwrap();
+    assert_eq!(authorized.query_pairs().filter(|(name, _)| name == "rkey").count(), 1);
+    assert_eq!(authorized.query_pairs().find(|(name, _)| name == "rkey").unwrap().1, "synthetic-direct");
+    assert_eq!(authorized.query_pairs().find(|(name, _)| name == "spec").unwrap().1, "0");
+    for raw in [
+        "https://media.example/download?appid=1406&fileid=synthetic",
+        "http://multimedia.nt.qq.com.cn/download?appid=1406&fileid=synthetic",
+        "https://multimedia.nt.qq.com.cn:444/download?appid=1406&fileid=synthetic",
+        "https://multimedia.nt.qq.com.cn/other?appid=1406&fileid=synthetic",
+        "https://multimedia.nt.qq.com.cn/download?appid=1406&appid=1407&fileid=synthetic",
+        "https://multimedia.nt.qq.com.cn/download?appid=1406",
+    ] {
+        let url = reqwest::Url::parse(raw).unwrap();
+        assert!(image_key_type(&url).is_none());
+        assert!(authorize_image_url(url, &key).is_err());
+    }
+    let wrong_business = reqwest::Url::parse("https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=synthetic").unwrap();
+    assert!(authorize_image_url(wrong_business, &key).is_err());
+}
+

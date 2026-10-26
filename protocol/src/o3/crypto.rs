@@ -4,7 +4,7 @@ use crate::{
 };
 use aes_gcm::{
     Aes256Gcm, Nonce, Tag,
-    aead::{AeadInPlace, KeyInit},
+    aead::{AeadInOut, KeyInit},
 };
 use bytes::Bytes;
 use openssl::{
@@ -16,7 +16,7 @@ use openssl::{
     pkey::Id,
     pkey_ctx::PkeyCtx,
 };
-use rand::{RngCore, rngs::OsRng};
+use rand::{TryRng, rngs::SysRng};
 use std::cmp::Ordering;
 
 pub(super) const PEER_PUBLIC_KEY: [u8; 33] = [
@@ -127,7 +127,7 @@ pub(super) fn authenticate(
 
 pub(super) fn seal(key: &[u8; 32], plain: &[u8]) -> Result<Bytes> {
     let mut nonce = [0u8; 12];
-    OsRng.try_fill_bytes(&mut nonce).map_err(crypto_error)?;
+    SysRng.try_fill_bytes(&mut nonce).map_err(crypto_error)?;
     seal_with_nonce(key, plain, &nonce)
 }
 
@@ -141,7 +141,7 @@ fn seal_with_nonce(key: &[u8; 32], plain: &[u8], nonce: &[u8; 12]) -> Result<Byt
     encrypted.extend_from_slice(plain);
     let cipher = Aes256Gcm::new(key.into());
     let tag = cipher
-        .encrypt_in_place_detached(Nonce::from_slice(nonce), &[], &mut encrypted[12..])
+        .encrypt_inout_detached(nonce.into(), &[], (&mut encrypted[12..]).into())
         .map_err(|_| crypto_error("O3 AES-GCM encryption failed"))?;
     encrypted.extend_from_slice(&tag);
     Ok(encrypted.into())
@@ -152,13 +152,15 @@ pub(super) fn open(key: &[u8; 32], encrypted: &[u8]) -> Result<Bytes> {
         return Err(crypto_error("Truncated O3 AES-GCM nonce/ciphertext/tag"));
     }
     let end = encrypted.len() - 16;
+    let nonce: &Nonce<_> = (&encrypted[..12]).try_into().map_err(crypto_error)?;
+    let tag: &Tag = (&encrypted[end..]).try_into().map_err(crypto_error)?;
     let mut plain = encrypted[12..end].to_vec();
     Aes256Gcm::new(key.into())
-        .decrypt_in_place_detached(
-            Nonce::from_slice(&encrypted[..12]),
+        .decrypt_inout_detached(
+            nonce,
             &[],
-            &mut plain,
-            Tag::from_slice(&encrypted[end..]),
+            plain.as_mut_slice().into(),
+            tag,
         )
         .map_err(|_| crypto_error("Invalid O3 AES-GCM authentication tag"))?;
     Ok(plain.into())

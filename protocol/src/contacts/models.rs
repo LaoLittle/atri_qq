@@ -36,6 +36,23 @@ pub struct Friend {
     pub category: Option<FriendCategory>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FriendStatus {
+    pub status: Option<u32>,
+    pub reported_status: Option<u32>,
+    pub extended_status: Option<u32>,
+    pub battery_status: Option<u32>,
+    pub terminal_type: Option<u32>,
+    pub network_type: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FriendStatusSnapshot {
+    pub statuses: std::collections::BTreeMap<String, FriendStatus>,
+    pub interval_minutes: Option<u32>,
+    pub received_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Group {
     pub uin: u64,
     pub name: String,

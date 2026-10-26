@@ -61,6 +61,7 @@ message ConfigRequest {
   optional ConfigOrigin origin = 1;
   optional ConfigIdentity identity = 3;
   optional ConfigCache cache = 5;
+  repeated ConfigGroupRequest groups = 6;
   repeated ConfigTarget targets = 7;
   optional ConfigContinuation continuation = 8;
   optional int32 fetch_type = 9;
@@ -92,7 +93,31 @@ message ConfigTarget { optional string id = 1; }
 message ConfigContinuation { optional int32 last_index = 1; }
 message ConfigVersion { optional string version = 2; }
 message ConfigFlags { optional uint32 group_id = 1; optional uint32 new_version = 2; }
+message ConfigGroupRequest {
+  optional string name = 1;
+  optional string old_version = 2;
+  optional uint32 group_id = 4;
+  optional uint32 new_version = 5;
+}
+message ConfigGroup {
+  optional string name = 1;
+  optional bytes field2 = 2;
+  repeated ConfigRecord records = 3;
+  optional string old_version = 4;
+  optional uint32 group_id = 5;
+  optional uint32 new_version = 6;
+  optional bool no_login = 7;
+}
+message ConfigRecord {
+  optional bytes content = 1;
+  optional int32 compression = 2;
+  optional uint64 uncompressed_size = 3;
+  optional bool switch_on = 4;
+  optional bool is_cdn = 5;
+  optional uint32 metadata6 = 6;
+}
 message ConfigResponse {
+  repeated ConfigGroup groups = 2;
   optional ConfigServerState state = 4;
   optional bool enable_config_snapshot = 6;
   optional uint32 resource_report_denominator = 9;

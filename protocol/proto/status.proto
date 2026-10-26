@@ -1,0 +1,49 @@
+syntax = "proto2";
+package atri.qq.status;
+
+message FriendStatusRequest {
+  optional string self_uid = 1;
+  optional uint32 field5 = 5;
+  optional uint32 field7 = 7;
+  optional uint32 field8 = 8;
+  optional uint32 social_style = 9;
+  optional uint32 social_switch = 10;
+  optional uint32 has_local = 11;
+  optional uint32 start_index = 100;
+  optional uint32 count = 101;
+}
+
+message FriendOnlineInfo {
+  optional string uid = 1;
+  optional uint32 status = 2;
+  optional uint32 field3 = 3;
+  optional uint32 field5 = 5;
+  optional uint32 status_override = 6;
+  optional bytes field8 = 8;
+  optional uint32 field9 = 9;
+  optional uint32 battery_status = 10;
+  optional uint32 terminal_type = 11;
+  optional uint32 field12 = 12;
+  optional uint32 field13 = 13;
+  optional uint32 network_type = 14;
+  optional bytes field15 = 15;
+  optional uint32 extended_status = 16;
+  optional uint32 field17 = 17;
+  optional bytes field18 = 18;
+  optional bytes field19 = 19;
+  optional bytes field20 = 20;
+  optional bytes field21 = 21;
+  optional uint32 field22 = 22;
+  optional string fallback_uid = 23;
+  optional uint32 field24 = 24;
+  optional uint64 field25 = 25;
+}
+
+message FriendStatusResponse {
+  optional string self_uid = 1;
+  optional uint32 interval_minutes = 2;
+  optional uint32 field3 = 3;
+  repeated FriendOnlineInfo online_info = 5;
+  optional uint32 over = 100;
+  optional uint32 next_start = 101;
+}

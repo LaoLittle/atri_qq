@@ -13,13 +13,16 @@ pub mod login;
 pub mod media;
 pub mod messages;
 pub mod models;
+pub mod network;
 pub mod o3;
 pub mod proto;
 pub mod signing;
+mod ticket_refresh;
 pub mod wire;
 
 pub use client::{Client, ServiceClient};
 pub use models::*;
+pub use credentials::file_transfer::FileTransferTicket;
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {

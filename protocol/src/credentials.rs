@@ -7,6 +7,8 @@ use std::{
 use tokio::{sync::Notify, time::Instant};
 use tokio_util::sync::CancellationToken;
 
+pub(crate) mod file_transfer;
+
 const STARTUP_DOMAINS: [&str; 3] = ["pd.qq.com", "mail.qq.com", "docs.qq.com"];
 
 pub(crate) struct Session {

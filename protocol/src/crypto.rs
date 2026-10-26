@@ -27,7 +27,7 @@ fn crypto_error(e: impl std::fmt::Display) -> Error {
 
 pub fn aes_gcm_encrypt(data: &[u8], key: &[u8]) -> Result<Vec<u8>> {
     let nonce = random_bytes(12);
-    let n = Nonce::from_slice(&nonce);
+    let n: &Nonce<_> = nonce.as_slice().try_into().map_err(crypto_error)?;
     let encrypted = match key.len() {
         16 => Aes128Gcm::new_from_slice(key)
             .map_err(crypto_error)?
@@ -49,7 +49,7 @@ pub fn aes_gcm_decrypt(data: &[u8], key: &[u8]) -> Result<Vec<u8>> {
     if data.len() < 28 {
         return Err(crypto_error("Truncated AES-GCM nonce/ciphertext/tag"));
     }
-    let nonce = Nonce::from_slice(&data[..12]);
+    let nonce: &Nonce<_> = (&data[..12]).try_into().map_err(crypto_error)?;
     let encrypted = &data[12..];
     match key.len() {
         16 => Aes128Gcm::new_from_slice(key)

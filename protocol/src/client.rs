@@ -8,7 +8,7 @@ use crate::{
 use ::signing as signing_engine;
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt, stream::FuturesUnordered};
+use futures_util::{SinkExt, StreamExt, future::Either, stream::FuturesUnordered};
 use prost::Message;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
@@ -17,11 +17,14 @@ use std::{
 };
 use tokio::{
     net::TcpStream,
-    sync::{Notify, broadcast, mpsc, oneshot},
+    sync::{Notify, broadcast, mpsc, oneshot, watch},
     task::JoinHandle,
     time::{Instant, timeout_at},
 };
 use tokio_util::{codec::Framed, sync::CancellationToken};
+
+mod file_transfer;
+mod network;
 
 #[async_trait]
 pub trait ServiceClient: Send + Sync {
@@ -36,6 +39,18 @@ pub trait ServiceClient: Send + Sync {
     async fn snapshot(&self) -> SessionState;
     async fn replace_state(&self, state: SessionState);
     fn subscribe(&self) -> broadcast::Receiver<IncomingPacket>;
+    async fn media_download_key(
+        &self,
+        _business_type: u32,
+        _store_id: u32,
+    ) -> Result<crate::media::MediaDownloadKey> {
+        Err(Error::Unsupported("Media download key provider is unavailable".into()))
+    }
+    async fn fetch_friend_statuses(
+        &self,
+    ) -> Result<Arc<crate::contacts::FriendStatusSnapshot>> {
+        Err(Error::Unsupported("Friend status provider is unavailable".into()))
+    }
 }
 struct Pending {
     id: u64,
@@ -47,6 +62,9 @@ struct Pending {
 enum RequestBinding<'a> {
     Connection(u64),
     Online(u64),
+    FriendStatus(&'a Arc<crate::lifecycle::status::Binding>),
+    Credentials(&'a Arc<credentials::Session>),
+    FileTransfer(&'a Arc<credentials::file_transfer::Binding>),
     SigningReport {
         generation: u64,
         report: &'a SigningReport,
@@ -59,6 +77,7 @@ struct Outgoing {
     deadline: Instant,
     cancel: CancellationToken,
     required_control: bool,
+    terminal: bool,
 }
 impl Outgoing {
     fn trace(&self, generation: u64) {
@@ -90,22 +109,36 @@ struct Inner {
     credentials: credentials::Cache,
     maintenance_started: bool,
     maintenance_cancel: CancellationToken,
+    ticket_refresh_failures: u8,
+    ticket_refresh_schedule: watch::Sender<crate::ticket_refresh::Schedule>,
+    friend_statuses: crate::lifecycle::status::Cache,
+    kick_reason: Option<String>,
+    ip_direct_configuration: Option<(Arc<credentials::Session>, Arc<crate::network::IpDirectConfiguration>)>,
+    sso_configuration: Option<Arc<crate::network::SsoConfiguration>>,
+    server_cursor: usize,
+    file_transfer: credentials::file_transfer::Cache,
+    file_transfer_worker: Option<Arc<credentials::file_transfer::Binding>>,
 }
 pub struct Client {
     pub(crate) config: ClientConfig,
     pub(crate) guild_session: Arc<crate::guild::Session>,
+    pub(crate) media_keys: Arc<crate::lifecycle::maintenance::Session>,
     inner: Mutex<Inner>,
     connect_gate: tokio::sync::Mutex<()>,
+    friend_status_gate: tokio::sync::Mutex<()>,
+    file_transfer_gate: tokio::sync::Mutex<()>,
     pub(crate) login_gate: tokio::sync::Mutex<()>,
     pub(crate) codecs: tokio::sync::Mutex<Option<login::LoginCodecs>>,
     pub(crate) captcha: Mutex<Option<oneshot::Sender<(String, String)>>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     events: broadcast::Sender<LoginEvent>,
     packets: broadcast::Sender<IncomingPacket>,
+    login_notifications: broadcast::Sender<Arc<crate::network::LoginNotification>>,
     activity: Arc<Notify>,
     background_work: Arc<Notify>,
     signing_work: Arc<Notify>,
     credential_work: Arc<Notify>,
+    file_transfer_work: Arc<Notify>,
     weak: Weak<Client>,
 }
 impl Client {
@@ -137,6 +170,9 @@ impl Client {
         keystore.login_cookie.clear();
         let (events, _) = broadcast::channel(128);
         let (packets, _) = broadcast::channel(256);
+        let (login_notifications, _) = broadcast::channel(64);
+        let (ticket_refresh_schedule, _) =
+            watch::channel(crate::ticket_refresh::Schedule::default());
         let state = SessionState {
             profile: config.profile.clone(),
             machine_id: config.machine_id.clone(),
@@ -148,6 +184,7 @@ impl Client {
         Ok(Arc::new_cyclic(|weak| Self {
             config,
             guild_session: Arc::new(crate::guild::Session::default()),
+            media_keys: Arc::new(crate::lifecycle::maintenance::Session::default()),
             inner: Mutex::new(Inner {
                 state,
                 signer,
@@ -169,18 +206,31 @@ impl Client {
                 credentials: credentials::Cache::default(),
                 maintenance_started: false,
                 maintenance_cancel: CancellationToken::new(),
+                ticket_refresh_failures: 0,
+                ticket_refresh_schedule,
+                friend_statuses: crate::lifecycle::status::Cache::default(),
+                kick_reason: None,
+                ip_direct_configuration: None,
+                sso_configuration: None,
+                server_cursor: 0,
+                file_transfer: credentials::file_transfer::Cache::default(),
+                file_transfer_worker: None,
             }),
             connect_gate: tokio::sync::Mutex::new(()),
+            friend_status_gate: tokio::sync::Mutex::new(()),
+            file_transfer_gate: tokio::sync::Mutex::new(()),
             login_gate: tokio::sync::Mutex::new(()),
             codecs: tokio::sync::Mutex::new(None),
             captcha: Mutex::new(None),
             tasks: Mutex::new(vec![]),
             events,
             packets,
+            login_notifications,
             activity: Arc::new(Notify::new()),
             background_work: Arc::new(Notify::new()),
             signing_work: Arc::new(Notify::new()),
             credential_work: Arc::new(Notify::new()),
+            file_transfer_work: Arc::new(Notify::new()),
             weak: weak.clone(),
         }))
     }
@@ -193,10 +243,24 @@ impl Client {
     pub async fn snapshot(&self) -> SessionState {
         self.inner.lock().unwrap().state.clone()
     }
-    pub async fn replace_state(&self, mut state: SessionState) {
+    pub async fn replace_state(&self, state: SessionState) {
         let mut inner = self.inner.lock().unwrap();
+        self.replace_state_locked(&mut inner, state);
+    }
+    fn replace_state_locked(&self, inner: &mut Inner, mut state: SessionState) {
+        if inner.kick_reason.is_some() {
+            return;
+        }
         let account_changed = inner.state.keystore.uin != state.keystore.uin
             || inner.state.keystore.uid != state.keystore.uid;
+        if account_changed {
+            inner.ticket_refresh_failures = 0;
+            inner.sso_configuration = None;
+            inner.server_cursor = 0;
+            inner
+                .ticket_refresh_schedule
+                .send_replace(crate::ticket_refresh::Schedule::default());
+        }
         let tickets_changed = inner.state.keystore.d2 != state.keystore.d2
             || inner.state.keystore.d2_key != state.keystore.d2_key
             || inner.state.keystore.a2 != state.keystore.a2;
@@ -206,10 +270,21 @@ impl Client {
             && inner.connection.is_some()
             && !inner.cancel.is_cancelled()
             && !account_changed;
+        if account_changed
+            || inner.state.keystore.a2 != state.keystore.a2
+            || inner.state.keystore.guid != state.keystore.guid
+            || !state.online
+        {
+            inner.file_transfer.invalidate();
+            inner.file_transfer_worker = None;
+        }
         if account_changed || tickets_changed || (inner.state.online && !state.online) {
             inner.credentials.invalidate(account_changed);
+            inner.ip_direct_configuration = None;
             if account_changed || !state.online {
+                inner.friend_statuses.clear();
                 self.guild_session.close(inner.generation);
+                self.media_keys.close(inner.generation);
                 inner.maintenance_cancel.cancel();
                 inner.maintenance_started = false;
             } else {
@@ -236,8 +311,9 @@ impl Client {
             self.emit(LoginEvent::KeystoreChanged(state.keystore.clone()))
         }
         inner.state = state;
+        Self::update_ticket_refresh_schedule(inner);
         if inner.state.online {
-            let Inner { state, signer, .. } = &mut *inner;
+            let Inner { state, signer, .. } = inner;
             if let Err(error) = signer.business_session_started(state) {
                 tracing::warn!(%error, "O3 business session could not be bound");
             }
@@ -249,6 +325,7 @@ impl Client {
         if inner.generation != generation
             || inner.connection.is_none()
             || inner.cancel.is_cancelled()
+            || inner.kick_reason.is_some()
         {
             return Err(Error::Disconnected);
         }
@@ -264,6 +341,13 @@ impl Client {
         inner.state.online = true;
         let cancel = inner.cancel.clone();
         inner.credentials.activate(generation, &cancel);
+        self.media_keys.activate(
+            generation,
+            inner.state.keystore.uin,
+            &inner.state.keystore.uid,
+            &cancel,
+        );
+        Self::update_ticket_refresh_schedule(&mut inner);
         self.emit(LoginEvent::Online {
             uin: inner.state.keystore.uin,
             uid: inner.state.keystore.uid.clone(),
@@ -275,6 +359,22 @@ impl Client {
     }
     pub(crate) fn cancellation(&self) -> CancellationToken {
         self.inner.lock().unwrap().cancel.clone()
+    }
+    pub(crate) fn media_download_key_binding(
+        &self,
+    ) -> Result<crate::lifecycle::maintenance::Binding> {
+        let inner = self.inner.lock().unwrap();
+        if !inner.state.online
+            || inner.connection.is_none()
+            || inner.cancel.is_cancelled()
+        {
+            return Err(Error::Disconnected);
+        }
+        self.media_keys.binding(
+            inner.generation,
+            inner.state.keystore.uin,
+            &inner.state.keystore.uid,
+        )
     }
     pub(crate) fn connection_generation(&self) -> u64 {
         self.inner.lock().unwrap().generation
@@ -299,7 +399,9 @@ impl Client {
             )
             .await?;
         if started.elapsed() > Duration::from_secs(7) {
-            return Err(wire::malformed("CorrectTime round trip exceeds seven seconds"));
+            return Err(wire::malformed(
+                "CorrectTime round trip exceeds seven seconds",
+            ));
         }
         let server = u32::from_be_bytes(
             response
@@ -308,7 +410,10 @@ impl Client {
                 .map_err(|_| wire::malformed("CorrectTime response must contain four bytes"))?,
         );
         let mut inner = self.inner.lock().unwrap();
-        if inner.generation != generation || inner.connection.is_none() || inner.cancel.is_cancelled() {
+        if inner.generation != generation
+            || inner.connection.is_none()
+            || inner.cancel.is_cancelled()
+        {
             return Err(Error::Disconnected);
         }
         inner.clock.correction(server, SystemTime::now());
@@ -317,6 +422,9 @@ impl Client {
     }
     pub(crate) fn is_current_online(&self, generation: u64) -> bool {
         let inner = self.inner.lock().unwrap();
+        Self::current_online(&inner, generation)
+    }
+    fn current_online(inner: &Inner, generation: u64) -> bool {
         inner.generation == generation
             && inner
                 .connection
@@ -324,6 +432,110 @@ impl Client {
                 .is_some_and(|connection| connection.generation == generation)
             && inner.state.online
             && !inner.cancel.is_cancelled()
+    }
+    fn update_ticket_refresh_schedule(inner: &mut Inner) {
+        let selected_time = inner
+            .state
+            .keystore
+            .nt_ticket_times
+            .and_then(|times| times.selected())
+            .is_some();
+        let generation = inner.generation;
+        inner.ticket_refresh_schedule.send_if_modified(|schedule| {
+            let previous = *schedule;
+            if schedule.generation != generation {
+                *schedule = crate::ticket_refresh::Schedule {
+                    generation,
+                    ..Default::default()
+                };
+            }
+            schedule.selected_time = selected_time;
+            *schedule != previous
+        });
+    }
+    pub(crate) fn ticket_refresh_schedule(
+        &self,
+        generation: u64,
+    ) -> Result<watch::Receiver<crate::ticket_refresh::Schedule>> {
+        let mut inner = self.inner.lock().unwrap();
+        if !Self::current_online(&inner, generation) {
+            return Err(Error::Disconnected);
+        }
+        Self::update_ticket_refresh_schedule(&mut inner);
+        Ok(inner.ticket_refresh_schedule.subscribe())
+    }
+    pub(crate) fn set_ticket_refresh_interval(&self, generation: u64, seconds: i32) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if !Self::current_online(&inner, generation) {
+            return Err(Error::Disconnected);
+        }
+        Self::update_ticket_refresh_schedule(&mut inner);
+        inner.ticket_refresh_schedule.send_if_modified(|schedule| {
+            if schedule.interval_seconds == Some(seconds) {
+                return false;
+            }
+            schedule.interval_seconds = Some(seconds);
+            true
+        });
+        Ok(())
+    }
+    pub(crate) fn ticket_refresh_ready(&self, generation: u64) -> Result<bool> {
+        let inner = self.inner.lock().unwrap();
+        if !Self::current_online(&inner, generation) {
+            return Err(Error::Disconnected);
+        }
+        if inner.state.keystore.a1.is_empty() {
+            return Err(Error::Authentication(
+                "NT ticket refresh requires A1".into(),
+            ));
+        }
+        if inner.ticket_refresh_failures >= 10 {
+            return Ok(false);
+        }
+        let Some(next) = inner.state.keystore.next_ticket_refresh_unix_seconds() else {
+            return Ok(false);
+        };
+        Ok(next <= u64::from(inner.clock.unix_seconds()?))
+    }
+    pub(crate) fn record_ticket_refresh_result(
+        &self,
+        generation: u64,
+        succeeded: bool,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if !Self::current_online(&inner, generation) {
+            return Err(Error::Disconnected);
+        }
+        inner.ticket_refresh_failures = if succeeded {
+            0
+        } else {
+            inner.ticket_refresh_failures.saturating_add(1)
+        };
+        Ok(())
+    }
+    pub(crate) fn commit_nt_maintenance_state(
+        &self,
+        generation: u64,
+        expected: &Keystore,
+        updated: SessionState,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if !Self::current_online(&inner, generation) {
+            return Err(Error::Disconnected);
+        }
+        if inner.state.keystore != *expected
+            || inner.state.profile != updated.profile
+            || inner.state.machine_id != updated.machine_id
+            || expected.uin != updated.keystore.uin
+            || expected.uid != updated.keystore.uid
+            || !updated.online
+        {
+            return Err(Error::Authentication(
+                "NT maintenance session state changed".into(),
+            ));
+        }
+        self.replace_state_locked(&mut inner, updated);
+        Ok(())
     }
     pub(crate) fn business_identity(&self, generation: u64) -> Result<(u64, String)> {
         let inner = self.inner.lock().unwrap();
@@ -340,6 +552,92 @@ impl Client {
         }
         Ok((inner.state.keystore.uin, inner.state.keystore.qimei.clone()))
     }
+    pub fn cached_friend_statuses(&self) -> Option<Arc<crate::contacts::FriendStatusSnapshot>> {
+        let inner = self.inner.lock().unwrap();
+        if !Self::current_online(&inner, inner.generation) {
+            return None;
+        }
+        let binding = inner.friend_statuses.binding.as_ref()?;
+        if !Self::friend_status_current(&inner, binding) {
+            return None;
+        }
+        inner.friend_statuses.snapshot.clone()
+    }
+
+    pub async fn fetch_friend_statuses(&self) -> Result<Arc<crate::contacts::FriendStatusSnapshot>> {
+        self.fetch_friend_statuses_generation(self.connection_generation()).await
+    }
+
+    pub(crate) async fn fetch_friend_statuses_generation(
+        &self,
+        generation: u64,
+    ) -> Result<Arc<crate::contacts::FriendStatusSnapshot>> {
+        let _gate = self.friend_status_gate.lock().await;
+        let (binding, has_local) = {
+            let mut inner = self.inner.lock().unwrap();
+            if !Self::current_online(&inner, generation)
+                || inner.state.keystore.uin == 0
+                || inner.state.keystore.uid.is_empty()
+            {
+                return Err(Error::Disconnected);
+            }
+            if inner.friend_statuses.binding.as_ref()
+                .is_none_or(|binding| !Self::friend_status_current(&inner, binding))
+            {
+                inner.friend_statuses.clear();
+                inner.friend_statuses.binding = Some(Arc::new(crate::lifecycle::status::Binding {
+                    generation,
+                    uin: inner.state.keystore.uin,
+                    uid: inner.state.keystore.uid.clone(),
+                    cancel: inner.cancel.child_token(),
+                }));
+            }
+            (
+                inner.friend_statuses.binding.as_ref().unwrap().clone(),
+                inner.friend_statuses.snapshot.is_some(),
+            )
+        };
+        crate::lifecycle::status::fetch(self, &binding, has_local).await
+    }
+
+    fn friend_status_current(
+        inner: &Inner,
+        binding: &Arc<crate::lifecycle::status::Binding>,
+    ) -> bool {
+        Self::current_online(inner, binding.generation)
+            && inner.state.keystore.uin == binding.uin
+            && inner.state.keystore.uid == binding.uid
+            && inner.friend_statuses.is_current(binding)
+    }
+
+    pub(crate) fn commit_friend_statuses(
+        &self,
+        binding: &Arc<crate::lifecycle::status::Binding>,
+        snapshot: Arc<crate::contacts::FriendStatusSnapshot>,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if !Self::friend_status_current(&inner, binding) {
+            return Err(Error::Disconnected);
+        }
+        inner.friend_statuses.snapshot = Some(snapshot);
+        Ok(())
+    }
+
+    pub(crate) async fn request_friend_status(
+        &self,
+        binding: &Arc<crate::lifecycle::status::Binding>,
+        body: Bytes,
+    ) -> Result<Bytes> {
+        self.request_inner(
+            crate::lifecycle::status::COMMAND,
+            body,
+            RequestType::D2,
+            Encryption::D2,
+            Duration::from_secs(30),
+            Some(RequestBinding::FriendStatus(binding)),
+        ).await
+    }
+
     pub(crate) fn start_maintenance(&self, generation: u64) -> Result<()> {
         let cancel = {
             let mut inner = self.inner.lock().unwrap();
@@ -364,8 +662,20 @@ impl Client {
             cancel.clone(),
             self.credential_work.clone(),
         ));
-        let lifecycle = tokio::spawn(crate::lifecycle::run(self.weak.clone(), generation, cancel));
-        self.tasks.lock().unwrap().extend([refresh, lifecycle]);
+        let lifecycle = tokio::spawn(crate::lifecycle::run(
+            self.weak.clone(),
+            generation,
+            cancel.clone(),
+        ));
+        let tickets = tokio::spawn(crate::ticket_refresh::run(
+            self.weak.clone(),
+            generation,
+            cancel,
+        ));
+        self.tasks
+            .lock()
+            .unwrap()
+            .extend([refresh, lifecycle, tickets]);
         Ok(())
     }
     fn credential_session(&self) -> Result<Arc<credentials::Session>> {
@@ -500,7 +810,7 @@ impl Client {
         };
         let socket = tokio::select! {
             _=cancel.cancelled()=>return Err(Error::Disconnected),
-            result=tokio::time::timeout(self.config.timeout,TcpStream::connect((self.config.host.as_str(),self.config.port)))=>result.map_err(|_|Error::Timeout)??,
+            result=tokio::time::timeout(self.config.timeout,self.connect_socket())=>result.map_err(|_|Error::Timeout)??,
         };
         socket.set_nodelay(true)?;
         let framed = Framed::new(socket, SsoFrameCodec);
@@ -550,6 +860,13 @@ impl Client {
                 if item.cancel.is_cancelled() {
                     continue;
                 }
+                if weak.upgrade().is_none_or(|client| {
+                    let inner = client.inner.lock().unwrap();
+                    inner.generation != generation
+                        || (inner.kick_reason.is_some() && !item.terminal)
+                }) {
+                    continue;
+                }
                 if Instant::now() >= item.deadline {
                     if item.required_control {
                         if let Some(client) = weak.upgrade() {
@@ -570,6 +887,10 @@ impl Client {
                     Ok(Ok(())) => {
                         if let Some(client) = weak.upgrade() {
                             client.mark_activity(generation);
+                            if item.terminal {
+                                client.terminate_generation(generation, String::new());
+                                return;
+                            }
                         }
                     }
                     Ok(Err(error)) => {
@@ -633,6 +954,15 @@ impl Client {
             self.terminate_generation(generation, format!("Kicked: {error}"));
             return Ok(());
         }
+        if i.kick_reason.is_some() {
+            return Ok(());
+        }
+        if packet.command == "trpc.qq_new_tech.status_svc.StatusService.KickNT" {
+            let kick = crate::proto::decode::<auth::Kick>(packet.body.clone())?;
+            drop(i);
+            let _ = self.packets.send(packet);
+            return self.begin_kick(generation, kick);
+        }
         if i.pending
             .get(&packet.sequence)
             .is_some_and(|p| p.command == packet.command)
@@ -660,10 +990,20 @@ impl Client {
                 message: extra,
             });
         }
+        if packet.command == crate::network::LOGIN_NOTIFICATION_COMMAND {
+            let notification = crate::network::decode_login_notification(packet.body.clone())
+                .inspect_err(|_| {
+                    let _ = self.packets.send(packet.clone());
+                })?;
+            let inner = self.inner.lock().unwrap();
+            if inner.generation == generation && inner.connection.is_some() && inner.kick_reason.is_none() {
+                let _ = self.login_notifications.send(Arc::new(notification));
+            }
+        }
         let control_reply = match packet.command.as_str() {
             "trpc.msg.olpush.OlPushService.MsgPush" => wire::encode_push_ack(packet.body.clone())?
                 .map(|body| ("trpc.msg.olpush.OlPushService.SsoPushAck", body)),
-            "ConfigPushSvc.PushReq" => wire::encode_config_push_response(packet.body.clone())
+            "ConfigPushSvc.PushReq" => self.apply_network_push(generation, packet.body.clone())
                 .inspect_err(|_| {
                     let _ = self.packets.send(packet.clone());
                 })?
@@ -693,20 +1033,104 @@ impl Client {
             inner.control_replies.push_back(reply);
             self.background_work.notify_one();
         }
-        let is_kick = packet.command == "trpc.qq_new_tech.status_svc.StatusService.KickNT";
-        let reason = if is_kick {
-            let p = crate::proto::decode::<auth::Kick>(packet.body.clone())?;
-            Some(format!(
-                "Kicked: {} {}",
-                p.title.unwrap_or_default(),
-                p.message.unwrap_or_default()
-            ))
-        } else {
-            None
-        };
         let _ = self.packets.send(packet);
-        if let Some(reason) = reason {
-            self.terminate_generation(generation, reason)
+        Ok(())
+    }
+    fn begin_kick(&self, generation: u64, kick: auth::Kick) -> Result<()> {
+        let reason = format!(
+            "Kicked: {} {} app_id={:?} instance_id={:?} kicked_type={:?} security_kicked_type={:?}",
+            kick.title.unwrap_or_default(),
+            kick.message.unwrap_or_default(),
+            kick.app_id,
+            kick.instance_id,
+            kick.kicked_type,
+            kick.security_kicked_type,
+        );
+        let deadline = match Instant::now().checked_add(self.config.timeout) {
+            Some(deadline) => deadline,
+            None => {
+                self.terminate_generation(generation, reason);
+                return Err(wire::malformed("Kick cleanup deadline overflow"));
+            }
+        };
+        let (sender, outgoing) = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.generation != generation || inner.connection.is_none() {
+                return Ok(());
+            }
+            if inner.kick_reason.is_some() {
+                return Ok(());
+            }
+            inner.kick_reason = Some(reason);
+            inner.state.online = false;
+            inner.signing_ready = false;
+            inner.alive_cancel.cancel();
+            inner.heartbeat_cancel.cancel();
+            inner.signing_cancel.cancel();
+            inner.maintenance_cancel.cancel();
+            inner.maintenance_started = false;
+            inner.credentials.invalidate(true);
+            inner.ip_direct_configuration = None;
+            inner.file_transfer.invalidate();
+            inner.file_transfer_worker = None;
+            inner.friend_statuses.clear();
+            inner.control_replies.clear();
+            for (_, pending) in inner.pending.drain() {
+                pending.cancel.cancel();
+                let _ = pending.reply.send(Err(Error::Disconnected));
+            }
+            let command = "trpc.qq_new_tech.status_svc.StatusService.UnRegister";
+            let prepared = self.prepare_frame(
+                &mut inner,
+                command,
+                Self::unregister_body(true),
+                RequestType::D2,
+                Encryption::D2,
+            );
+            let (sequence, frame) = match prepared {
+                Ok(frame) => frame,
+                Err(error) => {
+                    drop(inner);
+                    self.terminate_generation(generation, String::new());
+                    return Err(error);
+                }
+            };
+            let sender = inner.connection.as_ref().unwrap().sender.clone();
+            let outgoing = Outgoing {
+                command: command.into(),
+                sequence,
+                frame,
+                deadline,
+                cancel: inner.cancel.clone(),
+                required_control: true,
+                terminal: true,
+            };
+            (sender, outgoing)
+        };
+        self.guild_session.close(generation);
+        self.media_keys.close(generation);
+        match sender.try_send(outgoing) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.terminate_generation(generation, String::new());
+            }
+            Err(mpsc::error::TrySendError::Full(outgoing)) => {
+                let weak = self.weak.clone();
+                let cancel = outgoing.cancel.clone();
+                let task = tokio::spawn(async move {
+                    let result = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return,
+                        result = timeout_at(deadline, sender.send(outgoing)) => result,
+                    };
+                    if !matches!(result, Ok(Ok(())))
+                        && let Some(client) = weak.upgrade()
+                    {
+                        client.terminate_generation(generation, String::new());
+                    }
+                });
+                self.tasks.lock().unwrap().push(task);
+            }
         }
         Ok(())
     }
@@ -755,7 +1179,7 @@ impl Client {
             .ok_or_else(|| wire::malformed("Send deadline overflow"))?;
         let (sender, sequence, frame, cancel) = {
             let mut inner = self.inner.lock().unwrap();
-            if inner.generation != generation {
+            if inner.generation != generation || inner.kick_reason.is_some() {
                 return Err(Error::Disconnected);
             }
             let sender = inner
@@ -777,6 +1201,7 @@ impl Client {
                 deadline,
                 cancel,
                 required_control: true,
+                terminal: false,
             }),
         )
         .await
@@ -811,6 +1236,22 @@ impl Client {
         )
         .await
     }
+    pub(crate) async fn request_nt_maintenance(
+        &self,
+        generation: u64,
+        command: &str,
+        body: Bytes,
+    ) -> Result<Bytes> {
+        self.request_inner(
+            command,
+            body,
+            RequestType::D2,
+            Encryption::Empty,
+            self.config.timeout,
+            Some(RequestBinding::Online(generation)),
+        )
+        .await
+    }
     async fn request_inner(
         &self,
         command: &str,
@@ -834,11 +1275,21 @@ impl Client {
                 Some(RequestBinding::Online(generation)) => {
                     i.generation == generation && i.state.online
                 }
+                Some(RequestBinding::FriendStatus(binding)) => Self::friend_status_current(&i, binding),
+                Some(RequestBinding::Credentials(session)) => {
+                    Self::current_online(&i, session.generation) && i.credentials.is_current(session)
+                }
+                Some(RequestBinding::FileTransfer(binding)) => Self::file_transfer_current(&i, binding),
                 Some(RequestBinding::SigningReport { generation, report }) => {
-                    i.generation == generation && i.signer.report_is_current(report)
+                    i.generation == generation
+                        && i.signer.report_is_current(report)
+                        && std::str::from_utf8(&report.account)
+                            .ok()
+                            .and_then(|account| account.parse::<u64>().ok())
+                            == Some(i.state.keystore.uin)
                 }
             };
-            if !current {
+            if !current || i.kick_reason.is_some() {
                 return Err(Error::Disconnected);
             }
             let sender = i
@@ -861,7 +1312,12 @@ impl Client {
             let id = i.next_id;
             let key = i.state.keystore.d2_key.clone();
             let (tx, rx) = oneshot::channel();
-            let cancel = CancellationToken::new();
+            let cancel = match binding {
+                Some(RequestBinding::FriendStatus(binding)) => binding.cancel.child_token(),
+                Some(RequestBinding::Credentials(session)) => session.cancel.child_token(),
+                Some(RequestBinding::FileTransfer(binding)) => binding.cancel.child_token(),
+                _ => CancellationToken::new(),
+            };
             i.pending.insert(
                 sequence,
                 Pending {
@@ -888,6 +1344,7 @@ impl Client {
                     deadline,
                     cancel,
                     required_control: false,
+                    terminal: false,
                 })
                 .await
                 .map_err(|_| Error::Disconnected)?;
@@ -931,22 +1388,25 @@ impl Client {
             .send((ticket, random))
             .map_err(|_| Error::Disconnected)
     }
+    fn unregister_body(kicked: bool) -> Bytes {
+        auth::UnregisterRequest {
+            r#type: Some(0),
+            device: Some(auth::StatusDevice {
+                name: Some(Bytes::new()),
+                kernel: Some(Bytes::new()),
+                vendor: Some(Bytes::new()),
+                model: Some(Bytes::new()),
+                os: Some(Bytes::new()),
+            }),
+            reason: Some(u32::from(kicked)),
+        }
+        .encode_to_vec()
+        .into()
+    }
     pub async fn logout(&self) -> Result<()> {
         let state = self.snapshot().await;
         let result = if state.online {
-            let body = auth::UnregisterRequest {
-                r#type: Some(0),
-                device: Some(auth::StatusDevice {
-                    name: Some(Bytes::new()),
-                    kernel: Some(Bytes::new()),
-                    vendor: Some(Bytes::new()),
-                    model: Some(Bytes::new()),
-                    os: Some(Bytes::new()),
-                }),
-                reason: Some(0),
-            }
-            .encode_to_vec()
-            .into();
+            let body = Self::unregister_body(false);
             match self
                 .call(
                     "trpc.qq_new_tech.status_svc.StatusService.UnRegister",
@@ -988,15 +1448,23 @@ impl Client {
         self.terminate_generation(generation, reason)
     }
     fn terminate_generation(&self, generation: u64, reason: String) {
+        self.terminate_generation_with_policy(generation, reason, false);
+    }
+    fn terminate_generation_with_policy(&self, generation: u64, reason: String, preserve_kick: bool) {
         {
             let mut i = self.inner.lock().unwrap();
-            if i.generation != generation {
+            if i.generation != generation || (preserve_kick && i.kick_reason.is_some()) {
                 return;
             }
+            let reason = i.kick_reason.take().unwrap_or(reason);
             i.cancel.cancel();
             i.maintenance_cancel.cancel();
             i.maintenance_started = false;
             i.credentials.invalidate(true);
+            i.ip_direct_configuration = None;
+            i.file_transfer.invalidate();
+            i.file_transfer_worker = None;
+            i.friend_statuses.clear();
             let connected = i.connection.take().is_some();
             let online = i.state.online;
             i.state.online = false;
@@ -1010,6 +1478,7 @@ impl Client {
             }
         }
         self.guild_session.close(generation);
+        self.media_keys.close(generation);
         self.captcha.lock().unwrap().take();
     }
     fn mark_activity(&self, generation: u64) {
@@ -1233,32 +1702,72 @@ impl Client {
                         }
                     }
                 }
-                loop {
+                while let Some(work) = queued.pop_front() {
+                    let mut report = match work {
+                        crate::o3::Work::Report(report) => report,
+                        crate::o3::Work::Compute(task_report) => {
+                            let Some(task_scope) = active_scope else {
+                                continue;
+                            };
+                            let report_cancel = {
+                                let inner = client.inner.lock().unwrap();
+                                if inner.generation != generation
+                                    || inner.connection.as_ref().map(|connection| connection.generation) != Some(generation)
+                                    || !inner.signing_ready
+                                    || inner.o3.scope != Some(task_scope)
+                                    || inner.state.keystore.uin != task_scope.1
+                                    || !inner.signer.report_is_current(task_report.binding())
+                                    || inner.signing_cancel.is_cancelled()
+                                {
+                                    continue;
+                                }
+                                inner.signing_cancel.clone()
+                            };
+                            let job = tokio::task::spawn_blocking(move || task_report.execute());
+                            let cancel = cancel.clone();
+                            pending.push(Either::Right(async move {
+                                let completion = tokio::select! {
+                                    biased;
+                                    _ = cancel.cancelled() => None,
+                                    _ = report_cancel.cancelled() => None,
+                                    completion = job => Some(completion),
+                                };
+                                Either::Right((task_scope, completion, report_cancel))
+                            }));
+                            continue;
+                        }
+                        crate::o3::Work::RotatePeer {
+                            material,
+                            generation: signing_generation,
+                            account,
+                        } => {
+                            let mut inner = client.inner.lock().unwrap();
+                            if inner.generation != generation || inner.connection.is_none() {
+                                return;
+                            }
+                            if inner.signing_ready
+                                && inner.signer.generation() == signing_generation
+                                && inner.state.keystore.uin == account
+                            {
+                                if let Err(error) = inner.o3.channel.rotate_peer(&material) {
+                                    tracing::warn!(%error, "O3 peer rotation rejected");
+                                } else {
+                                    tracing::debug!(target: "atri_qq_protocol::packet_trace", stage = "o3_state", generation, phase = "peer_rotated", "QQ O3 state");
+                                }
+                            }
+                            continue;
+                        }
+                    };
                     let (report, request, report_cancel) = {
                         let mut inner = client.inner.lock().unwrap();
                         if inner.generation != generation || inner.connection.is_none() {
                             return;
                         }
-                        let Some(work) = queued.pop_front() else {
-                            break;
-                        };
-                        let mut report = match work {
-                            crate::o3::Work::Report(report) => report,
-                            crate::o3::Work::RotatePeer { material, generation: signing_generation, account } => {
-                                if inner.signing_ready
-                                    && inner.signer.generation() == signing_generation
-                                    && inner.state.keystore.uin == account
-                                {
-                                    if let Err(error) = inner.o3.channel.rotate_peer(&material) {
-                                        tracing::warn!(%error, "O3 peer rotation rejected");
-                                    } else {
-                                        tracing::debug!(target: "atri_qq_protocol::packet_trace", stage = "o3_state", generation, phase = "peer_rotated", "QQ O3 state");
-                                    }
-                                }
-                                continue;
-                            }
-                        };
-                        if !inner.signing_ready || !inner.signer.report_is_current(&report) {
+                        if !inner.signing_ready
+                            || !inner.signer.report_is_current(&report)
+                            || active_scope != Some((report.generation, inner.state.keystore.uin))
+                            || inner.signing_cancel.is_cancelled()
+                        {
                             continue;
                         }
                         if inner.o3.channel.is_establishing() {
@@ -1289,7 +1798,7 @@ impl Client {
                     };
                     let client = client.clone();
                     let cancel = cancel.clone();
-                    pending.push(async move {
+                    pending.push(Either::Left(async move {
                         let response = tokio::select! {
                             biased;
                             _ = cancel.cancelled() => Err(Error::Disconnected),
@@ -1303,8 +1812,8 @@ impl Client {
                                 Some(RequestBinding::SigningReport { generation, report: &report }),
                             ) => response,
                         };
-                        (report, request, response, report_cancel)
-                    });
+                        Either::Left((report, request, response, report_cancel))
+                    }));
                 }
                 let heartbeat_deadline = if active_scope.is_some() {
                     client.inner.lock().unwrap().o3.heartbeat.deadline()
@@ -1315,7 +1824,37 @@ impl Client {
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return,
-                    Some((report, request, response, report_cancel)) = pending.next(), if !pending.is_empty() => {
+                    Some(completion) = pending.next(), if !pending.is_empty() => {
+                        let (report, request, response, report_cancel) = match completion {
+                            Either::Left(completion) => completion,
+                            Either::Right((task_scope, completion, report_cancel)) => {
+                                let Some(client) = weak.upgrade() else { return };
+                                let inner = client.inner.lock().unwrap();
+                                if inner.generation != generation
+                                    || inner.connection.as_ref().map(|connection| connection.generation) != Some(generation)
+                                    || !inner.signing_ready
+                                    || inner.o3.scope != Some(task_scope)
+                                    || inner.state.keystore.uin != task_scope.1
+                                    || inner.signer.generation() != task_scope.0
+                                    || report_cancel.is_cancelled()
+                                    || cancel.is_cancelled()
+                                {
+                                    continue;
+                                }
+                                match completion {
+                                    Some(Ok(Some(report))) => {
+                                        if inner.signer.report_is_current(&report) {
+                                            queued.push_back(crate::o3::Work::Report(report));
+                                        }
+                                    }
+                                    Some(Ok(None)) | None => {}
+                                    Some(Err(error)) => {
+                                        tracing::warn!(%error, "O3 calculation worker failed");
+                                    }
+                                }
+                                continue;
+                            }
+                        };
                         let Some(client) = weak.upgrade() else { return };
                         let mut inner = client.inner.lock().unwrap();
                         if inner.generation != generation || !inner.signer.report_is_current(&report) {
@@ -1400,7 +1939,10 @@ impl Client {
                 let Some(client) = weak.upgrade() else { return };
                 let (replies, reports, telemetry_deadline) = {
                     let mut inner = client.inner.lock().unwrap();
-                    if inner.generation != generation || inner.connection.is_none() {
+                    if inner.generation != generation
+                        || inner.connection.is_none()
+                        || inner.kick_reason.is_some()
+                    {
                         return;
                     }
                     let Inner { state, signer, .. } = &mut *inner;
@@ -1419,9 +1961,10 @@ impl Client {
                     };
                     if let Err(error) = result {
                         if !cancel.is_cancelled() {
-                            client.terminate_generation(
+                            client.terminate_generation_with_policy(
                                 generation,
                                 format!("Required control response failed: {error}"),
+                                true,
                             );
                         }
                         return;
@@ -1577,9 +2120,459 @@ impl ServiceClient for Client {
     fn subscribe(&self) -> broadcast::Receiver<IncomingPacket> {
         Client::subscribe(self)
     }
+    async fn media_download_key(
+        &self,
+        business_type: u32,
+        store_id: u32,
+    ) -> Result<crate::media::MediaDownloadKey> {
+        Client::media_download_key(self, business_type, store_id).await
+    }
+    async fn fetch_friend_statuses(
+        &self,
+    ) -> Result<Arc<crate::contacts::FriendStatusSnapshot>> {
+        Client::fetch_friend_statuses(self).await
+    }
 }
 
 #[cfg(test)]
 #[path = "client_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+mod ticket_refresh_tests {
+    use super::*;
+
+    fn online_client() -> (Arc<Client>, mpsc::Receiver<Outgoing>) {
+        let client = Client::new(ClientConfig::default(), Keystore::default()).unwrap();
+        let (sender, receiver) = mpsc::channel(8);
+        {
+            let mut inner = client.inner.lock().unwrap();
+            inner.generation = 7;
+            inner.connection = Some(Connection {
+                generation: 7,
+                sender,
+            });
+            inner.state.online = true;
+            inner.state.keystore.uin = 42;
+            inner.state.keystore.uid = "synthetic-user".into();
+            inner.state.keystore.a1 = vec![1];
+            inner.state.keystore.nt_ticket_times = Some(times(0));
+            inner.clock.correction(100, SystemTime::now());
+        }
+        (client, receiver)
+    }
+
+    fn times(next: u64) -> NtTicketTimeMetadata {
+        NtTicketTimeMetadata {
+            field12: Some(NtTicketTimeValues {
+                raw_field1: Some(next),
+                raw_field2: None,
+            }),
+            field16: None,
+            received_unix_ms: 0,
+        }
+    }
+
+    #[test]
+    fn readiness_checks_identity_a1_and_corrected_deadline() {
+        let (client, _queue) = online_client();
+        assert!(client.ticket_refresh_ready(7).unwrap());
+        assert!(matches!(
+            client.ticket_refresh_ready(6),
+            Err(Error::Disconnected)
+        ));
+        {
+            let mut inner = client.inner.lock().unwrap();
+            inner.state.keystore.nt_ticket_times = Some(times(1_000));
+        }
+        assert!(!client.ticket_refresh_ready(7).unwrap());
+        client.inner.lock().unwrap().state.keystore.nt_ticket_times = Some(times(100));
+        assert!(client.ticket_refresh_ready(7).unwrap());
+        client.inner.lock().unwrap().state.keystore.a1.clear();
+        assert!(matches!(
+            client.ticket_refresh_ready(7),
+            Err(Error::Authentication(_))
+        ));
+        client.inner.lock().unwrap().cancel.cancel();
+        assert!(matches!(
+            client.ticket_refresh_ready(7),
+            Err(Error::Disconnected)
+        ));
+    }
+
+    #[tokio::test]
+    async fn server_failure_limit_survives_reconnection_but_not_account_replacement() {
+        let (client, _queue) = online_client();
+        for _ in 0..9 {
+            client.record_ticket_refresh_result(7, false).unwrap();
+        }
+        assert!(client.ticket_refresh_ready(7).unwrap());
+        client.record_ticket_refresh_result(7, false).unwrap();
+        assert!(!client.ticket_refresh_ready(7).unwrap());
+        {
+            let mut inner = client.inner.lock().unwrap();
+            inner.generation = 8;
+            inner.connection.as_mut().unwrap().generation = 8;
+        }
+        assert!(!client.ticket_refresh_ready(8).unwrap());
+        assert!(matches!(
+            client.record_ticket_refresh_result(7, true),
+            Err(Error::Disconnected)
+        ));
+        client.record_ticket_refresh_result(8, true).unwrap();
+        assert!(client.ticket_refresh_ready(8).unwrap());
+        client.record_ticket_refresh_result(8, false).unwrap();
+        let mut state = client.snapshot().await;
+        state.keystore.uin = 43;
+        state.keystore.uid = "another-synthetic-user".into();
+        client.replace_state(state).await;
+        let inner = client.inner.lock().unwrap();
+        assert_eq!(inner.ticket_refresh_failures, 0);
+        assert!(!inner.state.online);
+    }
+
+    #[test]
+    fn configuration_updates_are_generation_bound_and_preserve_stop_values() {
+        let (client, _queue) = online_client();
+        let mut updates = client.ticket_refresh_schedule(7).unwrap();
+        assert!(updates.borrow().interval_seconds.is_none());
+        client.set_ticket_refresh_interval(7, 15).unwrap();
+        assert_eq!(updates.borrow_and_update().interval_seconds, Some(15));
+        {
+            let mut inner = client.inner.lock().unwrap();
+            inner.generation = 8;
+            inner.connection.as_mut().unwrap().generation = 8;
+        }
+        client.set_ticket_refresh_interval(8, 22).unwrap();
+        assert!(matches!(
+            client.set_ticket_refresh_interval(7, 1),
+            Err(Error::Disconnected)
+        ));
+        assert_eq!(updates.borrow().generation, 8);
+        assert_eq!(updates.borrow().interval_seconds, Some(22));
+        for seconds in [0, -3] {
+            client.set_ticket_refresh_interval(8, seconds).unwrap();
+            assert_eq!(updates.borrow().interval_seconds, Some(seconds));
+        }
+        client.inner.lock().unwrap().cancel.cancel();
+        assert!(matches!(
+            client.set_ticket_refresh_interval(8, 1),
+            Err(Error::Disconnected)
+        ));
+    }
+
+    #[tokio::test]
+    async fn maintenance_commit_is_atomic_and_reuses_key_rotation_and_events() {
+        let (client, _queue) = online_client();
+        let mut events = client.login_events();
+        let original = client.snapshot().await;
+        let mut updated = original.clone();
+        updated.keystore.d2 = vec![2];
+        updated.keystore.d2_key = vec![3; 16];
+        updated.keystore.nt_ticket_times = Some(times(200));
+        client.record_ticket_refresh_result(7, false).unwrap();
+        client
+            .commit_nt_maintenance_state(7, &original.keystore, updated.clone())
+            .unwrap();
+        {
+            let inner = client.inner.lock().unwrap();
+            assert!(inner.state.keystore == updated.keystore);
+            assert!(inner.previous_keys.contains(&original.keystore.d2_key));
+            assert_eq!(inner.ticket_refresh_failures, 1);
+        }
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            LoginEvent::KeystoreChanged(_)
+        ));
+        assert!(
+            client
+                .commit_nt_maintenance_state(7, &original.keystore, updated.clone())
+                .is_err()
+        );
+        let mut wrong_profile = updated.clone();
+        wrong_profile.profile.qua.push_str("-changed");
+        assert!(
+            client
+                .commit_nt_maintenance_state(7, &updated.keystore, wrong_profile)
+                .is_err()
+        );
+        let mut wrong_machine = updated.clone();
+        wrong_machine.machine_id.push_str("-changed");
+        assert!(
+            client
+                .commit_nt_maintenance_state(7, &updated.keystore, wrong_machine)
+                .is_err()
+        );
+        assert!(client.inner.lock().unwrap().state.keystore == updated.keystore);
+        assert!(matches!(
+            client.commit_nt_maintenance_state(6, &updated.keystore, updated.clone()),
+            Err(Error::Disconnected)
+        ));
+        client.inner.lock().unwrap().cancel.cancel();
+        assert!(matches!(
+            client.commit_nt_maintenance_state(7, &updated.keystore, updated.clone()),
+            Err(Error::Disconnected)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn worker_waits_for_ticket_state_and_skips_busy_login_without_failures() {
+        let (client, mut queue) = online_client();
+        client.inner.lock().unwrap().state.keystore.nt_ticket_times = None;
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(crate::ticket_refresh::run(
+            Arc::downgrade(&client),
+            7,
+            cancel.clone(),
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(10_000)).await;
+        tokio::task::yield_now().await;
+        assert!(queue.try_recv().is_err());
+        let busy = client.login_gate.lock().await;
+        client.inner.lock().unwrap().state.keystore.nt_ticket_times = Some(times(0));
+        client.set_ticket_refresh_interval(7, 3).unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+        tokio::task::yield_now().await;
+        assert!(queue.try_recv().is_err());
+        assert_eq!(client.inner.lock().unwrap().ticket_refresh_failures, 0);
+        client.set_ticket_refresh_interval(7, 0).unwrap();
+        tokio::task::yield_now().await;
+        drop(busy);
+        tokio::time::advance(Duration::from_secs(100)).await;
+        tokio::task::yield_now().await;
+        assert!(queue.try_recv().is_err());
+        cancel.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn waiting_worker_does_not_keep_the_client_alive() {
+        let (client, _queue) = online_client();
+        client.set_ticket_refresh_interval(7, 3600).unwrap();
+        let weak = Arc::downgrade(&client);
+        let task = tokio::spawn(crate::ticket_refresh::run(
+            weak.clone(),
+            7,
+            CancellationToken::new(),
+        ));
+        tokio::task::yield_now().await;
+        drop(client);
+        assert!(weak.upgrade().is_none());
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disabling_checks_does_not_discard_an_inflight_authenticated_refresh() {
+        let (client, mut queue) = online_client();
+        {
+            let mut inner = client.inner.lock().unwrap();
+            inner.state.keystore.key_exchange_ticket = b"synthetic-exchange-ticket".to_vec();
+            inner.state.keystore.key_exchange_key = vec![42; 16];
+        }
+        let mut events = client.login_events();
+        client.set_ticket_refresh_interval(7, 1).unwrap();
+        let cancel = CancellationToken::new();
+        let worker = tokio::spawn(crate::ticket_refresh::run(
+            Arc::downgrade(&client),
+            7,
+            cancel.clone(),
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let outgoing = tokio::time::timeout(Duration::from_secs(3), queue.recv()).await.unwrap().unwrap();
+        assert_eq!(
+            outgoing.command,
+            "trpc.login.ecdh.EcdhService.SsoNTLoginRefreshTicket"
+        );
+        client.set_ticket_refresh_interval(7, 0).unwrap();
+        tokio::task::yield_now().await;
+        let common = auth::NtResponse {
+            head: Some(auth::NtResponseHead::default()),
+            body: Some(
+                auth::NtRefreshTicketResponseBody {
+                    tickets: Some(auth::NtTickets {
+                        a1: Some(Bytes::from_static(b"refreshed-after-disable")),
+                        raw_time_field12: Some(auth::NtTicketTimeValues {
+                            raw_field1: Some(1000),
+                            raw_field2: None,
+                        }),
+                        ..Default::default()
+                    }),
+                    account: None,
+                }
+                .encode_to_vec()
+                .into(),
+            ),
+        };
+        let reply = auth::NtForward {
+            encrypted: Some(
+                crate::crypto::aes_gcm_encrypt(&common.encode_to_vec(), &[42; 16])
+                    .unwrap()
+                    .into(),
+            ),
+            ..Default::default()
+        }
+        .encode_to_vec()
+        .into();
+        let pending = client
+            .inner
+            .lock()
+            .unwrap()
+            .pending
+            .remove(&outgoing.sequence)
+            .unwrap();
+        assert!(pending.reply.send(Ok(reply)).is_ok());
+        loop {
+            if let LoginEvent::KeystoreChanged(store) = events.recv().await.unwrap() {
+                assert_eq!(store.a1, b"refreshed-after-disable");
+                break;
+            }
+        }
+        assert_eq!(
+            client.snapshot().await.keystore.a1,
+            b"refreshed-after-disable"
+        );
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+        assert!(queue.try_recv().is_err());
+        cancel.cancel();
+        worker.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod friend_status_tests {
+    use super::*;
+    use crate::{
+        contacts::{FriendStatus, FriendStatusSnapshot},
+        lifecycle::status,
+        proto::{contacts::OidbEnvelope, status as pb},
+    };
+
+    fn online_client() -> (Arc<Client>, mpsc::Receiver<Outgoing>) {
+        let client = Client::new(ClientConfig::default(), Keystore::default()).unwrap();
+        let (sender, receiver) = mpsc::channel(8);
+        {
+            let mut inner = client.inner.lock().unwrap();
+            inner.generation = 7;
+            inner.connection = Some(Connection { generation: 7, sender });
+            inner.state.online = true;
+            inner.state.keystore.uin = 42;
+            inner.state.keystore.uid = "u_synthetic_self".into();
+        }
+        (client, receiver)
+    }
+
+    fn reply(client: &Client, sequence: i32, response: Result<Bytes>) {
+        let pending = client.inner.lock().unwrap().pending.remove(&sequence).unwrap();
+        assert!(pending.reply.send(response).is_ok());
+    }
+
+    fn response() -> Bytes {
+        OidbEnvelope {
+            command: Some(0x116d),
+            service: Some(1),
+            code: Some(0),
+            body: Some(pb::FriendStatusResponse {
+                self_uid: Some("u_synthetic_self".into()),
+                interval_minutes: Some(30),
+                over: Some(1),
+                next_start: Some(400),
+                online_info: vec![pb::FriendOnlineInfo {
+                    uid: Some("u_synthetic_friend".into()),
+                    status: Some(10),
+                    status_override: Some(11),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }.encode_to_vec().into()),
+            ..Default::default()
+        }.encode_to_vec().into()
+    }
+
+
+    #[tokio::test(start_paused = true)]
+    async fn polls_after_login_every_thirty_minutes_and_stops_without_losing_error_semantics() {
+        let (client, mut queue) = online_client();
+        let cancel = CancellationToken::new();
+        let worker = tokio::spawn(status::run(Arc::downgrade(&client), 7, cancel.clone()));
+        let initial = queue.recv().await.unwrap();
+        reply(&client, initial.sequence, Ok(response()));
+        tokio::task::yield_now().await;
+        let snapshot = client.cached_friend_statuses().unwrap();
+        tokio::time::advance(Duration::from_secs(1799)).await;
+        tokio::task::yield_now().await;
+        assert!(queue.try_recv().is_err());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let poll = queue.recv().await.unwrap();
+        reply(&client, poll.sequence, Err(Error::Server { code: 17, message: "synthetic rejection".into() }));
+        tokio::task::yield_now().await;
+        assert!(client.is_current_online(7));
+        assert!(Arc::ptr_eq(&snapshot, &client.cached_friend_statuses().unwrap()));
+        cancel.cancel();
+        worker.await.unwrap();
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        assert!(queue.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn account_aba_cancels_queued_frames_and_rejects_old_cache_commits() {
+        let (client, mut queue) = online_client();
+        let fetch_client = client.clone();
+        let fetch = tokio::spawn(async move { fetch_client.fetch_friend_statuses().await });
+        let outgoing = queue.recv().await.unwrap();
+        let binding = client.inner.lock().unwrap().friend_statuses.binding.clone().unwrap();
+        let mut state = client.snapshot().await;
+        state.keystore.uin = 43;
+        state.keystore.uid = "u_other_synthetic".into();
+        client.replace_state(state).await;
+        assert!(binding.cancel.is_cancelled());
+        assert!(outgoing.cancel.is_cancelled());
+        assert!(matches!(fetch.await.unwrap(), Err(Error::Disconnected)));
+        assert!(client.cached_friend_statuses().is_none());
+        {
+            let mut inner = client.inner.lock().unwrap();
+            inner.state.keystore.uin = binding.uin;
+            inner.state.keystore.uid = binding.uid.clone();
+            inner.state.online = true;
+        }
+        let snapshot = Arc::new(FriendStatusSnapshot {
+            statuses: BTreeMap::<String, FriendStatus>::new(),
+            interval_minutes: Some(30),
+            received_unix_ms: 0,
+        });
+        assert!(matches!(client.commit_friend_statuses(&binding, snapshot), Err(Error::Disconnected)));
+        assert!(matches!(client.request_friend_status(&binding, Bytes::new()).await, Err(Error::Disconnected)));
+        assert!(queue.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn old_generation_response_cannot_commit_into_new_connection() {
+        let (client, mut queue) = online_client();
+        let fetch_client = client.clone();
+        let fetch = tokio::spawn(async move { fetch_client.fetch_friend_statuses().await });
+        let outgoing = queue.recv().await.unwrap();
+        {
+            let mut inner = client.inner.lock().unwrap();
+            inner.generation = 8;
+            inner.connection.as_mut().unwrap().generation = 8;
+        }
+        reply(&client, outgoing.sequence, Ok(response()));
+        assert!(matches!(fetch.await.unwrap(), Err(Error::Disconnected)));
+        assert!(client.cached_friend_statuses().is_none());
+    }
+
+    #[tokio::test]
+    async fn stopped_or_unconfirmed_context_never_starts_polling() {
+        let (client, mut queue) = online_client();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        status::run(Arc::downgrade(&client), 7, cancel).await;
+        client.inner.lock().unwrap().state.online = false;
+        status::run(Arc::downgrade(&client), 7, CancellationToken::new()).await;
+        assert!(queue.try_recv().is_err());
+    }
+}

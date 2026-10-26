@@ -7,7 +7,7 @@ use crate::{
     proto::admin,
 };
 use ciborium::Value;
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::{
     sync::Arc,
@@ -410,9 +410,9 @@ impl Admin {
         tips_sequence_id: u64,
     ) -> Result<()> {
         let uid = if is_group {
-            rand::thread_rng().gen_range(7_580_000_000_000_000_000..7_580_099_999_999_999_999u64)
+            rand::rng().random_range(7_580_000_000_000_000_000..7_580_099_999_999_999_999u64)
         } else {
-            rand::thread_rng().gen_range(7_500_000_000_000_000_000..7_509_999_999_999_999_999u64)
+            rand::rng().random_range(7_500_000_000_000_000_000..7_509_999_999_999_999_999u64)
         };
         let info = admin::RecallPokeInfo {
             peer_uin: Some(peer_uin),

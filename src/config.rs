@@ -2,7 +2,7 @@ use atri_core::{ApiError, decode};
 use atri_extensions::Context;
 use atri_qq_api::signing::SigningConfig;
 use atri_qq_protocol::{ClientConfig, Keystore, Profile};
-use rand::RngCore;
+use rand::TryRng;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -42,7 +42,9 @@ impl Config {
         let mut config: Self = ctx.config().load_or_create(&Self::default()).await?;
         if config.machine_id.is_empty() {
             let mut bytes = [0u8; 16];
-            rand::rngs::OsRng.fill_bytes(&mut bytes);
+            rand::rngs::SysRng
+                .try_fill_bytes(&mut bytes)
+                .map_err(ApiError::internal)?;
             config.machine_id = String::with_capacity(32);
             for byte in bytes {
                 write!(&mut config.machine_id, "{byte:02x}")
@@ -71,6 +73,7 @@ impl Config {
             timeout: Duration::from_secs(self.timeout_seconds),
             host: "msfwifi.3g.qq.com".into(),
             port: 8080,
+            server_selection: Default::default(),
         }
     }
 

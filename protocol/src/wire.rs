@@ -118,7 +118,8 @@ pub(crate) mod config_push {
     struct PushRequest {
         #[jce(tag = "1", required)]
         kind: i32,
-        // Configuration bytes (tag 2) are skipped without materializing them.
+        #[jce(tag = "2")]
+        configuration: TarsBytes,
         #[jce(tag = "3")]
         sequence: RequestSequence,
     }
@@ -170,30 +171,93 @@ pub(crate) mod config_push {
     }
 
     fn invalid(error: impl std::fmt::Display) -> Error {
-        malformed(format!("Invalid ConfigPush: {error}"))
+        malformed(format!("Invalid JCE envelope: {error}"))
     }
 
-    pub(super) fn response(body: Bytes) -> Result<Option<Bytes>> {
+    fn unpack(
+        body: Bytes,
+        servant: &str,
+        function: &str,
+        entry: &str,
+        entry_type: &str,
+    ) -> Result<(Packet, Bytes)> {
+        if body.len() > MAX_FRAME_SIZE {
+            return Err(malformed("JCE request exceeds limit"));
+        }
         let mut packet = Packet::decode(body).map_err(invalid)?;
-        if packet.version != 2
-            || packet.servant != "QQService.ConfigPushSvc.MainServant"
-            || packet.function != "PushReq"
-        {
-            return Err(malformed("Unsupported ConfigPush request envelope"));
+        if packet.version != 2 || packet.servant != servant || packet.function != function {
+            return Err(malformed("Unsupported JCE request envelope"));
         }
-        let mut data = Data::decode(packet.buffer.0).map_err(invalid)?;
-        let request = data
-            .entries
-            .remove("PushReq")
-            .and_then(|mut entries| entries.remove("ConfigPush.PushReq"))
-            .ok_or_else(|| malformed("Missing ConfigPush.PushReq"))?
-            .0;
-        if request.first() != Some(&0x0a) || request.last() != Some(&0x0b) {
-            return Err(malformed("Invalid ConfigPush request struct"));
+        let mut data = Data::decode(std::mem::take(&mut packet.buffer.0)).map_err(invalid)?;
+        let body = data.entries.remove(entry)
+            .and_then(|mut entries| entries.remove(entry_type))
+            .ok_or_else(|| malformed("Missing JCE request body"))?.0;
+        if body.first() != Some(&0x0a) || body.last() != Some(&0x0b) {
+            return Err(malformed("Invalid JCE request struct"));
         }
-        let request = PushRequest::decode(request.slice(1..request.len() - 1)).map_err(invalid)?;
+        let inner = body.slice(1..body.len() - 1);
+        Ok((packet, inner))
+    }
+
+    pub(crate) fn payload(
+        body: Bytes,
+        servant: &str,
+        function: &str,
+        entry: &str,
+        entry_type: &str,
+    ) -> Result<Bytes> {
+        unpack(body, servant, function, entry, entry_type).map(|(_, body)| body)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn payload_fixture(
+        servant: &str,
+        function: &str,
+        entry: &str,
+        entry_type: &str,
+        body: Bytes,
+    ) -> Bytes {
+        let mut wrapped = BytesMut::with_capacity(body.len() + 2);
+        wrapped.put_u8(0x0a);
+        wrapped.put_slice(&body);
+        wrapped.put_u8(0x0b);
+        encode(&Packet {
+            version: 2,
+            servant: servant.into(),
+            function: function.into(),
+            buffer: TarsBytes(encode(&Data {
+                entries: HashMap::from([(
+                    entry.into(),
+                    HashMap::from([(entry_type.into(), TarsBytes(wrapped.freeze()))]),
+                )]),
+            })),
+            ..Default::default()
+        })
+    }
+
+    pub(crate) struct DecodedPush {
+        pub kind: i32,
+        pub sequence: Option<i64>,
+        pub configuration: Bytes,
+        pub acknowledgment: Option<Bytes>,
+    }
+
+    pub(crate) fn decode(body: Bytes) -> Result<DecodedPush> {
+        let (mut packet, request) = unpack(
+            body,
+            "QQService.ConfigPushSvc.MainServant",
+            "PushReq",
+            "PushReq",
+            "ConfigPush.PushReq",
+        )?;
+        let request = PushRequest::decode(request).map_err(invalid)?;
         if request.kind != 1 {
-            return Ok(None);
+            return Ok(DecodedPush {
+                kind: request.kind,
+                sequence: request.sequence.0,
+                configuration: request.configuration.0,
+                acknowledgment: None,
+            });
         }
         let sequence = request
             .sequence
@@ -211,7 +275,17 @@ pub(crate) mod config_push {
                 HashMap::from([("ConfigPush.PushResp".into(), TarsBytes(wrapped))]),
             )]),
         }));
-        Ok(Some(encode(&packet)))
+        Ok(DecodedPush {
+            kind: request.kind,
+            sequence: Some(sequence),
+            configuration: request.configuration.0,
+            acknowledgment: Some(encode(&packet)),
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn response(body: Bytes) -> Result<Option<Bytes>> {
+        decode(body).map(|push| push.acknowledgment)
     }
 
     #[cfg(test)]
@@ -220,6 +294,7 @@ pub(crate) mod config_push {
             wrap(&PushRequest {
                 kind,
                 sequence: RequestSequence(Some(sequence)),
+                configuration: TarsBytes::default(),
             }),
             0,
         )
@@ -335,9 +410,6 @@ pub(crate) mod config_push {
     }
 }
 
-pub(crate) fn encode_config_push_response(body: Bytes) -> Result<Option<Bytes>> {
-    config_push::response(body)
-}
 pub(crate) struct Reader {
     data: Bytes,
 }

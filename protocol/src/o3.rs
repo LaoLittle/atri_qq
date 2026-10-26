@@ -7,6 +7,7 @@ mod crypto;
 pub(crate) use channel::Channel;
 
 mod heartbeat;
+mod task11;
 pub(crate) use heartbeat::{Heartbeat, Work};
 
 #[derive(Default)]
@@ -31,19 +32,18 @@ const SDK_VERSION: &str = "0.0.20";
 const REPORT_ID: &str = "0df00071646";
 
 pub const CANONICAL_REPORT_MODULE_PATHS: &[&str] = &[
-    "/opt/lib/qq/resources/app/app_launcher/index.js",
-    "/opt/lib/qq/resources/app/app_launcher/launcher.js",
-    "/opt/lib/qq/resources/app/application.asar/165.background.js",
-    "/opt/lib/qq/resources/app/application.asar/288.background.js",
-    "/opt/lib/qq/resources/app/application.asar/357.background.js",
-    "/opt/lib/qq/resources/app/application.asar/544.background.js",
-    "/opt/lib/qq/resources/app/application.asar/790.background.js",
-    "/opt/lib/qq/resources/app/application.asar/86.background.js",
-    "/opt/lib/qq/resources/app/application.asar/875.background.js",
-    "/opt/lib/qq/resources/app/application.asar/app_launcher/index.js",
-    "/opt/lib/qq/resources/app/application.asar/app_launcher/launcher.js",
-    "/opt/lib/qq/resources/app/application.asar/background.js",
-    "/opt/lib/qq/resources/app/application.asar/node-plugin.background.js",
+    "/opt/QQ/resources/app/app_launcher/index.js",
+    "/opt/QQ/resources/app/app_launcher/launcher.js",
+    "/opt/QQ/resources/app/application.asar/165.background.js",
+    "/opt/QQ/resources/app/application.asar/288.background.js",
+    "/opt/QQ/resources/app/application.asar/357.background.js",
+    "/opt/QQ/resources/app/application.asar/544.background.js",
+    "/opt/QQ/resources/app/application.asar/790.background.js",
+    "/opt/QQ/resources/app/application.asar/86.background.js",
+    "/opt/QQ/resources/app/application.asar/app_launcher/index.js",
+    "/opt/QQ/resources/app/application.asar/app_launcher/launcher.js",
+    "/opt/QQ/resources/app/application.asar/background.js",
+    "/opt/QQ/resources/app/application.asar/node-plugin.background.js",
 ];
 
 /// Bound trusted caller-supplied inventory without inspecting the host or
@@ -144,7 +144,7 @@ pub fn verify_file_telemetry(state: &SessionState, module_paths: Option<&[String
         SDK_VERSION.into(),
         "verify_file".into(),
         concat!(
-            r#"{"application.asar":"1","major.node":"1","package.json":"1","wrapper.node":"1"}"#,
+            r#"{"/opt/QQ/resources/app/application.json":"0"}"#,
             "\n",
         )
         .into(),

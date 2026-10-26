@@ -2,7 +2,7 @@ use super::{ACCESS_COMMAND, ESTABLISH_COMMAND, crypto};
 use crate::{Error, Result, proto::o3 as pb};
 use bytes::{Bytes, BytesMut};
 use prost::Message;
-use rand::RngCore;
+use rand::TryRng;
 
 pub(crate) struct Channel {
     peer: [u8; 33],
@@ -168,7 +168,7 @@ impl Channel {
         self.state = State::Vacant;
         let agreement = crypto::Agreement::new(&self.peer)?;
         let mut random = [0; 40];
-        rand::rngs::OsRng
+        rand::rngs::SysRng
             .try_fill_bytes(&mut random)
             .map_err(|_| Error::Crypto("O3 channel entropy unavailable".into()))?;
         let uuid: [u8; 32] = random[..32].try_into().unwrap();

@@ -351,8 +351,11 @@ impl WtLogin {
         Ok((command, r.rest()))
     }
 }
-pub(super) fn apply_tickets(t: &BTreeMap<u16, Bytes>, k: &mut Keystore) -> Result<()> {
-    // Validate into a detached candidate. Invalid partial responses never poison restored tickets.
+pub(super) fn apply_tickets(
+    t: &BTreeMap<u16, Bytes>,
+    k: &mut Keystore,
+    generated_unix_seconds: u64,
+) -> Result<()> {
     let mut candidate = k.clone();
     for (&tag, value) in t {
         match tag {
@@ -406,6 +409,16 @@ pub(super) fn apply_tickets(t: &BTreeMap<u16, Bytes>, k: &mut Keystore) -> Resul
     if candidate.d2.is_empty() || candidate.a2.is_empty() || candidate.d2_key.len() != 16 {
         return Err(malformed("Successful WT response lacks D2/A2 tickets"));
     }
+    candidate.nt_ticket_times = None;
+    candidate.wt_ticket_times = Some(WtTicketTimeMetadata {
+        next_refresh_unix_seconds: generated_unix_seconds
+            .checked_add(604_800)
+            .ok_or_else(|| malformed("WT ticket refresh time overflow"))?,
+        expire_unix_seconds: generated_unix_seconds
+            .checked_add(2_592_000)
+            .ok_or_else(|| malformed("WT ticket expiry time overflow"))?,
+    });
+    candidate.ticket_generated_unix_seconds = Some(generated_unix_seconds);
     *k = candidate;
     Ok(())
 }
@@ -441,11 +454,27 @@ mod tests {
         tlvs.add(0x305, [0x22; 16]);
         let mut reader = Reader::new(tlvs.encode(None).unwrap());
         let tickets = Tlv::decode(&mut reader).unwrap();
-        let mut keystore = Keystore::default();
-        apply_tickets(&tickets, &mut keystore).unwrap();
+        let mut keystore = Keystore {
+            nt_ticket_times: Some(NtTicketTimeMetadata {
+                field12: Some(NtTicketTimeValues::default()),
+                field16: None,
+                received_unix_ms: 1,
+            }),
+            ..Default::default()
+        };
+        apply_tickets(&tickets, &mut keystore, 1_000).unwrap();
         assert_eq!(keystore.d2_key, [0x22; 16]);
         assert_eq!(keystore.d2, b"new-d2");
         assert_eq!(keystore.a2, b"new-a2");
+        assert_eq!(keystore.nt_ticket_times, None);
+        assert_eq!(keystore.ticket_generated_unix_seconds, Some(1_000));
+        assert_eq!(keystore.next_ticket_refresh_unix_seconds(), Some(605_800));
+        assert_eq!(keystore.wt_ticket_times.unwrap().expire_unix_seconds, 2_593_000);
+        let restored: Keystore =
+            serde_json::from_slice(&serde_json::to_vec(&keystore).unwrap()).unwrap();
+        assert_eq!(restored.wt_ticket_times, keystore.wt_ticket_times);
+        assert_eq!(restored.ticket_generated_unix_seconds, Some(1_000));
+        assert_eq!(restored.next_ticket_refresh_unix_seconds(), Some(605_800));
         assert_eq!(reader.remaining(), 0);
     }
 
@@ -565,10 +594,57 @@ mod tests {
     }
     #[test]
     fn ticket_failure_does_not_mutate_keystore() {
-        let mut k = Keystore::default();
+        let mut k = Keystore {
+            nt_ticket_times: Some(NtTicketTimeMetadata {
+                field12: Some(NtTicketTimeValues::default()),
+                field16: None,
+                received_unix_ms: 1,
+            }),
+            ..Default::default()
+        };
         let old = k.clone();
         let t = BTreeMap::from([(0x143, Bytes::from_static(b"new-d2"))]);
-        assert!(apply_tickets(&t, &mut k).is_err());
+        assert!(apply_tickets(&t, &mut k, 1_000).is_err());
         assert!(old == k);
+    }
+
+    #[test]
+    fn ticket_time_overflow_never_commits_partial_tickets_or_time_source() {
+        let mut store = Keystore {
+            a1: b"old-a1".to_vec(),
+            a2: b"old-a2".to_vec(),
+            d2: b"old-d2".to_vec(),
+            d2_key: vec![1; 16],
+            nt_ticket_times: Some(NtTicketTimeMetadata {
+                field12: Some(NtTicketTimeValues {
+                    raw_field1: Some(123),
+                    raw_field2: Some(456),
+                }),
+                field16: None,
+                received_unix_ms: 1,
+            }),
+            ticket_generated_unix_seconds: Some(100),
+            ..Default::default()
+        };
+        let retained = store.clone();
+        let tickets = BTreeMap::from([
+            (0x106, Bytes::from_static(b"new-a1")),
+            (0x10a, Bytes::from_static(b"new-a2")),
+            (0x143, Bytes::from_static(b"new-d2")),
+            (0x305, Bytes::from_static(&[2; 16])),
+        ]);
+        for generated in [u64::MAX - 604_800 + 1, u64::MAX - 2_592_000 + 1] {
+            assert!(apply_tickets(&tickets, &mut store, generated).is_err());
+            assert!(store == retained);
+        }
+        let generated = u64::MAX - 2_592_000;
+        apply_tickets(&tickets, &mut store, generated).unwrap();
+        assert_eq!(store.ticket_generated_unix_seconds, Some(generated));
+        assert_eq!(store.wt_ticket_times.unwrap().expire_unix_seconds, u64::MAX);
+        assert_eq!(
+            store.next_ticket_refresh_unix_seconds(),
+            generated.checked_add(604_800),
+        );
+        assert_eq!(store.nt_ticket_times, None);
     }
 }

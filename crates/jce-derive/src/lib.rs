@@ -1,11 +1,6 @@
-//! Derived JCE structures from <https://github.com/LaoLittle/rust-jce>, revision
-//! `37363944a2003ea1fc0848464eed90b7c13d9adc` (MIT OR Apache-2.0).
-//! Local changes preserve tag syntax and default fields, add `required`, check
-//! struct ends and nesting, and calculate exact encoded lengths.
-
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{Data, DeriveInput, Fields, Lit, Meta, NestedMeta};
+use syn::{Data, DeriveInput, Expr, Fields, Lit, Meta, Token, punctuated::Punctuated};
 
 #[proc_macro_derive(JceStruct, attributes(jce))]
 pub fn jce(input: TokenStream) -> TokenStream {
@@ -51,8 +46,9 @@ fn try_jce(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             .ok_or_else(|| syn::Error::new_spanned(field, "expected field name"))?;
         let mut explicit_tag = None;
         let mut required = false;
-        for attr in field.attrs.iter().filter(|attr| attr.path.is_ident("jce")) {
-            let list = match attr.parse_meta()? {
+        let mut default = None;
+        for attr in field.attrs.iter().filter(|attr| attr.path().is_ident("jce")) {
+            let list = match &attr.meta {
                 Meta::List(list) => list,
                 _ => {
                     return Err(syn::Error::new_spanned(
@@ -61,13 +57,22 @@ fn try_jce(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                     ))
                 }
             };
-            for nested in list.nested {
+            for nested in list.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)? {
                 match nested {
-                    NestedMeta::Meta(Meta::NameValue(value)) if value.path.is_ident("tag") => {
+                    Meta::NameValue(value) if value.path.is_ident("tag") => {
                         if explicit_tag.is_some() {
                             return Err(syn::Error::new_spanned(value, "duplicate tag attribute"));
                         }
-                        let tag = match &value.lit {
+                        let literal = match &value.value {
+                            Expr::Lit(value) => &value.lit,
+                            _ => {
+                                return Err(syn::Error::new_spanned(
+                                    &value.value,
+                                    "expected a tag from 0 to 255",
+                                ))
+                            }
+                        };
+                        let tag = match literal {
                             Lit::Str(value) => value
                                 .value()
                                 .parse::<u8>()
@@ -82,7 +87,13 @@ fn try_jce(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                         };
                         explicit_tag = Some(tag);
                     }
-                    NestedMeta::Meta(Meta::Path(path)) if path.is_ident("required") => {
+                    Meta::NameValue(value) if value.path.is_ident("default") => {
+                        if default.is_some() {
+                            return Err(syn::Error::new_spanned(value, "duplicate default attribute"));
+                        }
+                        default = Some(value.value);
+                    }
+                    Meta::Path(path) if path.is_ident("required") => {
                         required = true;
                     }
                     other => {
@@ -104,7 +115,10 @@ fn try_jce(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         }
         next_tag = u16::from(tag) + 1;
         let header_len = if tag < 15 { 1usize } else { 2usize };
-        defaults.push(quote!(#ident: ::core::default::Default::default()));
+        defaults.push(match default {
+            Some(value) => quote!(#ident: #value),
+            None => quote!(#ident: ::core::default::Default::default()),
+        });
         lengths.push(quote!(#header_len + ::jce::types::JceType::write_len(&self.#ident)));
         encodes.push(quote!(::jce::types::JceType::write(&self.#ident, buf, #tag);));
         let mark_seen = if required {

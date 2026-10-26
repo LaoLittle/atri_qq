@@ -1,0 +1,20 @@
+syntax = "proto2";
+package atri.qq.file_transfer;
+
+message FileTransSignRequest {
+  optional uint32 account = 1;
+  optional uint32 field2 = 2;
+  optional bytes a2 = 3;
+  optional uint32 field4 = 4;
+  optional bytes machine_guid = 8;
+}
+
+message FileTransSignResponse {
+  optional bytes field1 = 1;
+  optional FileTransSignTicket ticket = 8;
+}
+
+message FileTransSignTicket {
+  optional bytes sign = 1;
+  optional uint64 lifetime_seconds = 2;
+}

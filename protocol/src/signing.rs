@@ -13,7 +13,7 @@ use ::signing::{
         TokenResources, XwidAcquisition,
     },
 };
-use rand::RngCore;
+use rand::TryRng;
 use std::{
     collections::VecDeque,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -64,7 +64,9 @@ impl ExtraEntropy for SigningResources {
             .map_err(|_| Error::Crypto("Wall clock exceeds u64 nanoseconds".into()))
     }
     fn random_u32(&mut self) -> Result<u32> {
-        Ok(rand::rngs::OsRng.next_u32())
+        rand::rngs::SysRng
+            .try_next_u32()
+            .map_err(|error| Error::Crypto(format!("Signing entropy unavailable: {error}")))
     }
 }
 impl TokenResources for SigningResources {
@@ -123,8 +125,10 @@ impl SignResources for SigningResources {
     fn metadata_resources(&mut self, needs_entropy: bool) -> Result<MetadataResources> {
         let entropy_read = if needs_entropy {
             let mut bytes = [0; 16];
-            rand::rngs::OsRng.fill_bytes(&mut bytes);
-            EntropyRead::Complete(bytes)
+            match rand::rngs::SysRng.try_fill_bytes(&mut bytes) {
+                Ok(()) => EntropyRead::Complete(bytes),
+                Err(_) => EntropyRead::Unavailable,
+            }
         } else {
             EntropyRead::Unavailable
         };
@@ -147,8 +151,10 @@ pub struct SessionSigner {
 }
 impl Default for SessionSigner {
     fn default() -> Self {
+        let mut signer = Signer::default();
+        signer.initialize_desktop_resource();
         Self {
-            signer: Signer::default(),
+            signer,
             resources: SigningResources::default(),
             account: None,
             empty_token_reported: false,
@@ -393,7 +399,9 @@ impl SessionSigner {
                     signing_engine::Signature::Full(random_bytes(48).try_into().unwrap())
                 }
             };
-            rand::rngs::OsRng.fill_bytes(&mut signature.token);
+            rand::rngs::SysRng
+                .try_fill_bytes(&mut signature.token)
+                .map_err(|error| Error::Crypto(format!("Signing entropy unavailable: {error}")))?;
         }
         Ok(Some(signature))
     }

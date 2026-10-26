@@ -1,8 +1,8 @@
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use md5::{Digest, Md5};
 use rand_chacha::ChaCha12Rng;
-use rand_core::{RngCore, SeedableRng};
-use rc4::{KeyInit, Rc4, cipher::consts::U8};
+use rand_core::{Rng, SeedableRng};
+use rc4::{KeyInit, Rc4};
 
 pub(crate) fn md5(input: &[u8]) -> [u8; 16] {
     md5_parts(&[input])
@@ -73,7 +73,7 @@ fn derive_key(random_bytes: [u8; 4]) -> [u8; 8] {
 }
 
 fn rc4_self(key: [u8; 8]) -> [u8; 8] {
-    let mut cipher = Rc4::<U8>::new_from_slice(&key).expect("RC4 key is eight bytes");
+    let mut cipher = Rc4::new_from_slice(&key).expect("RC4 key is eight bytes");
     let mut encrypted = key;
     cipher.apply_keystream(&mut encrypted);
     encrypted

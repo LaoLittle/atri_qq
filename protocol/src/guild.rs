@@ -10,7 +10,7 @@ use crate::{Client, Error, IncomingPacket, Result, proto};
 use bytes::Bytes;
 use ciborium::Value;
 use prost::Message;
-use rand::Rng;
+use rand::RngExt;
 use std::sync::Arc;
 
 pub const GUILD_METHODS: &[&str] = &[
@@ -129,7 +129,7 @@ impl Guild {
         }
         let (generation, tiny_id) = self.ready().await?;
         let tiny_id = require_tiny_id(tiny_id)?;
-        let random = rand::thread_rng().gen_range(1..=i32::MAX as u64);
+        let random = rand::rng().random_range(1..=i32::MAX as u64);
         let request = proto::guild::SendRequest {
             message: Some(proto::guild::SendMessage {
                 head: Some(proto::guild::MessageHead {

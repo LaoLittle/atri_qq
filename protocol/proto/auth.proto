@@ -22,6 +22,7 @@ message NtSecurity { optional uint32 mode = 1; }
 message NtRequestHead { optional NtAccountRequest account = 1; optional NtClient client = 2; optional NtApp app = 3; optional NtCookie cookie = 5; optional NtSecurity security = 7; }
 message NtRequest { optional NtRequestHead head = 1; optional bytes body = 2; }
 message NtLoginBody { optional bytes a1 = 1; optional NtCaptcha captcha = 2; }
+message NtRefreshTicketBody { optional bytes a1 = 1; }
 message NtUnusualLoginBody { optional bytes a1 = 1; optional bytes one_click_succeed_sig = 2; }
 message NtCaptcha { optional string ticket = 1; optional string random = 2; optional string sid = 3; }
 message NtNewDeviceBody { optional string success_token = 1; }
@@ -32,6 +33,7 @@ message NtEasyLoginResponseBody { optional NtTickets tickets = 1; optional NtUnu
 message NtPasswordResponseBody { optional NtTickets tickets = 1; optional NtCaptchaChallenge captcha = 2; optional NtUnusualDevice protection = 3; optional NtAccount account = 4; }
 message NtNewDeviceResponseBody { optional NtTickets tickets = 1; optional NtAccount account = 3; }
 message NtPasswordVerificationResponseBody { optional NtTickets tickets = 1; optional NtAccount account = 2; }
+message NtRefreshTicketResponseBody { optional NtTickets tickets = 1; optional NtAccount account = 2; }
 message NtCaptchaChallenge { optional string url = 3; }
 message NtUnusualDevice { optional bytes signature = 2; }
 message NtAccount { optional uint64 uin = 1; optional string uid = 2; optional NtNickname profile = 3; }
@@ -44,10 +46,13 @@ message NtTickets {
   optional NtTgt tgt = 8;
   optional NtServiceTicket service_ticket = 9;
   optional NtHttpTicket http_ticket = 11;
+  optional NtTicketTimeValues raw_time_field12 = 12;
   optional bytes no_pic_sig = 13;
   optional bytes a1_key = 14;
+  optional NtTicketTimeValues raw_time_field16 = 16;
   optional bytes a2_key = 17;
 }
+message NtTicketTimeValues { optional uint64 raw_field1 = 1; optional uint64 raw_field2 = 2; }
 message NtTgt { optional bytes a2_key = 2; optional NtUserProfile profile = 11; optional bytes session_ticket = 12; optional bytes session_ticket_key = 13; }
 message NtUserProfile { optional uint32 face_id = 1; optional string nickname = 2; optional uint32 gender = 3; optional uint32 age = 5; }
 message NtServiceTicket { optional bytes ticket = 1; optional bytes key = 2; }
@@ -60,7 +65,16 @@ message WtUidTicket { optional WtUidLayer layer = 9; }
 message WtUidLayer { optional WtUid identity = 11; }
 message WtUid { optional string uid = 1; }
 
-message Kick { optional string message = 3; optional string title = 4; }
+message Kick {
+ optional uint64 account = 1;
+ optional uint32 same_device = 2;
+ optional string message = 3;
+ optional string title = 4;
+ optional uint32 app_id = 5;
+ optional uint32 instance_id = 6;
+ optional uint32 kicked_type = 7;
+ optional uint32 security_kicked_type = 8;
+}
 message StatusDevice { optional bytes name = 1; optional bytes kernel = 2; optional bytes vendor = 3; optional bytes model = 4; optional bytes os = 5; }
 message UnregisterRequest { optional uint32 type = 1; optional StatusDevice device = 2; optional uint32 reason = 3; }
 message StatusResponse { optional string message = 2; }

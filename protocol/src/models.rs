@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use rand::{RngCore, seq::SliceRandom};
+use rand::{Rng, TryRng, rand_core::UnwrapErr, rngs::SysRng, seq::IndexedRandom};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, time::Duration};
 
@@ -55,6 +55,7 @@ pub struct ClientConfig {
     pub machine_id: String,
     pub host: String,
     pub port: u16,
+    pub server_selection: crate::network::ServerSelection,
     pub timeout: Duration,
     pub uin: u64,
     pub password: Option<String>,
@@ -67,6 +68,7 @@ impl std::fmt::Debug for ClientConfig {
             .field("machine_id", &self.machine_id)
             .field("host", &self.host)
             .field("port", &self.port)
+            .field("server_selection", &self.server_selection)
             .field("timeout", &self.timeout)
             .field("uin", &self.uin)
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
@@ -84,12 +86,42 @@ impl Default for ClientConfig {
             machine_id: hex::encode(random_bytes(16)),
             host: "msfwifi.3g.qq.com".into(),
             port: 8080,
+            server_selection: crate::network::ServerSelection::default(),
             timeout: Duration::from_secs(30),
             uin: 0,
             password: None,
             randomize_signature_for_testing: false,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NtTicketTimeValues {
+    pub raw_field1: Option<u64>,
+    pub raw_field2: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NtTicketTimeMetadata {
+    pub field12: Option<NtTicketTimeValues>,
+    pub field16: Option<NtTicketTimeValues>,
+    pub received_unix_ms: u64,
+}
+
+impl NtTicketTimeMetadata {
+    pub fn selected(&self) -> Option<NtTicketTimeValues> {
+        self.field12.or(self.field16)
+    }
+
+    pub fn next_refresh_unix_seconds(&self) -> Option<u64> {
+        self.selected().map(|values| values.raw_field1.unwrap_or_default())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WtTicketTimeMetadata {
+    pub next_refresh_unix_seconds: u64,
+    pub expire_unix_seconds: u64,
 }
 
 // No Debug implementation: ticket/key bytes must not accidentally become log output.
@@ -126,6 +158,12 @@ pub struct Keystore {
     pub ps_keys: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub o3_xwid_switch: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nt_ticket_times: Option<NtTicketTimeMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wt_ticket_times: Option<WtTicketTimeMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ticket_generated_unix_seconds: Option<u64>,
     #[serde(skip)]
     pub qr_sig: Vec<u8>,
     #[serde(skip)]
@@ -134,6 +172,14 @@ pub struct Keystore {
     pub key_exchange_key: Vec<u8>,
     #[serde(skip)]
     pub login_cookie: Vec<u8>,
+}
+
+impl Keystore {
+    pub fn next_ticket_refresh_unix_seconds(&self) -> Option<u64> {
+        self.nt_ticket_times
+            .and_then(|times| times.next_refresh_unix_seconds())
+            .or_else(|| self.wt_ticket_times.map(|times| times.next_refresh_unix_seconds))
+    }
 }
 
 fn default_device_name() -> String {
@@ -149,7 +195,7 @@ fn default_device_name() -> String {
         "AlmaLinux",
     ];
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut rng = rand::rngs::OsRng;
+    let mut rng = UnwrapErr(SysRng);
     let distribution = DISTRIBUTIONS
         .choose(&mut rng)
         .expect("nonempty distribution list");
@@ -196,6 +242,9 @@ impl Default for Keystore {
             wt_session_ticket_key: vec![],
             ps_keys: BTreeMap::new(),
             o3_xwid_switch: None,
+            nt_ticket_times: None,
+            wt_ticket_times: None,
+            ticket_generated_unix_seconds: None,
             qr_sig: vec![],
             key_exchange_ticket: vec![],
             key_exchange_key: vec![],
@@ -304,6 +353,48 @@ pub enum LoginEvent {
 }
 pub(crate) fn random_bytes(n: usize) -> Vec<u8> {
     let mut v = vec![0; n];
-    rand::rngs::OsRng.fill_bytes(&mut v);
+    SysRng
+        .try_fill_bytes(&mut v)
+        .expect("system entropy unavailable");
     v
+}
+
+#[cfg(test)]
+mod ticket_time_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_records_do_not_invent_ticket_times_or_generation() {
+        let legacy: Keystore = serde_json::from_str(r#"{"a1":[1],"a2":[2],"d2":[3]}"#).unwrap();
+        assert_eq!(legacy.ticket_generated_unix_seconds, None);
+        assert_eq!(legacy.wt_ticket_times, None);
+        assert_eq!(legacy.next_ticket_refresh_unix_seconds(), None);
+
+        let legacy_nt: Keystore = serde_json::from_str(
+            r#"{"nt_ticket_times":{"field12":null,"field16":{"raw_field1":123,"raw_field2":456},"received_unix_ms":1000}}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy_nt.ticket_generated_unix_seconds, None);
+        assert_eq!(legacy_nt.wt_ticket_times, None);
+        assert_eq!(legacy_nt.next_ticket_refresh_unix_seconds(), Some(123));
+    }
+
+    #[test]
+    fn present_nt_message_takes_precedence_over_wt_deadlines() {
+        let mut store = Keystore {
+            nt_ticket_times: Some(NtTicketTimeMetadata {
+                field12: None,
+                field16: None,
+                received_unix_ms: 1000,
+            }),
+            wt_ticket_times: Some(WtTicketTimeMetadata {
+                next_refresh_unix_seconds: 123,
+                expire_unix_seconds: 456,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(store.next_ticket_refresh_unix_seconds(), Some(123));
+        store.nt_ticket_times.as_mut().unwrap().field12 = Some(NtTicketTimeValues::default());
+        assert_eq!(store.next_ticket_refresh_unix_seconds(), Some(0));
+    }
 }

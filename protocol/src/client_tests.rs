@@ -260,41 +260,63 @@ async fn stale_service_state_cannot_resurrect_a_closed_or_replaced_session() {
 }
 
 #[tokio::test]
-async fn kick_push_preserves_details_and_terminates_the_session() {
-    let (client, _queue) = queued_client();
+async fn normal_kick_unregisters_before_closing_and_rejects_business_requests() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = Client::new(
+        ClientConfig {
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+            ..Default::default()
+        },
+        Keystore {
+            d2_key: vec![0; 16],
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let mut events = client.login_events();
-    let mut pushes = client.subscribe();
-    client.confirm_online(0).unwrap();
-    assert!(matches!(
-        events.recv().await.unwrap(),
-        LoginEvent::Online { .. }
-    ));
+    client.connect().await.unwrap();
+    let (socket, _) = listener.accept().await.unwrap();
+    let mut server = Framed::new(socket, SsoFrameCodec);
+    client.confirm_online(client.connection_generation()).unwrap();
+    assert!(matches!(events.recv().await.unwrap(), LoginEvent::Online { .. }));
+    let pending = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            client.request("WaitingBeforeKick", Bytes::new(), RequestType::D2, Encryption::D2, Duration::from_secs(5)).await
+        })
+    };
+    let frame = timeout(Duration::from_secs(2), server.next())
+        .await.unwrap().unwrap().unwrap();
+    assert_eq!(outgoing_d2(frame, &[0; 16]).1, "WaitingBeforeKick");
     let body = auth::Kick {
         title: Some("Session expired".into()),
-        message: Some("Signed in elsewhere".into()),
-    }
-    .encode_to_vec();
-    let command = "trpc.qq_new_tech.status_svc.StatusService.KickNT";
-    client
-        .receive(incoming(0, command, &body, None), 0)
-        .unwrap();
-    let push = pushes.recv().await.unwrap();
-    assert_eq!(push.command, command);
-    assert_eq!(
-        crate::proto::decode::<auth::Kick>(push.body)
-            .unwrap()
-            .message
-            .as_deref(),
-        Some("Signed in elsewhere")
-    );
+        message: Some("Login is no longer valid".into()),
+        app_id: Some(1001),
+        instance_id: Some(537391664),
+        kicked_type: Some(17),
+        security_kicked_type: Some(3),
+        ..Default::default()
+    }.encode_to_vec();
+    server.send(incoming(-71, "trpc.qq_new_tech.status_svc.StatusService.KickNT", &body, None))
+        .await.unwrap();
+    let frame = timeout(Duration::from_secs(2), server.next())
+        .await.unwrap().unwrap().unwrap();
+    let (_, command, body, _) = outgoing_d2(frame, &[0; 16]);
+    assert_eq!(command, "trpc.qq_new_tech.status_svc.StatusService.UnRegister");
+    let unregister: auth::UnregisterRequest = crate::proto::decode(body).unwrap();
+    assert_eq!(unregister.reason, Some(1));
+    assert!(matches!(pending.await.unwrap(), Err(Error::Disconnected)));
+    assert!(matches!(
+        client.request("AfterKick", Bytes::new(), RequestType::D2, Encryption::D2, Duration::from_secs(1)).await,
+        Err(Error::Disconnected)
+    ));
+    assert!(matches!(
+        timeout(Duration::from_secs(2), events.recv()).await.unwrap().unwrap(),
+        LoginEvent::Offline { .. }
+    ));
     assert!(!client.snapshot().await.online);
-    assert!(client.inner.lock().unwrap().connection.is_none());
-    match events.recv().await.unwrap() {
-        LoginEvent::Offline { reason } => {
-            assert_eq!(reason, "Kicked: Session expired Signed in elsewhere");
-        }
-        _ => panic!("Expected offline event"),
-    }
+    assert!(timeout(Duration::from_secs(2), server.next()).await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -916,8 +938,9 @@ async fn framed_tcp_config_push_response_is_send_only_and_does_not_block_request
         let (socket, _) = listener.accept().await.unwrap();
         let mut framed = Framed::new(socket, SsoFrameCodec);
         let push = wire::config_push::request_fixture(1, 0x0102_0304_0506_0708);
-        let expected = wire::encode_config_push_response(push.clone())
+        let expected = wire::config_push::decode(push.clone())
             .unwrap()
+            .acknowledgment
             .unwrap();
         framed
             .send(incoming(-73, "ConfigPushSvc.PushReq", &push, None))
@@ -1051,6 +1074,14 @@ async fn ticket_and_registration_telemetry_preserve_real_token_acquisition() {
     let values = telemetry.data.into_iter().next().unwrap().values;
     assert_eq!(values[2], "verify_file");
     assert_eq!(values[6], client.snapshot().await.machine_id);
+    let inventory: serde_json::Value = serde_json::from_str(&values[3]).unwrap();
+    assert_eq!(
+        inventory,
+        serde_json::json!({"/opt/QQ/resources/app/application.json": "0"})
+    );
+    let modules: Vec<String> = serde_json::from_str(&values[4]).unwrap();
+    assert!(modules.iter().all(|path| path.starts_with("/opt/QQ/resources/app/")));
+    assert!(!modules.iter().any(|path| path.ends_with("/875.background.js")));
     client
         .receive(incoming(sequence, &command, &[], Some(&[0; 16])), 0)
         .unwrap();
@@ -1666,4 +1697,177 @@ async fn server_clock_discards_timed_out_and_replaced_transport_samples() {
     let (sequence, command, _) = outgoing_identity(outgoing.frame);
     client.receive(incoming(sequence, &command, &1u32.to_be_bytes(), None), 0).unwrap();
     assert!(client.server_time_seconds().unwrap() >= 2_000_000_000);
+}
+
+#[tokio::test(start_paused = true)]
+async fn configuration_bootstrap_survives_update_failure_without_repeating_full_fetches() {
+    use crate::proto::lifecycle as configuration;
+    async fn next_configuration(
+        client: &Client,
+        queue: &mut mpsc::Receiver<Outgoing>,
+    ) -> (i32, configuration::ConfigRequest) {
+        loop {
+            let outgoing = queue.recv().await.unwrap();
+            let (sequence, command, body, _) = outgoing_d2(outgoing.frame, &[0; 16]);
+            if command == "trpc.group_pro.configdistribution.ConfigDistributionSvr.SsoGetConfig" {
+                return (sequence, configuration::ConfigRequest::decode(body).unwrap());
+            }
+            assert_eq!(command, "QQClubComm.getNewFlag");
+            let reply = configuration::ClubFlagResponse {
+                code: Some(0),
+                poll_seconds: Some(300),
+                ..Default::default()
+            };
+            client.receive(incoming(sequence, &command, &reply.encode_to_vec(), Some(&[0; 16])), 0).unwrap();
+        }
+    }
+    let command = "trpc.group_pro.configdistribution.ConfigDistributionSvr.SsoGetConfig";
+    let (client, mut queue) = queued_client();
+    {
+        let mut inner = client.inner.lock().unwrap();
+        inner.state.online = true;
+        inner.state.keystore.uin = 1234;
+    }
+    let cancel = CancellationToken::new();
+    let driver = tokio::spawn(crate::lifecycle::run(Arc::downgrade(&client), 0, cancel.clone()));
+    let (sequence, bootstrap) = next_configuration(&client, &mut queue).await;
+    assert_eq!(bootstrap.fetch_type, Some(5));
+    assert!(bootstrap.groups.is_empty());
+    let reply = configuration::ConfigResponse {
+        groups: vec![configuration::ConfigGroup {
+            name: Some("100085".into()),
+            old_version: Some("10055".into()),
+            group_id: Some(100085),
+            new_version: Some(8),
+            records: vec![configuration::ConfigRecord {
+                content: Some(Bytes::from_static(b"[]")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        state: Some(configuration::ConfigServerState {
+            config_sequence: Some(42),
+            inc_cookies: Some(Bytes::from_static(b"global-cookie")),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    client.receive(incoming(sequence, command, &reply.encode_to_vec(), Some(&[0; 16])), 0).unwrap();
+    let (sequence, exact) = next_configuration(&client, &mut queue).await;
+    assert_eq!(exact.fetch_type, Some(2));
+    assert_eq!(exact.origin.unwrap().model_type, Some(2));
+    assert_eq!(exact.groups[0].name.as_deref(), Some("100085"));
+    assert_eq!(exact.groups[0].old_version.as_deref(), Some("1"));
+    assert_eq!(exact.groups[0].new_version, Some(8));
+    assert_eq!(exact.cache.unwrap().inc_cookies, Some(Bytes::new()));
+    client.receive(incoming(sequence, command, b"\x22\xff", Some(&[0; 16])), 0).unwrap();
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(3599)).await;
+    tokio::task::yield_now().await;
+    while let Ok(outgoing) = queue.try_recv() {
+        let (sequence, command, _, _) = outgoing_d2(outgoing.frame, &[0; 16]);
+        assert_eq!(command, "QQClubComm.getNewFlag");
+        let reply = configuration::ClubFlagResponse {
+            code: Some(0), poll_seconds: Some(300), ..Default::default()
+        };
+        client.receive(incoming(sequence, &command, &reply.encode_to_vec(), Some(&[0; 16])), 0).unwrap();
+    }
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let (sequence, exact) = next_configuration(&client, &mut queue).await;
+    assert_eq!(exact.fetch_type, Some(2));
+    assert_eq!(exact.groups[0].name.as_deref(), Some("100085"));
+    assert_eq!(exact.groups[0].new_version, Some(8));
+    let reply = configuration::ConfigResponse {
+        state: Some(configuration::ConfigServerState::default()),
+        ..Default::default()
+    };
+    client.receive(incoming(sequence, command, &reply.encode_to_vec(), Some(&[0; 16])), 0).unwrap();
+    cancel.cancel();
+    driver.await.unwrap();
+    assert!(client.is_current_online(0));
+    client.terminate("synthetic configuration lifecycle complete".into());
+}
+
+#[tokio::test]
+async fn mobile_logoff_notice_is_observable_without_pc_logout_or_ack() {
+    use jce::JceStruct;
+    let (client, mut queue) = queued_client();
+    client.confirm_online(0).unwrap();
+    let mut notices = client.login_notifications();
+    let mut events = client.login_events();
+    let value = crate::network::LoginNotificationBody {
+        raw_field0: 7,
+        raw_field1: 2,
+        raw_field3: 110,
+        title: "Peer session".into(),
+        message: "Another device changed status".into(),
+        ..Default::default()
+    };
+    let mut body = bytes::BytesMut::with_capacity(value.encoded_len());
+    value.encode_raw(&mut body);
+    let body = wire::config_push::payload_fixture(
+        "StatSvc",
+        "SvcReqMSFLoginNotify",
+        "SvcReqMSFLoginNotify",
+        "QQService.SvcReqMSFLoginNotify",
+        body.freeze(),
+    );
+    client.receive(incoming(-87, crate::network::LOGIN_NOTIFICATION_COMMAND, &body, None), 0).unwrap();
+    assert_eq!(notices.recv().await.unwrap().body.raw_field3, 110);
+    assert!(client.snapshot().await.online);
+    assert!(events.try_recv().is_err());
+    assert!(queue.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn canceled_file_transfer_acquisition_does_not_block_the_next_demand() {
+    let (client, mut queue) = queued_client();
+    {
+        let mut inner = client.inner.lock().unwrap();
+        inner.state.online = true;
+        inner.state.keystore.uin = 7;
+        inner.state.keystore.uid = "u_synthetic_file_self".into();
+        inner.state.keystore.a2 = vec![2; 16];
+    }
+    let fetching = {
+        let client = client.clone();
+        tokio::spawn(async move { client.file_transfer_ticket().await })
+    };
+    let first = timeout(Duration::from_secs(2), queue.recv()).await.unwrap().unwrap();
+    assert_eq!(first.command, "OidbSvcTrpcTcp.0x9a2_8");
+    fetching.abort();
+    assert!(fetching.await.unwrap_err().is_cancelled());
+    let fetching = {
+        let client = client.clone();
+        tokio::spawn(async move { client.file_transfer_ticket().await })
+    };
+    let retry = timeout(Duration::from_secs(2), queue.recv()).await.unwrap().unwrap();
+    let response = crate::proto::contacts::OidbEnvelope {
+        command: Some(0x9a2),
+        service: Some(8),
+        code: Some(0),
+        body: Some(crate::proto::file_transfer::FileTransSignResponse {
+            ticket: Some(crate::proto::file_transfer::FileTransSignTicket {
+                sign: Some(Bytes::from_static(b"synthetic-relay-ticket")),
+                lifetime_seconds: Some(43200),
+            }),
+            ..Default::default()
+        }.encode_to_vec().into()),
+        ..Default::default()
+    }.encode_to_vec();
+    client.receive(incoming(retry.sequence, &retry.command, &response, None), 0).unwrap();
+    fetching.await.unwrap().unwrap();
+    assert!(client.cached_file_transfer_ticket().is_some());
+    let replacement = SessionState {
+        keystore: Keystore {
+            uin: 8,
+            uid: "u_synthetic_replacement".into(),
+            ..Default::default()
+        },
+        ..client.snapshot().await
+    };
+    client.replace_state(replacement).await;
+    assert!(client.cached_file_transfer_ticket().is_none());
+    assert!(queue.try_recv().is_err());
+    client.terminate("Synthetic file transfer scenario finished".into());
 }

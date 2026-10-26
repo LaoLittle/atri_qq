@@ -161,34 +161,85 @@ async fn run_login(client: &Arc<Client>, codecs: &mut LoginCodecs) -> Result<()>
     require_online(client).await
 }
 pub(crate) async fn refresh_tickets(client: &Arc<Client>) -> Result<()> {
-    let _gate = client
-        .login_gate
-        .try_lock()
-        .map_err(|_| Error::Authentication("Login or ticket refresh is already running".into()))?;
-    let state = client.snapshot().await;
-    if !state.online || state.keystore.a1.is_empty() {
-        return Err(Error::Authentication(
-            "Online A1 session required for ticket refresh".into(),
-        ));
+    refresh_tickets_for_generation(client, client.connection_generation())
+        .await
+        .map(|_| ())
+}
+
+pub(crate) async fn refresh_tickets_for_generation(
+    client: &Arc<Client>,
+    generation: u64,
+) -> Result<bool> {
+    let Ok(_gate) = client.login_gate.try_lock() else {
+        return Ok(false);
+    };
+    if !client.ticket_refresh_ready(generation)? {
+        return Ok(false);
     }
     let mut codecs = client.codecs.lock().await;
     if codecs.is_none() {
-        *codecs = Some(LoginCodecs::new()?)
+        *codecs = Some(LoginCodecs::new()?);
     }
-    let codecs = codecs.as_mut().unwrap();
-    key_exchange(client, &mut codecs.nt).await?;
-    nt_call(
-        client,
-        &codecs.nt,
-        "SsoNTLoginEasyLogin",
-        &auth::NtLoginBody {
+    let codec = &mut codecs.as_mut().unwrap().nt;
+    let mut state = client.snapshot().await;
+    if state.keystore.key_exchange_ticket.is_empty()
+        || !matches!(state.keystore.key_exchange_key.len(), 16 | 24 | 32)
+    {
+        let expected = state.keystore.clone();
+        let request = codec.key_exchange(&state, client.server_time_seconds()?)?;
+        let response = client
+            .request_nt_maintenance(
+                generation,
+                "trpc.login.ecdh.EcdhService.SsoKeyExchange",
+                request,
+            )
+            .await?;
+        let (ticket, key) = codec.decode_key_exchange(response)?;
+        state.keystore.key_exchange_ticket = ticket;
+        state.keystore.key_exchange_key = key;
+        state.keystore.login_cookie.clear();
+        client.commit_nt_maintenance_state(generation, &expected, state)?;
+        state = client.snapshot().await;
+    }
+    if !client.ticket_refresh_ready(generation)? {
+        return Ok(false);
+    }
+    let request = codec.encode(
+        &auth::NtRefreshTicketBody {
             a1: Some(Bytes::copy_from_slice(&state.keystore.a1)),
-            captcha: None,
         },
-        NtResponseKind::Easy,
-    )
-    .await?
-    .require_success()
+        &state,
+    )?;
+    let response = client
+        .request_nt_maintenance(
+            generation,
+            "trpc.login.ecdh.EcdhService.SsoNTLoginRefreshTicket",
+            request,
+        )
+        .await?;
+    let expected = state.keystore.clone();
+    let result = codec.decode(
+        response,
+        &mut state.keystore,
+        NtResponseKind::Refresh,
+        u64::from(client.server_time_seconds()?),
+    )?;
+    if result.code != 0 {
+        client.record_ticket_refresh_result(generation, false)?;
+        return Err(Error::Server {
+            code: result.code as i32,
+            message: format!(
+                "{}: {}",
+                redact_login_urls(&result.title),
+                redact_login_urls(&result.message),
+            ),
+        });
+    }
+    let times = state.keystore.nt_ticket_times;
+    client.commit_nt_maintenance_state(generation, &expected, state)?;
+    client.record_ticket_refresh_result(generation, true)?;
+    trace_ticket_times("SsoNTLoginRefreshTicket", times);
+    Ok(true)
 }
 async fn key_exchange(client: &Client, codec: &mut NtLogin) -> Result<()> {
     let state = client.snapshot().await;
@@ -227,7 +278,12 @@ async fn nt_call(
         )
         .await?;
     let mut state = client.snapshot().await;
-    let result = codec.decode(response, &mut state.keystore, kind)?;
+    let result = codec.decode(
+        response,
+        &mut state.keystore,
+        kind,
+        u64::from(client.server_time_seconds()?),
+    )?;
     let cached_a1_invalidated = state.keystore.uin == requested_uin
         && !state.keystore.a1.is_empty()
         && result.code != 0
@@ -238,8 +294,10 @@ async fn nt_call(
     if cached_a1_invalidated {
         state.keystore.a1.clear();
     }
+    let ticket_times = state.keystore.nt_ticket_times;
     client.replace_state(state).await;
     if result.code == 0 {
+        trace_ticket_times(method, ticket_times);
         client.mark_signing_ticket_complete()?;
     } else {
         // Keep the server's reason even if the caller starts a fresh login.
@@ -257,6 +315,26 @@ async fn nt_call(
             "NT login returned an authentication error");
     }
     Ok(result)
+}
+
+fn trace_ticket_times(method: &str, times: Option<NtTicketTimeMetadata>) {
+    if let Some(times) = times {
+        let selected = times.selected();
+        tracing::debug!(target: "atri_qq_protocol::packet_trace",
+            stage = "nt_ticket_times", method,
+            received_unix_ms = times.received_unix_ms,
+            field12_present = times.field12.is_some(),
+            field12_raw_field1 = ?times.field12.and_then(|v| v.raw_field1),
+            field12_raw_field2 = ?times.field12.and_then(|v| v.raw_field2),
+            field16_present = times.field16.is_some(),
+            field16_raw_field1 = ?times.field16.and_then(|v| v.raw_field1),
+            field16_raw_field2 = ?times.field16.and_then(|v| v.raw_field2),
+            selected_field = ?times.field12.map(|_| 12u32).or_else(|| times.field16.map(|_| 16)),
+            selected_raw_field1 = ?selected.and_then(|v| v.raw_field1),
+            selected_raw_field2 = ?selected.and_then(|v| v.raw_field2),
+            next_refresh_unix_seconds = ?times.next_refresh_unix_seconds(),
+            "QQ NT ticket time metadata");
+    }
 }
 
 fn redact_login_urls(text: &str) -> std::borrow::Cow<'_, str> {
@@ -554,7 +632,11 @@ async fn wt_login(client: &Client, codec: &mut WtLogin) -> Result<()> {
         t = Tlv::decode(&mut r)?;
     }
     let mut state = client.snapshot().await;
-    wt::apply_tickets(&t, &mut state.keystore)?;
+    wt::apply_tickets(
+        &t,
+        &mut state.keystore,
+        u64::from(client.server_time_seconds()?),
+    )?;
     client.replace_state(state).await;
     client.mark_signing_ticket_complete()?;
     Ok(())

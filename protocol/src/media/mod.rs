@@ -70,6 +70,52 @@ pub struct Media {
     highway: Mutex<Option<HighwaySession>>,
     sequence: AtomicU32,
 }
+fn image_key_type(url: &reqwest::Url) -> Option<u32> {
+    if url.scheme() != "https"
+        || url.host_str() != Some("multimedia.nt.qq.com.cn")
+        || url.path() != "/download"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some_and(|port| port != 443)
+    {
+        return None;
+    }
+    let mut app_id = None;
+    let mut file_id = None;
+    for (name, value) in url.query_pairs() {
+        match name.as_ref() {
+            "appid" if app_id.is_none() => app_id = Some(value),
+            "fileid" if file_id.is_none() => file_id = Some(value),
+            "appid" | "fileid" => return None,
+            _ => {},
+        }
+    }
+    if file_id.is_none_or(|value| value.is_empty()) {
+        return None;
+    }
+    match app_id.as_deref() {
+        Some("1406") => Some(10),
+        Some("1407") => Some(20),
+        _ => None,
+    }
+}
+fn authorize_image_url(mut url: reqwest::Url, key: &MediaDownloadKey) -> Result<String> {
+    if image_key_type(&url) != Some(key.business_type) || key.store_id != 1 {
+        return Err(Error::Malformed("Media key does not match image URL".into()));
+    }
+    let parameter = key.parameter.strip_prefix('&').unwrap_or(&key.parameter);
+    let parameter = reqwest::Url::parse(&format!("https://localhost/?{parameter}"))
+        .map_err(|_| Error::Malformed("Invalid media key parameter".into()))?;
+    let mut pairs = parameter.query_pairs();
+    let (name, value) = pairs.next().ok_or_else(|| Error::Malformed("Missing media key parameter".into()))?;
+    if name != "rkey" || value.is_empty() || pairs.next().is_some() {
+        return Err(Error::Malformed("Invalid media key parameter".into()));
+    }
+    let retained: Vec<_> = url.query_pairs().filter(|(name, _)| name != "rkey")
+        .map(|(name, value)| (name.into_owned(), value.into_owned())).collect();
+    url.query_pairs_mut().clear().extend_pairs(retained).append_pair("rkey", &value);
+    Ok(url.into())
+}
 impl Media {
     pub fn new(client: Arc<dyn ServiceClient>) -> Self {
         Self {
@@ -412,10 +458,16 @@ impl Media {
             let url = reference.download_url.as_ref().ok_or_else(|| {
                 Error::Unsupported("Media reference has neither MsgInfo nor a download URL".into())
             })?;
-            valid_http_url(url)?;
-            return Ok(url.clone());
+            return self.authorize_download_url(url).await;
         }
         self.download_message_info_url(reference, 0).await
+    }
+    async fn authorize_download_url(&self, url: &str) -> Result<String> {
+        valid_http_url(url)?;
+        let parsed = reqwest::Url::parse(url).map_err(|_| Error::Malformed("Invalid media URL".into()))?;
+        let Some(business_type) = image_key_type(&parsed) else { return Ok(url.to_owned()) };
+        let key = self.client.media_download_key(business_type, 1).await?;
+        authorize_image_url(parsed, &key)
     }
     pub async fn video_thumbnail_url(&self, reference: &MediaReference) -> Result<String> {
         if reference.kind != MediaKind::Video {
@@ -546,8 +598,7 @@ impl Media {
                 .and_then(|v| String::from_utf8(v.to_vec()).ok())
                 .unwrap_or_default()
         );
-        valid_http_url(&url)?;
-        Ok(url)
+        self.authorize_download_url(&url).await
     }
     pub async fn download(&self, reference: &MediaReference, destination: &Path) -> Result<()> {
         let url = self.download_url(reference).await?;

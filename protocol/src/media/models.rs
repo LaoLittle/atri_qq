@@ -2,6 +2,20 @@ use super::*;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct MediaDownloadKey {
+    pub business_type: u32,
+    pub store_id: u32,
+    pub parameter: String,
+    pub created_at: u32,
+    pub ttl_seconds: u64,
+}
+impl MediaDownloadKey {
+    pub fn expires_unix_seconds(&self) -> Option<u64> {
+        u64::from(self.created_at).checked_add(self.ttl_seconds)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaKind {

@@ -87,6 +87,7 @@ pub struct Signer {
     pub command_policy: CommandPolicyState,
     pub sign_enabled: bool,
     pub sequence_only: bool,
+    desktop_resource_initialized: bool,
     last_token_error: Option<TokenError>,
 }
 
@@ -101,6 +102,7 @@ impl Default for Signer {
             command_policy: CommandPolicyState::new(),
             sign_enabled: true,
             sequence_only: false,
+            desktop_resource_initialized: false,
             last_token_error: None,
         }
     }
@@ -115,6 +117,14 @@ impl Signer {
 
     pub fn set_footer_seed(&mut self, seed: &[u8; 48]) {
         self.footer.set_seed(seed);
+    }
+
+    pub fn initialize_desktop_resource(&mut self) {
+        if self.desktop_resource_initialized {
+            return;
+        }
+        self.footer.set_seed(&footer::DESKTOP_SEED);
+        self.desktop_resource_initialized = true;
     }
 
     pub fn context(&self) -> &Context {
@@ -173,7 +183,7 @@ impl Signer {
             let clock = resources.clock_ns().map_err(SignError::Entropy)? as i64;
             let mut prepared = digest::prepare_sign(&input, clock);
 
-            prepared[5] = 0x80;
+            prepared[5] = if self.desktop_resource_initialized { 0 } else { 0x80 };
             let counter = self.command_policy.next(command.as_bytes());
             let facts = resources
                 .metadata_resources(self.metadata.requires_entropy())

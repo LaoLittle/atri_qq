@@ -1,0 +1,31 @@
+syntax = "proto2";
+package atri.qq.network;
+
+message GetIpDirectRequest {
+  optional bytes body = 1;
+}
+
+message GetIpDirectResponse {
+  optional DomainIpConfiguration body = 1;
+}
+
+message DomainIpConfiguration {
+  optional int32 result = 1;
+  optional uint64 uin = 2;
+  repeated DomainAddressList ipv4 = 3;
+  repeated DomainAddressList ipv6 = 4;
+  optional bytes extension = 5;
+}
+
+message DomainAddressList {
+  optional uint32 field_1 = 1;
+  optional string domain = 2;
+  optional uint32 field_3 = 3;
+  optional uint32 field_4 = 4;
+  repeated ServerAddress addresses = 5;
+}
+
+message ServerAddress {
+  optional string host = 1;
+  optional uint32 port = 2;
+}

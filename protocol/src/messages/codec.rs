@@ -923,13 +923,13 @@ fn forward_xml(data: &[u8]) -> Result<String> {
             .read_event()
             .map_err(|error| Error::Malformed(error.to_string()))?
         {
-            Event::Start(element) | Event::Empty(element) if element.name().as_ref() == b"msg" => {
+            Event::Start(element) | Event::Empty(element) if element.name().as_ref() == "msg" => {
                 for attribute in element.attributes() {
                     let attribute =
                         attribute.map_err(|error| Error::Malformed(error.to_string()))?;
-                    if attribute.key.as_ref() == b"m_resid" {
+                    if attribute.key.as_ref() == "m_resid" {
                         return attribute
-                            .decode_and_unescape_value(reader.decoder())
+                            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                             .map(|value| value.into_owned())
                             .map_err(|error| Error::Malformed(error.to_string()));
                     }

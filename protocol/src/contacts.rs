@@ -21,6 +21,7 @@ use tokio::sync::Mutex;
 
 pub const CONTACT_METHODS: &[&str] = &[
     "friends",
+    "friend_statuses",
     "categories",
     "groups",
     "members",
@@ -801,6 +802,9 @@ impl Operations {
             })?,
         })
     }
+    pub async fn fetch_friend_statuses(&self) -> Result<Arc<FriendStatusSnapshot>> {
+        self.client.fetch_friend_statuses().await
+    }
     pub async fn set_status(&self, status: u32) -> Result<bool> {
         if status > i32::MAX as u32 {
             return Err(Error::Malformed(
@@ -842,6 +846,7 @@ impl Operations {
         let args = Args::new(&args)?;
         match method {
             "friends" => value(&self.fetch_friends(args.boolean("refresh", false)?).await?),
+            "friend_statuses" => value(self.fetch_friend_statuses().await?.as_ref()),
             "categories" => value(
                 &self
                     .fetch_friend_categories(args.boolean("refresh", false)?)
