@@ -93,9 +93,7 @@ message InfoSyncRequest {
   optional AppState app = 11;
   optional bytes extension = 13;
 }
-message SyncCursor { optional uint64 timestamp = 1; }
-// Field 6 contains the current and previous C2C cookies, not group cursors.
-message SyncState { optional SyncCursor current_cookie = 1; optional uint64 last_message_time = 2; optional SyncCursor previous_cookie = 3; }
+message SyncState { optional bytes current_cookie = 1; optional uint64 last_message_time = 2; optional bytes previous_cookie = 3; }
 message RegisterDevice { optional string name = 1; optional string kernel = 2; optional string os_version = 3; optional string brand = 4; optional string os = 5; }
 message RegisterBusiness { optional uint32 notify_switch = 1; optional uint32 message_switch = 2; }
 message RegisterInfo {

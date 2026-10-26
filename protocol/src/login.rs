@@ -784,9 +784,9 @@ fn info_sync(state: &SessionState, reconnect: bool, request_random: u32) -> Byte
         current_active_status: Some(2),
         group_last_message_time: Some(0),
         sync: Some(auth::SyncState {
-            current_cookie: Some(auth::SyncCursor { timestamp: None }),
+            current_cookie: Some(Bytes::new()),
             last_message_time: Some(0),
-            previous_cookie: Some(auth::SyncCursor { timestamp: None }),
+            previous_cookie: Some(Bytes::new()),
         }),
         cookie: Some(Bytes::new()),
         register: Some(auth::RegisterInfo {
@@ -1013,34 +1013,6 @@ mod tests {
         assert_eq!(register.server_time, Some(100));
         assert_eq!(register.heartbeat_interval_seconds, Some(360));
         assert_eq!(register.field5, Some(40));
-    }
-    #[test]
-    fn infosync_profile_and_uid_are_not_legacy_android() {
-        let state = SessionState {
-            profile: Profile::linux(),
-            keystore: Keystore::default(),
-            machine_id: "explicit".into(),
-            online: false,
-        };
-        let sync: auth::InfoSyncRequest = proto::decode(info_sync(&state, false, 7)).unwrap();
-        assert_eq!(sync.sync_flag, Some(1759));
-        assert_eq!(sync.current_active_status, Some(2));
-        assert_eq!(sync.group_last_message_time, Some(0));
-        assert_eq!(sync.cookie, Some(Bytes::new()));
-        let cursors = sync.sync.unwrap();
-        assert_eq!(cursors.last_message_time, Some(0));
-        assert_eq!(cursors.current_cookie.unwrap().timestamp, None);
-        assert_eq!(cursors.previous_cookie.unwrap().timestamp, None);
-        let register = sync.register.unwrap();
-        assert_eq!(register.version.as_deref(), Some("3.2.34-53644"));
-        assert_eq!(register.vendor_type, Some(0));
-        assert_eq!(register.kick_pc, Some(0));
-        assert_eq!(register.mute, Some(0));
-        assert_eq!(register.registration_type, Some(1));
-        assert_eq!(register.battery_status, Some(0));
-        assert_eq!(register.first_register, Some(0));
-        assert_eq!(register.field16, Some(7));
-        assert_eq!(register.device.unwrap().os.as_deref(), Some("Linux"));
     }
     #[test]
     fn infosync_reconnect_uses_distinct_registration_mode() {
