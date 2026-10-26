@@ -8,6 +8,7 @@ use atri_core::{
 use atri_extensions::{Context, Extension, ManagedTask};
 use atri_qq_api::guild::GUILD_SERVICE;
 use atri_qq_api::mini_app::MINI_APP_SERVICE;
+use atri_qq_api::sdk_share::SDK_SHARE_SERVICE;
 use atri_qq_api::signing::{SIGNING_METHODS, SIGNING_SERVICE};
 use atri_qq_api::{CONTACTS_SERVICE, FRIENDS_METHOD, FriendInfo, FriendsResponse};
 use atri_qq_protocol::{
@@ -18,6 +19,7 @@ use atri_qq_protocol::{
     media::{MEDIA_METHODS, Media},
     messages::{MESSAGE_METHODS, Messaging},
     mini_app::{MINI_APP_METHODS, MiniApp},
+    sdk_share::{SDK_SHARE_METHODS, SdkShare},
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -39,6 +41,7 @@ pub(crate) struct Services {
     pub(crate) messaging: Messaging,
     pub(crate) guild: Guild,
     pub(crate) mini_app: MiniApp,
+    pub(crate) sdk_share: SdkShare,
     pub(crate) signing: signing::SigningService,
 }
 
@@ -61,6 +64,7 @@ pub(crate) fn protocol_error(error: Error) -> ApiError {
         Error::Io(_) => "qq.io",
         Error::Crypto(_) => "qq.crypto",
         Error::UnconfirmedFileSend { .. } => "qq.send_unconfirmed",
+        Error::UnconfirmedSdkShare { .. } => "qq.share_unconfirmed",
     };
     ApiError::new(code, error.to_string())
 }
@@ -70,6 +74,7 @@ async fn bind_services(ctx: &Context, account: Option<&str>) -> Result<(), ApiEr
         CONTACTS_SERVICE,
         GUILD_SERVICE,
         MINI_APP_SERVICE,
+        SDK_SHARE_SERVICE,
         "qq.admin",
         "qq.messaging",
         "qq.media",
@@ -99,6 +104,7 @@ impl Extension for QQExtension {
             service(GUILD_SERVICE, GUILD_METHODS),
             service("qq.media", MEDIA_METHODS),
             service(MINI_APP_SERVICE, MINI_APP_METHODS),
+            service(SDK_SHARE_SERVICE, SDK_SHARE_METHODS),
             service(SIGNING_SERVICE, SIGNING_METHODS),
             service("atri.messaging", &["send"]),
             service(
@@ -150,6 +156,7 @@ impl Extension for QQExtension {
             configured_uin: config.uin,
             guild: Guild::new(client.clone()),
             mini_app: MiniApp::new(client.clone()),
+            sdk_share: SdkShare::new(client.clone()),
             messaging: Messaging::new(transport, media.clone()),
             media,
             signing: signing::SigningService::default(),
@@ -372,6 +379,11 @@ impl Extension for QQExtension {
             ));
         }
         match call.service.as_str() {
+            SDK_SHARE_SERVICE => services
+                .sdk_share
+                .call(&call.method, call.args)
+                .await
+                .map_err(protocol_error),
             MINI_APP_SERVICE => services
                 .mini_app
                 .call(&call.method, call.args)

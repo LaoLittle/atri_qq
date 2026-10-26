@@ -1,6 +1,7 @@
 pub mod guild;
 pub mod media;
 pub mod mini_app;
+pub mod sdk_share;
 pub mod signing;
 pub use guild::GUILD_SERVICE;
 

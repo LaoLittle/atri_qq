@@ -15,6 +15,7 @@ pub mod messages;
 pub mod message_sync;
 pub mod mini_app;
 pub mod models;
+pub mod sdk_share;
 pub mod network;
 pub mod o3;
 pub mod personal_events;
@@ -49,6 +50,11 @@ pub enum Error {
         "File {file_id} was accepted but confirmation failed ({cause}); do not resend automatically"
     )]
     UnconfirmedFileSend { file_id: String, cause: String },
+    #[error("SDK share result is unknown ({cause}); do not resend automatically")]
+    UnconfirmedSdkShare {
+        #[source]
+        cause: Box<Error>,
+    },
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 impl From<std::io::Error> for Error {

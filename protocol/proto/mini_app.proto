@@ -26,7 +26,7 @@ message ShareTemplate {
 }
 
 message AdaptShareInfoResponse {
-  optional uint32 code = 2;
+  optional int32 code = 2;
   optional string error_message = 3;
   optional AdaptShareInfoContent content = 4;
 }

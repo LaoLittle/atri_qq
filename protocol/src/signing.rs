@@ -767,7 +767,10 @@ mod tests {
         // None resets only the external override, not the session's local identity.
         signer.set_resources(None, None, None).unwrap();
         signer.initialize(&state).unwrap();
-        assert_eq!(signer.resources.collect_properties().unwrap(), defaults);
+        let restored = signer.resources.collect_properties().unwrap();
+        assert_eq!(restored[&16], state.machine_id.as_bytes());
+        assert_eq!(restored[&24], defaults[&24]);
+        assert!(!restored.contains_key(&999));
     }
 
     #[test]

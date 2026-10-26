@@ -105,7 +105,7 @@ fn decode_response(bytes: Bytes) -> Result<AdaptedShareInfo> {
         crate::diagnostics::decode_response(ADAPT_SHARE_INFO_COMMAND, bytes)?;
     if let Some(code) = response.code.filter(|code| *code != 0) {
         return Err(Error::Server {
-            code: code as i32,
+            code,
             message: response.error_message.unwrap_or_default(),
         });
     }
@@ -175,15 +175,15 @@ mod tests {
     }
 
     #[test]
-    fn server_rejection_is_not_misreported_as_missing_card() {
-        let bytes = pb::AdaptShareInfoResponse {
-            code: Some(403),
-            error_message: Some("synthetic rejection".into()),
-            content: None,
-        }
-        .encode_to_vec();
+    fn negative_server_rejection_preserves_signed_code_and_error_without_card() {
+        let bytes = hex::decode(
+            "108b9ba4d0ffffffffff011a18e88eb7e58f96e5ba94e794a8e4bfa1e681afe5a4b1e8b4a5",
+        )
+        .unwrap();
+        let response = pb::AdaptShareInfoResponse::decode(bytes.as_slice()).unwrap();
+        assert_eq!(response.code, Some(-100070005));
         assert!(
-            matches!(decode_response(bytes.into()), Err(Error::Server { code: 403, message }) if message == "synthetic rejection")
+            matches!(decode_response(bytes.into()), Err(Error::Server { code: -100070005, message }) if message == "获取应用信息失败")
         );
     }
 

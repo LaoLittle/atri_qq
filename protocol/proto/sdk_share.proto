@@ -1,0 +1,70 @@
+syntax = "proto2";
+package atri.qq.sdk_share;
+
+message LegacyOidbEnvelope {
+  optional uint32 command = 1;
+  optional uint32 service = 2;
+  optional uint32 result = 3;
+  optional bytes body = 4;
+  optional string error_message = 5;
+  optional string client_version = 6;
+}
+
+message ShareClientInfo {
+  optional uint32 platform = 1;
+  optional string sdk_version = 2;
+  optional string android_package_name = 3;
+  optional string android_signature = 4;
+  optional string ios_bundle_id = 5;
+  optional string pc_sign = 6;
+}
+
+message ShareExtInfo {
+  repeated uint32 custom_feature_ids = 11;
+  optional string apns_wording = 12;
+  optional uint32 group_savedb_flag = 13;
+  optional uint32 receiver_app_id = 14;
+  optional uint64 message_sequence = 15;
+  optional bytes tag_name = 17;
+  optional bytes message_ext = 18;
+}
+
+message MusicShareBody {
+  optional bool using_ark = 1;
+  optional string title = 10;
+  optional string summary = 11;
+  optional string brief = 12;
+  optional string url = 13;
+  optional string picture_url = 14;
+  optional string action = 15;
+  optional string music_url = 16;
+}
+
+message ShareMusicRequest {
+  optional uint64 app_id = 1;
+  optional uint32 app_type = 2;
+  optional uint32 message_style = 3;
+  optional uint64 sender_uin = 4;
+  optional ShareClientInfo client_info = 5;
+  optional string text_message = 6;
+  optional ShareExtInfo ext_info = 7;
+  optional uint32 send_type = 10;
+  optional uint64 receiver_uin = 11;
+  optional MusicShareBody rich_message = 12;
+  optional string receiver_open_id = 14;
+  optional uint64 receiver_guild_id = 19;
+  optional uint64 sign_timestamp = 20;
+  optional uint64 sign_nonce = 21;
+  optional string sign_signature = 22;
+  optional string json = 23;
+  optional uint32 need_app_info = 24;
+}
+
+message ShareMusicResponse {
+  optional string wording = 1;
+  optional uint32 jump_result = 2;
+  optional string jump_url = 3;
+  optional uint32 level = 4;
+  optional uint32 sub_level = 5;
+  optional string developer_message = 6;
+}

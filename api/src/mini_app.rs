@@ -29,8 +29,7 @@ impl Operation for AdaptShareInfoRequest {
     const METHOD: &'static str = "adapt_share_info";
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AdaptShareInfoResponse {
     pub raw_json: String,
     pub light_app_json: String,
