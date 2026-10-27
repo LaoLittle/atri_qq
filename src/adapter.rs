@@ -91,10 +91,10 @@ async fn bind_services(ctx: &Context, account: Option<&str>) -> Result<(), ApiEr
 impl Extension for QQExtension {
     fn metadata() -> ExtensionMetadata {
         let mut descriptor =
-            ExtensionMetadata::new("io.atri.qq", "QQ Linux desktop", env!("CARGO_PKG_VERSION"));
+            ExtensionMetadata::new("io.atri.qq", "QQ NT", env!("CARGO_PKG_VERSION"));
         descriptor.role = ExtensionRole::Adapter;
         descriptor.description =
-            "Native Linux NT protocol, native signing, contacts and messaging".into();
+            "Linux NT and resource-backed iPhone/iPad protocol; mobile token collection, O3 and local QR login are unavailable".into();
         descriptor.configuration.defaults =
             to_value(&config::Config::default()).expect("static QQ defaults serialize");
         descriptor.services = vec![
@@ -143,9 +143,12 @@ impl Extension for QQExtension {
             ));
         }
         let config = config::Config::load(&ctx).await?;
+        let client_config = config.client_config(&ctx).await?;
         let keystore = config.keystore(&ctx).await?;
-        let client = Client::new(config.client_config(), keystore).map_err(protocol_error)?;
-        signing::apply_initial(&client, config.signing)?;
+        let client = Client::new(client_config, keystore).map_err(protocol_error)?;
+        if !config.platform.is_ios() {
+            signing::apply_initial(&client, config.signing.unwrap_or_default())?;
+        }
         let transport: Arc<dyn ServiceClient> = client.clone();
         let operations = Arc::new(Operations::new(transport.clone()));
         let media = Arc::new(Media::new(transport.clone()));

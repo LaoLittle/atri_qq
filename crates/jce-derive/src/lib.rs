@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{Data, DeriveInput, Expr, Fields, Lit, Meta, Token, punctuated::Punctuated};
+use syn::{punctuated::Punctuated, Data, DeriveInput, Expr, Fields, Lit, Meta, Token};
 
 #[proc_macro_derive(JceStruct, attributes(jce))]
 pub fn jce(input: TokenStream) -> TokenStream {
@@ -47,7 +47,11 @@ fn try_jce(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         let mut explicit_tag = None;
         let mut required = false;
         let mut default = None;
-        for attr in field.attrs.iter().filter(|attr| attr.path().is_ident("jce")) {
+        for attr in field
+            .attrs
+            .iter()
+            .filter(|attr| attr.path().is_ident("jce"))
+        {
             let list = match &attr.meta {
                 Meta::List(list) => list,
                 _ => {
@@ -89,7 +93,10 @@ fn try_jce(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                     }
                     Meta::NameValue(value) if value.path.is_ident("default") => {
                         if default.is_some() {
-                            return Err(syn::Error::new_spanned(value, "duplicate default attribute"));
+                            return Err(syn::Error::new_spanned(
+                                value,
+                                "duplicate default attribute",
+                            ));
                         }
                         default = Some(value.value);
                     }

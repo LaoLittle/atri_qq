@@ -16,4 +16,6 @@ mod extension_signing;
 #[cfg(feature = "extension")]
 mod guild_conversion;
 #[cfg(feature = "extension")]
+mod mobile_config;
+#[cfg(feature = "extension")]
 pub use adapter::QQExtension;

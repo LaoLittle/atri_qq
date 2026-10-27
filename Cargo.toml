@@ -25,10 +25,8 @@ signing = { package = "atri_qq_signing", path = "signing" }
 async-trait = { version = "0.1", optional = true }
 serde = { version = "1", features = ["derive"] }
 rand = "0.10"
-tokio = { version = "1", features = ["sync", "macros"] }
-
-[dev-dependencies]
 prost = "0.14"
+tokio = { version = "1", features = ["sync", "macros"] }
 
 [profile.release]
 debug = 1

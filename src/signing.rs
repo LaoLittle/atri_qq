@@ -69,10 +69,12 @@ pub(crate) fn apply_initial(client: &Client, config: SigningConfig) -> Result<()
         )
         .map_err(|error| invalid(&error.to_string()))?;
     if let Some(seed) = seed {
-        client.set_signing_footer_seed(seed);
+        client
+            .set_signing_footer_seed(seed)
+            .map_err(protocol_error)?;
     }
     if let Some(xwid) = xwid {
-        client.complete_signing_xwid(xwid);
+        client.complete_signing_xwid(xwid).map_err(protocol_error)?;
     }
     Ok(())
 }
@@ -118,11 +120,15 @@ impl SigningService {
             }
             "set_footer_seed" => {
                 let args: api::FooterSeed = from_value(&args)?;
-                client.set_signing_footer_seed(footer(&args.seed)?);
+                client
+                    .set_signing_footer_seed(footer(&args.seed)?)
+                    .map_err(protocol_error)?;
                 Ok(Value::Null)
             }
             "complete_xwid" => {
-                client.complete_signing_xwid(xwid(from_value(&args)?)?);
+                client
+                    .complete_signing_xwid(xwid(from_value(&args)?)?)
+                    .map_err(protocol_error)?;
                 Ok(Value::Null)
             }
             "drain_reports" => {

@@ -692,7 +692,13 @@ mod jce_struct {
         }
 
         fn write<B: BufMut>(&self, buf: &mut B, tag: u8) {
-            write_header(buf, JceHeader { val_type: super::LIST, tag });
+            write_header(
+                buf,
+                JceHeader {
+                    val_type: super::LIST,
+                    tag,
+                },
+            );
             crate::ser::write_len(buf, self.len());
             for value in self {
                 value.write(buf, 0);
@@ -702,7 +708,10 @@ mod jce_struct {
         fn write_len(&self) -> usize {
             crate::ser::len_bytes(self.len())
                 + 1
-                + self.iter().map(|value| 1 + value.write_len()).sum::<usize>()
+                + self
+                    .iter()
+                    .map(|value| 1 + value.write_len())
+                    .sum::<usize>()
         }
     }
 }
