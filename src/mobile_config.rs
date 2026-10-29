@@ -1,21 +1,67 @@
 use atri_core::ApiError;
 use atri_extensions::Context;
 use atri_qq_protocol::{
-    IosAccountRecord80, IosDevice, IosPushStatistics, IosRegistration, IosReservedTemplate,
-    IosTransportAccount, IosTransportResources, proto::auth::InfoSyncRequest,
+    ClientConfig, ClientPlatform, IosAccountRecord80, IosDevice, IosPushStatistics, IosRegistration, IosReservedTemplate,
+    IosTransportAccount, IosTransportResources, ios_device::IosVirtualConfig, proto::auth::InfoSyncRequest,
     signing::IosSigningResources,
 };
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use signing::ios::command_policy::CommandPolicy;
+use std::sync::Arc;
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum MobileConfig {
+    Snapshot(MobileSnapshotConfig),
+    Virtual {
+        #[serde(default)]
+        device: Arc<IosVirtualConfig>,
+    },
+}
+
+impl MobileConfig {
+    pub(crate) fn validate(&self, platform: ClientPlatform) -> Result<(), ApiError> {
+        if !platform.is_ios() {
+            return Err(invalid("iOS configuration requires an iPhone or iPad profile"));
+        }
+        match self {
+            Self::Snapshot(snapshot) => snapshot.validate(),
+            Self::Virtual { device } => device.application.heartbeat_resources().map(|_| ()).map_err(crate::adapter::protocol_error),
+        }
+    }
+
+    pub(crate) async fn apply(&self, ctx: &Context, config: &mut ClientConfig) -> Result<(), ApiError> {
+        match self {
+            Self::Snapshot(snapshot) => {
+                let resources = snapshot.load(ctx).await?;
+                config.ios_device = Some(snapshot.device.clone());
+                config.ios_signing = Some(resources.signing);
+                config.ios_transport = Some(resources.transport);
+                config.ios_registration = Some(resources.registration);
+            }
+            Self::Virtual { device } => config.ios_virtual = Some(device.clone()),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn heartbeat_snapshot(&self) -> Option<&atri_qq_api::signing::IosHeartbeatResources> {
+        match self {
+            Self::Snapshot(snapshot) => Some(&snapshot.heartbeat),
+            Self::Virtual { .. } => None,
+        }
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct MobileConfig {
+pub(crate) struct MobileSnapshotConfig {
     pub device: IosDevice,
     pub signing: MobileSigningConfig,
     pub transport: MobileTransportConfig,
     pub registration: MobileRegistrationConfig,
+    #[serde(default)]
+    pub heartbeat: atri_qq_api::signing::IosHeartbeatResources,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -23,6 +69,10 @@ pub(crate) struct MobileConfig {
 pub(crate) struct MobileSigningConfig {
     pub provenance: String,
     pub raw_device_token_file: String,
+    #[serde(default)]
+    pub raw_device_token_expires_at: u64,
+    #[serde(default)]
+    pub raw_device_token_uin: String,
     pub raw_xwid_file: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_state_file: Option<String>,
@@ -46,24 +96,36 @@ pub(crate) struct MobileCommandSwitch {
 
 impl MobileCommandPolicyConfig {
     fn policy(&self) -> Result<CommandPolicy, ApiError> {
-        let mut policy = CommandPolicy::default();
-        for switch in &self.switches {
-            if policy.set_switch(switch.key, switch.value).is_some() {
-                return Err(invalid(
-                    "ios.signing.command_policy.switches contains a duplicate key",
-                ));
-            }
-        }
-        for command in &self.persisted_host_commands {
-            if command.is_empty() || command.contains(',') {
-                return Err(invalid(
-                    "ios.signing.command_policy.persisted_host_commands entries must be nonempty individual command names without commas",
-                ));
-            }
-            policy.append_persisted_host_commands(command);
-        }
-        Ok(policy)
+        command_policy(
+            self.switches
+                .iter()
+                .map(|switch| (switch.key, switch.value)),
+            self.persisted_host_commands.iter().map(String::as_str),
+        )
     }
+}
+
+pub(crate) fn command_policy<'a>(
+    switches: impl IntoIterator<Item = (u32, u32)>,
+    host_commands: impl IntoIterator<Item = &'a str>,
+) -> Result<CommandPolicy, ApiError> {
+    let mut policy = CommandPolicy::default();
+    for (key, value) in switches {
+        if policy.set_switch(key, value).is_some() {
+            return Err(invalid(
+                "ios.signing.command_policy.switches contains a duplicate key",
+            ));
+        }
+    }
+    for command in host_commands {
+        if command.is_empty() || command.contains(',') {
+            return Err(invalid(
+                "ios.signing.command_policy.persisted_host_commands entries must be nonempty individual command names without commas",
+            ));
+        }
+        policy.append_persisted_host_commands(command);
+    }
+    Ok(policy)
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -110,7 +172,7 @@ pub(crate) struct MobileResources {
     pub registration: IosRegistration,
 }
 
-impl MobileConfig {
+impl MobileSnapshotConfig {
     pub(crate) fn validate(&self) -> Result<(), ApiError> {
         if self.device.system_version.is_empty()
             || self.device.hardware_model.is_empty()
@@ -138,7 +200,7 @@ impl MobileConfig {
 
     pub(crate) async fn load(&self, ctx: &Context) -> Result<MobileResources, ApiError> {
         self.validate()?;
-        let raw_device_token = read_nonempty(
+        let raw_device_token = read_resource(
             ctx,
             "ios.signing.raw_device_token_file",
             &self.signing.raw_device_token_file,
@@ -210,6 +272,8 @@ impl MobileConfig {
             signing: IosSigningResources {
                 provenance: self.signing.provenance.clone(),
                 raw_device_token: raw_device_token.into(),
+                raw_device_token_expires_at: self.signing.raw_device_token_expires_at,
+                raw_device_token_uin: self.signing.raw_device_token_uin.clone(),
                 raw_xwid: raw_xwid.into(),
                 channel_state,
                 command_policy: self.signing.command_policy.policy()?,

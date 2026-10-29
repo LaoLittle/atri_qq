@@ -41,6 +41,9 @@ pub(crate) async fn run(weak: Weak<Client>, generation: u64, cancel: Cancellatio
             loaded = true;
             if schedule.interval_seconds.is_none() {
                 let Some(client) = weak.upgrade() else { return };
+                if client.config.profile.platform.is_ios() {
+                    continue;
+                }
                 let result = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return,

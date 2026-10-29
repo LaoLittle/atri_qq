@@ -4,6 +4,7 @@ use prost::Message;
 
 mod channel;
 mod crypto;
+pub mod ios;
 pub(crate) use channel::Channel;
 
 mod heartbeat;

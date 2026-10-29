@@ -314,6 +314,7 @@ impl IosTransportResources {
 pub struct ClientConfig {
     pub profile: Profile,
     pub ios_device: Option<IosDevice>,
+    pub ios_virtual: Option<std::sync::Arc<crate::ios_device::IosVirtualConfig>>,
     pub ios_signing: Option<crate::signing::IosSigningResources>,
     pub ios_registration: Option<IosRegistration>,
     pub ios_transport: Option<IosTransportResources>,
@@ -332,6 +333,13 @@ impl std::fmt::Debug for ClientConfig {
         f.debug_struct("ClientConfig")
             .field("profile", &self.profile)
             .field("ios_device", &self.ios_device)
+            .field(
+                "ios_virtual",
+                &self
+                    .ios_virtual
+                    .as_ref()
+                    .map(|_| "<explicit virtual device>"),
+            )
             .field(
                 "ios_signing",
                 &self.ios_signing.as_ref().map(|_| "<redacted>"),
@@ -364,6 +372,7 @@ impl Default for ClientConfig {
         Self {
             profile: Profile::linux(),
             ios_device: None,
+            ios_virtual: None,
             ios_signing: None,
             ios_registration: None,
             ios_transport: None,
@@ -498,6 +507,7 @@ pub struct Keystore {
     pub uid: String,
     pub guid: Vec<u8>,
     pub ios_msf_imei: String,
+    pub ios_virtual_state: Option<crate::ios_device::IosVirtualState>,
     pub device_name: String,
     pub android_id: String,
     pub qimei: String,
@@ -608,6 +618,7 @@ impl Default for Keystore {
             uid: String::new(),
             guid: random_bytes(16),
             ios_msf_imei: String::new(),
+            ios_virtual_state: None,
             device_name: default_device_name(),
             android_id: hex::encode(random_bytes(8)),
             qimei: String::new(),

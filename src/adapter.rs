@@ -94,7 +94,7 @@ impl Extension for QQExtension {
             ExtensionMetadata::new("io.atri.qq", "QQ NT", env!("CARGO_PKG_VERSION"));
         descriptor.role = ExtensionRole::Adapter;
         descriptor.description =
-            "Linux NT and resource-backed iPhone/iPad protocol; mobile token collection, O3 and local QR login are unavailable".into();
+            "Linux NT and experimental iPhone/iPad with native signing, modeled device resources and mobile O3; mobile local QR login is unavailable".into();
         descriptor.configuration.defaults =
             to_value(&config::Config::default()).expect("static QQ defaults serialize");
         descriptor.services = vec![
@@ -145,9 +145,16 @@ impl Extension for QQExtension {
         let config = config::Config::load(&ctx).await?;
         let client_config = config.client_config(&ctx).await?;
         let keystore = config.keystore(&ctx).await?;
+        let persist_virtual_device = client_config.ios_virtual.is_some();
         let client = Client::new(client_config, keystore).map_err(protocol_error)?;
+        if persist_virtual_device {
+            ctx.storage().write("data", "keystore.cbor", &encode(&client.snapshot().await.keystore)?).await?;
+        }
         if !config.platform.is_ios() {
             signing::apply_initial(&client, config.signing.unwrap_or_default())?;
+        }
+        if let Some(heartbeat) = config.ios.as_ref().and_then(|mobile| mobile.heartbeat_snapshot()) {
+            signing::apply_ios_heartbeat(&client, heartbeat)?;
         }
         let transport: Arc<dyn ServiceClient> = client.clone();
         let operations = Arc::new(Operations::new(transport.clone()));
@@ -294,12 +301,10 @@ impl Extension for QQExtension {
             }
         }
         if call.service == SIGNING_SERVICE {
-            return services.signing.call(
-                &services.client,
-                call.caller_kind,
-                &call.method,
-                call.args,
-            );
+            return services
+                .signing
+                .call(&services.client, call.caller_kind, &call.method, call.args)
+                .await;
         }
         if call.service == "qq.login" {
             return match call.method.as_str() {

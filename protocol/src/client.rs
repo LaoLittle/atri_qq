@@ -24,6 +24,10 @@ use tokio::{
 use tokio_util::{codec::Framed, sync::CancellationToken};
 
 mod file_transfer;
+mod ios_heartbeat;
+mod ios_guild;
+mod ios_network;
+mod ios_o3;
 mod message_sync;
 mod network;
 mod personal_events;
@@ -31,6 +35,12 @@ mod robot_ranges;
 
 #[cfg(test)]
 mod ios_signing_tests;
+
+#[cfg(test)]
+mod ios_heartbeat_tests;
+
+#[cfg(test)]
+mod ios_heartbeat_source_tests;
 
 #[async_trait]
 pub trait ServiceClient: Send + Sync {
@@ -71,6 +81,7 @@ struct Pending {
     key: Vec<u8>,
     reply: oneshot::Sender<Result<Bytes>>,
     cancel: CancellationToken,
+    ios: Option<ios_network::RequestTiming>,
     message_sync: Option<(
         Arc<crate::message_sync::Binding>,
         Arc<crate::message_sync::Request>,
@@ -82,6 +93,7 @@ enum RequestBinding<'a> {
     FriendStatus(&'a Arc<crate::lifecycle::status::Binding>),
     Credentials(&'a Arc<credentials::Session>),
     FileTransfer(&'a Arc<credentials::file_transfer::Binding>),
+    IosO3(&'a ios_o3::Binding),
     SigningReport {
         generation: u64,
         report: &'a SigningReport,
@@ -109,8 +121,11 @@ struct Inner {
     state: SessionState,
     signer: SessionSigner,
     ios_transport: Option<IosTransportResources>,
+    ios_network: Option<crate::ios_device::network::IosNetworkSession>,
+    ios_heartbeat_source: Option<Arc<dyn crate::heartbeat::IosSource>>,
     connection_cookie: Bytes,
     o3: crate::o3::Session,
+    ios_o3: Option<crate::o3::ios::Channel>,
     clock: crate::clock::ServerClock,
     sequence: i32,
     next_id: u64,
@@ -168,9 +183,9 @@ pub struct Client {
     weak: Weak<Client>,
 }
 impl Client {
-    pub fn new(config: ClientConfig, mut keystore: Keystore) -> Result<Arc<Self>> {
+    pub fn new(mut config: ClientConfig, mut keystore: Keystore) -> Result<Arc<Self>> {
         if config.timeout.is_zero() || config.host.is_empty() || config.port == 0 {
-            return Err(wire::malformed("Invalid desktop endpoint/timeout"));
+            return Err(wire::malformed("Invalid SSO endpoint/timeout"));
         }
         if keystore.guid.len() != 16
             || keystore.random_key.len() != 16
@@ -192,6 +207,24 @@ impl Client {
         if config.profile.platform.is_ios() {
             keystore.ensure_ios_identity()?;
         }
+        let (virtual_device, ios_heartbeat_source, ios_network) = if let Some(model) = &config.ios_virtual {
+            if config.ios_device.is_some() || config.ios_signing.is_some() || config.ios_transport.is_some() || config.ios_registration.is_some() {
+                return Err(wire::malformed("Virtual iOS mode owns device, signing, transport and registration resources; do not mix snapshot resources"));
+            }
+            let heartbeat = model.application.heartbeat_resources()?;
+            let now_micros = u64::try_from(signing_engine::ios::source::SystemSource.unix_micros()?)
+                .map_err(|_| wire::malformed("Virtual iOS device creation precedes Unix epoch"))?;
+            let (device, identity) = crate::ios_device::IosVirtualRuntime::initialize(
+                model.clone(), &config.profile, &mut keystore, now_micros,
+            )?;
+            config.ios_device = Some(identity);
+            config.ios_signing = Some(device.signing_resources(keystore.ios_virtual_state.as_ref().unwrap()));
+            config.ios_transport = Some(model.transport_resources()?);
+            let network = crate::ios_device::network::IosNetworkSession::new(model, (now_micros / 1000) as i64);
+            (Some(device), Some(Arc::new(heartbeat) as Arc<dyn crate::heartbeat::IosSource>), Some(network))
+        } else {
+            (None, None, None)
+        };
         // A new client cannot resume another NT manager's challenge/session state.
         keystore.qr_sig.clear();
         keystore.key_exchange_session = None;
@@ -207,11 +240,14 @@ impl Client {
             keystore,
             online: false,
         };
-        let signer = SessionSigner::for_client(
+        let mut signer = SessionSigner::for_client(
             config.application_uuid.clone(),
             &state,
             config.ios_signing.clone(),
         )?;
+        if let Some(device) = virtual_device {
+            signer.enable_ios_virtual(device)?;
+        }
         let ios_transport = config.ios_transport.clone();
         if config.profile.platform.is_ios() {
             if let Some(resources) = &ios_transport {
@@ -231,8 +267,11 @@ impl Client {
                 state,
                 signer,
                 ios_transport,
+                ios_network,
+                ios_heartbeat_source,
                 connection_cookie: Bytes::new(),
                 o3: crate::o3::Session::default(),
+                ios_o3: None,
                 clock: crate::clock::ServerClock::default(),
                 sequence: rand::random::<u32>().wrapping_rem(4_900_001) as i32 + 5_000_000,
                 next_id: 0,
@@ -306,8 +345,23 @@ impl Client {
         if inner.kick_reason.is_some() {
             return;
         }
+        if inner.signer.has_ios_virtual_device()
+            && state.keystore.ios_virtual_state != inner.state.keystore.ios_virtual_state
+        {
+            state.keystore.ios_virtual_state = inner.state.keystore.ios_virtual_state.clone();
+        }
         let account_changed = inner.state.keystore.uin != state.keystore.uin
             || inner.state.keystore.uid != state.keystore.uid;
+        if inner.state.profile.platform.is_ios()
+            && (account_changed
+                || inner.state.machine_id != state.machine_id
+                || inner.state.profile.qua != state.profile.qua
+                || inner.state.profile.platform != state.profile.platform
+                || inner.state.keystore.guid != state.keystore.guid)
+        {
+            inner.signing_cancel.cancel();
+            inner.signing_cancel = CancellationToken::new();
+        }
         if account_changed {
             self.message_sync
                 .replace_identity(state.keystore.uin, &state.keystore.uid);
@@ -401,6 +455,17 @@ impl Client {
                 tracing::warn!(%error, "O3 business session could not be bound");
             }
             signer.registration_complete(state)?;
+            if let Some(saved) = &mut state.keystore.ios_virtual_state {
+                if saved.confirm_registration(state.keystore.uin) {
+                    self.emit(LoginEvent::KeystoreChanged(state.keystore.clone()));
+                }
+            }
+            if signer.has_ios_virtual_device() {
+                let mut uin = itoa::Buffer::new();
+                if let Err(error) = signer.update_ios_logged_accounts(state, &[uin.format(state.keystore.uin)]) {
+                    tracing::warn!(%error, "Mobile authenticated-account token collection failed");
+                }
+            }
             self.background_work.notify_one();
             self.signing_work.notify_one();
         }
@@ -890,6 +955,7 @@ impl Client {
                 Error::Unsupported("Connection generation space exhausted".into())
             })?;
             i.connection_cookie = Bytes::new();
+            self.prepare_ios_connection(&mut i)?;
             (i.generation, i.cancel.clone())
         };
         let socket = tokio::select! {
@@ -897,6 +963,7 @@ impl Client {
             result=tokio::time::timeout(self.config.timeout,self.connect_socket())=>result.map_err(|_|Error::Timeout)??,
         };
         socket.set_nodelay(true)?;
+        let ios_peer = self.config.ios_virtual.as_ref().map(|_| socket.peer_addr()).transpose()?;
         let framed = Framed::new(socket, SsoFrameCodec);
         let (mut sink, mut source) = framed.split();
         let (sender, mut queue) = mpsc::channel::<Outgoing>(512);
@@ -904,6 +971,9 @@ impl Client {
             let mut i = self.inner.lock().unwrap();
             if i.generation != generation || cancel.is_cancelled() {
                 return Err(Error::Disconnected);
+            }
+            if let (Some(network), Some(peer)) = (&mut i.ios_network, ios_peer) {
+                network.connected(peer, crate::ios_device::network::wall_millis()?);
             }
             i.connection = Some(Connection { generation, sender });
         }
@@ -966,11 +1036,20 @@ impl Client {
                 // Once a frame starts, request cancellation MUST NOT abandon its tail.
                 // A successful response can precede sink.flush completion; it never cancels this write.
                 item.trace(generation);
+                if let Some(client) = weak.upgrade() {
+                    if let Err(error) = client.mark_ios_send_started(generation, item.sequence) {
+                        client.terminate_generation(generation, error.to_string());
+                        return;
+                    }
+                }
                 let result = tokio::select! {biased;_ = write_cancel.cancelled()=>return,result=timeout_at(item.deadline,sink.send(item.frame))=>result};
                 match result {
                     Ok(Ok(())) => {
                         if let Some(client) = weak.upgrade() {
-                            client.mark_activity(generation);
+                            if let Err(error) = client.mark_activity(generation, item.sequence, &item.command) {
+                                client.terminate_generation(generation, error.to_string());
+                                return;
+                            }
                             if item.terminal {
                                 client.terminate_generation(generation, String::new());
                                 return;
@@ -1001,6 +1080,7 @@ impl Client {
         self.tasks.lock().unwrap().extend([reader, writer]);
         self.start_background_work(generation);
         self.start_signing_work(generation, crate::o3::Channel::new());
+        self.start_ios_network_work(generation);
         Ok(())
     }
     fn receive(&self, frame: Bytes, generation: u64) -> Result<()> {
@@ -1035,6 +1115,18 @@ impl Client {
         }
         i.last_activity = Instant::now();
         self.activity.notify_one();
+        if i.ios_network.is_some() {
+            let (created, sent) = i.pending.get(&packet.sequence)
+                .filter(|request| request.command == packet.command)
+                .and_then(|request| request.ios.as_ref())
+                .map(|timing| (Some(timing.created), timing.sent))
+                .unwrap_or((None, None));
+            let correction = crate::proto::sso::Reserved::decode(packet.header.server_reserve.as_ref())
+                .ok().and_then(|reserve| reserve.rtt_correction_ms).map(|value| value as i32);
+            i.ios_network.as_mut().unwrap().response(
+                &packet.command, created, sent, correction, crate::ios_device::network::wall_millis()?,
+            );
+        }
         if packet.command == "trpc.qq_new_tech.status_svc.StatusService.KickNT"
             && packet.return_code != 0
         {
@@ -1073,6 +1165,7 @@ impl Client {
                 let actions = self.message_sync.direct(&binding, &request, result);
                 let _ = pending.reply.send(Ok(Bytes::new()));
                 drop(i);
+                self.sync_ios_guild_cursor(generation);
                 self.spawn_message_sync_actions(binding, actions);
                 return Ok(());
             }
@@ -1101,6 +1194,7 @@ impl Client {
                 tracing::warn!(%error, command = packet.command, "QQ message synchronization push rejected");
             }
         }
+        self.sync_ios_guild_cursor(generation);
         if packet.return_code != 0 {
             return Err(Error::Server {
                 code: packet.return_code,
@@ -1265,12 +1359,23 @@ impl Client {
         request_type: RequestType,
         encryption: Encryption,
     ) -> Result<(i32, Bytes)> {
+        self.prepare_frame_from(inner, command, body, request_type, encryption, true)
+    }
+    fn prepare_frame_from(
+        &self,
+        inner: &mut Inner,
+        command: &str,
+        body: Bytes,
+        request_type: RequestType,
+        encryption: Encryption,
+        is_nt_request: bool,
+    ) -> Result<(i32, Bytes)> {
         if inner.state.profile.platform.is_ios() {
             let resources = inner.ios_transport.as_ref().ok_or_else(|| {
                 Error::Authentication("iOS requests require actual transport resources".into())
             })?;
             resources.validate()?;
-            if command == "PushService.get" && resources.push_service_get_statistics.is_none() {
+            if command == "PushService.get" && resources.push_service_get_statistics.is_none() && inner.ios_network.is_none() {
                 return Err(Error::Authentication(
                     "PushService.get requires actual iOS transport statistics".into(),
                 ));
@@ -1295,6 +1400,11 @@ impl Client {
         if signature.is_some() {
             self.signing_work.notify_one();
         }
+        if command == "PushService.get" {
+            if let (Some(network), Some(resources)) = (&mut inner.ios_network, &mut inner.ios_transport) {
+                resources.push_service_get_statistics = Some(network.take_push_statistics());
+            }
+        }
         tracing::debug!(target: "atri_qq_protocol::packet_trace", direction = "send", stage = "prepared", command, sequence, generation = inner.generation, request_type = ?request_type, encryption = ?encryption, body_hex = %hex::encode(&body), "QQ packet");
         let frame = wire::encode_sso(
             command,
@@ -1308,13 +1418,15 @@ impl Client {
                 .ios_transport
                 .as_ref()
                 .map(|resources| (resources, inner.connection_cookie.as_ref())),
-        )?;
+            inner.ios_network.as_ref(),
+            is_nt_request,
+        );
         if inner.state.profile.platform.is_ios() && command == "PushService.get" {
             if let Some(resources) = &mut inner.ios_transport {
                 resources.push_service_get_statistics = Some(IosPushStatistics::default());
             }
         }
-        Ok((sequence, frame))
+        Ok((sequence, frame?))
     }
     async fn send_only(&self, command: &str, body: Bytes, generation: u64) -> Result<()> {
         let deadline = Instant::now()
@@ -1415,6 +1527,7 @@ impl Client {
             let current = match binding {
                 None => true,
                 Some(RequestBinding::Connection(generation)) => i.generation == generation,
+                Some(RequestBinding::IosO3(binding)) => binding.is_current(&i),
                 Some(RequestBinding::Online(generation)) => {
                     i.generation == generation && i.state.online
                 }
@@ -1451,8 +1564,12 @@ impl Client {
                     "Too many outstanding SSO requests".into(),
                 ));
             }
+            let ios = ios_network::RequestTiming::new(&i)?;
+            let is_nt_request = !matches!(binding,
+                Some(RequestBinding::Connection(_) | RequestBinding::IosO3(_) | RequestBinding::Credentials(_))
+            );
             let (sequence, frame) =
-                self.prepare_frame(&mut i, command, body, request_type, encryption)?;
+                self.prepare_frame_from(&mut i, command, body, request_type, encryption, is_nt_request)?;
             i.next_id = i
                 .next_id
                 .checked_add(1)
@@ -1474,6 +1591,7 @@ impl Client {
                     key,
                     reply: tx,
                     cancel: cancel.clone(),
+                    ios,
                     message_sync: None,
                 },
             );
@@ -1500,7 +1618,10 @@ impl Client {
             reply.await.map_err(|_| Error::Disconnected)?
         })
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| {
+            self.note_ios_timeout(sequence, id);
+            Error::Timeout
+        })?
     }
     pub(crate) async fn call(
         &self,
@@ -1621,6 +1742,9 @@ impl Client {
             i.friend_statuses.clear();
             let connected = i.connection.take().is_some();
             i.connection_cookie = Bytes::new();
+            if let Some(network) = &mut i.ios_network {
+                network.disconnect();
+            }
             let online = i.state.online;
             i.state.online = false;
             i.control_replies.clear();
@@ -1638,12 +1762,19 @@ impl Client {
         self.media_keys.close(generation);
         self.captcha.lock().unwrap().take();
     }
-    fn mark_activity(&self, generation: u64) {
+    fn mark_activity(&self, generation: u64, sequence: i32, command: &str) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         if inner.generation == generation && inner.connection.is_some() {
+            if let Some(network) = &mut inner.ios_network {
+                network.sent(command);
+                if let Some(timing) = inner.pending.get_mut(&sequence).and_then(|request| request.ios.as_mut()) {
+                    timing.sent = Some(crate::ios_device::network::wall_millis()?);
+                }
+            }
             inner.last_activity = Instant::now();
             self.activity.notify_one();
         }
+        Ok(())
     }
     pub(crate) fn start_alive(self: &Arc<Self>) {
         let (generation, cancel) = {
@@ -1681,12 +1812,13 @@ impl Client {
                 let result = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return,
-                    result = client.request(
+                    result = client.request_inner(
                         "Heartbeat.Alive",
                         Bytes::from_static(&[0, 0, 0, 4]),
                         RequestType::Simple,
                         Encryption::None,
                         client.config.timeout,
+                        Some(RequestBinding::Connection(generation)),
                     ) => result,
                 };
                 if let Err(error) = result {
@@ -1701,16 +1833,29 @@ impl Client {
         self.tasks.lock().unwrap().push(task);
     }
     pub(crate) fn start_heartbeat(self: &Arc<Self>, server_time: u64, heartbeat_seconds: u32) {
-        let cancel = {
+        let (cancel, mobile) = {
             let mut inner = self.inner.lock().unwrap();
             inner.heartbeat_cancel.cancel();
             inner.heartbeat_cancel = inner.cancel.child_token();
-            inner.heartbeat_cancel.clone()
+            (
+                inner.heartbeat_cancel.clone(),
+                inner.state.profile.platform.is_ios(),
+            )
+        };
+        let mut trigger_time = if mobile {
+            match self.ios_heartbeat_time() {
+                Ok(time) => time,
+                Err(error) => {
+                    tracing::warn!(%error, "Cannot arm mobile heartbeat without epoch time");
+                    return;
+                }
+            }
+        } else {
+            server_time
         };
         let weak = self.weak.clone();
         let task = tokio::spawn(async move {
             let reference = Instant::now();
-            let mut trigger_time = server_time;
             let mut interval = heartbeat_seconds.clamp(120, 500);
             loop {
                 tokio::select! {
@@ -1719,17 +1864,7 @@ impl Client {
                     _ = tokio::time::sleep(Duration::from_secs(u64::from(interval))) => {},
                 }
                 let Some(client) = weak.upgrade() else { return };
-                let body = auth::HeartbeatRequest {
-                    r#type: Some(1),
-                    state: Some(auth::HeartbeatState {
-                        silence_status: Some(0),
-                        silent_version: Some(0),
-                    }),
-                    battery_status: Some(0),
-                    trigger_time: Some(trigger_time),
-                }
-                .encode_to_vec()
-                .into();
+                let body = client.heartbeat_body(trigger_time);
                 let result = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return,
@@ -1750,8 +1885,17 @@ impl Client {
                         tracing::warn!(%error, "SSO heartbeat failed; retaining periodic schedule");
                     }
                 }
-                // Field 4 is the preceding timer-arm time, not this request's send time.
-                trigger_time = server_time.saturating_add(reference.elapsed().as_secs());
+                trigger_time = if mobile {
+                    match client.ios_heartbeat_time() {
+                        Ok(time) => time,
+                        Err(error) => {
+                            tracing::warn!(%error, "Cannot rearm mobile heartbeat without epoch time");
+                            return;
+                        }
+                    }
+                } else {
+                    server_time.saturating_add(reference.elapsed().as_secs())
+                };
             }
         });
         self.tasks.lock().unwrap().push(task);
@@ -1781,6 +1925,10 @@ impl Client {
         Ok(())
     }
     fn start_signing_work(&self, generation: u64, channel: crate::o3::Channel) {
+        if self.inner.lock().unwrap().signer.has_ios_virtual_device() {
+            self.start_ios_signing_work(generation);
+            return;
+        }
         {
             let mut inner = self.inner.lock().unwrap();
             if inner.generation != generation || !inner.signer.uses_desktop_maintenance() {
@@ -2227,11 +2375,11 @@ impl Client {
         &self,
         resources: crate::signing::IosSigningResources,
     ) -> Result<()> {
-        self.inner
-            .lock()
-            .unwrap()
-            .signer
-            .set_ios_resources(resources)
+        let mut inner = self.inner.lock().unwrap();
+        inner.signer.set_ios_resources(resources)?;
+        inner.signing_cancel.cancel();
+        inner.signing_cancel = CancellationToken::new();
+        Ok(())
     }
     pub fn set_ios_transport_resources(&self, resources: IosTransportResources) -> Result<()> {
         resources.validate()?;

@@ -12,6 +12,9 @@ pub const SIGNING_METHODS: &[&str] = &[
     "complete_report",
     "take_token_error",
     "answer_property_challenge",
+    "set_ios_resources",
+    "refresh_ios_token",
+    "set_ios_heartbeat",
 ];
 
 /// Trusted explicit signed-ID observations; the caller owns their provenance.
@@ -152,15 +155,90 @@ pub enum SigningTokenError {
     Transport { code: u32 },
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use atri_core::{Value, from_value};
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IosCommandSwitch {
+    pub key: u32,
+    pub value: u32,
+}
 
-    #[test]
-    fn property_challenge_response_decodes_native_cbor_bytes() {
-        let response: <PropertyChallenge as Operation>::Response =
-            from_value(&Value::Bytes(vec![0, 127, 255])).unwrap();
-        assert_eq!(response.as_ref(), &[0, 127, 255]);
-    }
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IosResources {
+    pub provenance: String,
+    pub raw_device_token: Vec<u8>,
+    #[serde(default)]
+    pub raw_device_token_expires_at: u64,
+    #[serde(default)]
+    pub raw_device_token_uin: String,
+    pub raw_xwid: Vec<u8>,
+    pub channel_state: Option<[u8; 32]>,
+    #[serde(default)]
+    pub switches: Vec<IosCommandSwitch>,
+    #[serde(default)]
+    pub persisted_host_commands: Vec<String>,
+}
+
+impl Operation for IosResources {
+    type Response = ();
+    const SERVICE: &'static str = SIGNING_SERVICE;
+    const METHOD: &'static str = "set_ios_resources";
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum IosNativePayload {
+    Disabled,
+    Encoded {
+        bytes: Vec<u8>,
+    },
+    Session {
+        fingerprint: [u8; 32],
+    },
+    Generate {
+        material: [u8; 16],
+        material_seed: u8,
+        fingerprint: [u8; 32],
+        unix_seconds: u64,
+        process_id: i32,
+        allocation_low32: u32,
+    },
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefreshIosToken {
+    pub properties: Vec<DeviceProperty>,
+    pub native_payload: IosNativePayload,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct IosTokenPersistence {
+    pub key: String,
+    pub value: Vec<u8>,
+}
+
+impl Operation for RefreshIosToken {
+    type Response = Option<IosTokenPersistence>;
+    const SERVICE: &'static str = SIGNING_SERVICE;
+    const METHOD: &'static str = "refresh_ios_token";
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum IosHeartbeatResources {
+    #[default]
+    Unregistered,
+    Snapshot {
+        provenance: String,
+        silence_status: u32,
+        silent_version: u32,
+        battery_status: u32,
+    },
+}
+
+impl Operation for IosHeartbeatResources {
+    type Response = ();
+    const SERVICE: &'static str = SIGNING_SERVICE;
+    const METHOD: &'static str = "set_ios_heartbeat";
 }

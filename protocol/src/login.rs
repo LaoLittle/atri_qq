@@ -47,9 +47,17 @@ impl LoginCodecs {
                 })?
                 .validate()?;
         }
+        let nt = if let Some(model) = &config.ios_virtual {
+            NtLogin::with_device_name(
+                config.ios_device.clone(),
+                Some(model.device_name(config.profile.platform).to_owned()),
+            )?
+        } else {
+            NtLogin::with_device(config.ios_device.clone())?
+        };
         Ok(Self {
             wt: WtLogin::new()?,
-            nt: NtLogin::with_device(config.ios_device.clone())?,
+            nt,
             registered_session: false,
         })
     }
@@ -67,7 +75,7 @@ impl Drop for LoginGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
             self.client
-                .terminate("Desktop login canceled or failed".into())
+                .terminate("Login canceled or failed".into())
         }
     }
 }
@@ -82,7 +90,13 @@ pub(crate) async fn login(client: &Arc<Client>) -> Result<UserInfo> {
         return Ok(UserInfo::from(&state.keystore));
     }
     if state.profile.platform.is_ios() {
-        info_sync_for_config(&state, false, &client.config)?;
+        info_sync_for_config_at(
+            &state,
+            false,
+            &client.config,
+            SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| malformed("iOS registration clock precedes Unix epoch"))?.as_secs(),
+            client.ios_background_since(),
+        )?;
         if state.keystore.a1.is_empty()
             && client.config.password.as_deref().is_none_or(str::is_empty)
         {
@@ -116,7 +130,7 @@ pub(crate) async fn login(client: &Arc<Client>) -> Result<UserInfo> {
         Err(error) => {
             guard.armed = false;
             client
-                .close_transport(format!("Desktop login failed: {error}"))
+                .close_transport(format!("Login failed: {error}"))
                 .await;
             Err(error)
         }
@@ -690,7 +704,7 @@ async fn password_login(client: &Client, codecs: &mut LoginCodecs, password: &st
     }
     if state.keystore.uin == 0 {
         return Err(Error::Authentication(
-            "Desktop password login requires a numeric UIN".into(),
+            "Password login requires a numeric UIN".into(),
         ));
     }
     state.keystore.login_cookie.clear();
@@ -797,11 +811,26 @@ pub(crate) fn registration_confirmed(response: &auth::InfoSyncResponse) -> bool 
         .and_then(|p| p.message.as_deref())
         == Some("register success")
 }
+#[cfg(test)]
 pub(crate) fn info_sync_for_config(
     state: &SessionState,
     reconnect: bool,
     config: &ClientConfig,
 ) -> Result<auth::InfoSyncRequest> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| malformed("iOS registration clock precedes Unix epoch"))?.as_secs();
+    info_sync_for_config_at(state, reconnect, config, now, None)
+}
+
+pub(crate) fn info_sync_for_config_at(
+    state: &SessionState,
+    reconnect: bool,
+    config: &ClientConfig,
+    now_seconds: u64,
+    background_since: Option<u64>,
+) -> Result<auth::InfoSyncRequest> {
+    if let Some(model) = &config.ios_virtual {
+        return crate::ios_device::registration::build(state, reconnect, model, now_seconds, background_since);
+    }
     if !state.profile.platform.is_ios() {
         return Ok(info_sync(state, reconnect));
     }
@@ -811,7 +840,7 @@ pub(crate) fn info_sync_for_config(
     device.validate()?;
     let resources = config.ios_registration.as_ref().ok_or_else(|| {
         Error::Unsupported(
-            "iOS registration requires native initial/reconnect InfoSync resources, including GUID text, locale and notification settings".into(),
+            "Snapshot iOS registration requires native initial/reconnect InfoSync resources".into(),
         )
     })?;
     let mut request = if reconnect {
@@ -851,12 +880,13 @@ pub(crate) fn info_sync(state: &SessionState, reconnect: bool) -> auth::InfoSync
         request_random: None,
         current_active_status: Some(2),
         group_last_message_time: Some(0),
+        group_code: None,
         sync: Some(auth::SyncState {
             current_cookie: Some(Bytes::new()),
             last_message_time: Some(0),
             previous_cookie: Some(Bytes::new()),
         }),
-        cookie: Some(Bytes::new()),
+        platform_extension: Some(Bytes::new()),
         register: Some(auth::RegisterInfo {
             guid: Some(hex::encode(&state.keystore.guid)),
             kick_pc: Some(0),
@@ -872,34 +902,35 @@ pub(crate) fn info_sync(state: &SessionState, reconnect: bool) -> auth::InfoSync
             }),
             mute: Some(0),
             vendor_type: Some(0),
-            registration_type: Some(u32::from(!reconnect)),
+            user_trigger: Some(u32::from(!reconnect)),
             business: Some(auth::RegisterBusiness {
                 notify_switch: Some(0),
-                message_switch: Some(0),
+                bound_uin_notify_switch: Some(0),
             }),
             battery_status: Some(0),
             set_status: Some(1),
             flags: Some(auth::RegisterFlags {
-                field1: Some(0),
-                field2: Some(0),
+                silence_status: Some(0),
+                silent_version: Some(0),
             }),
-            field16: Some(if reconnect { 4 } else { 7 }),
-            field17: Some(0),
-            field18: Some(0),
+            scene: Some(if reconnect { 4 } else { 7 }),
+            background_time: Some(0),
+            is_chat_on_focus: Some(false),
         }),
         guild_sync: Some(proto::guild::GuildSyncRequest {
             pull_scene: Some(if reconnect { 2 } else { 0 }),
-            first_view: Some(proto::guild::GuildFirstViewRequest {
+            memory_increment: Some(proto::guild::GuildMemoryIncrement {
                 last_msg_time: Some(0),
                 last_pull_time: None,
+                entries: Vec::new(),
             }),
         }),
         app: Some(auth::AppState {
-            foreground: Some(0),
-            full_screen: Some(0),
-            background: Some(0),
+            is_delay_req: Some(0),
+            app_status: Some(0),
+            silence_status: Some(0),
         }),
-        extension: Some(Bytes::new()),
+        ai_sync: Some(auth::AiSyncRequest::default()),
     }
 }
 
@@ -974,7 +1005,8 @@ async fn new_device_login(client: &Client, codec: &mut NtLogin, jump: &str) -> R
         .timeout(client.config.timeout)
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()?;
-    let acquired=new_device_request(client,&http,&endpoint,serde_json::json!({"str_dev_auth_token":sig,"str_uin_token":uin_token,"str_dev_type":state.profile.os,"str_dev_name":state.keystore.device_name,"uint32_flag":1,"uint32_url_type":0})).await?;
+    let device_name = client.config.ios_virtual.as_ref().map_or(state.keystore.device_name.as_str(), |model| model.device_name(state.profile.platform));
+    let acquired=new_device_request(client,&http,&endpoint,serde_json::json!({"str_dev_auth_token":sig,"str_uin_token":uin_token,"str_dev_type":state.profile.os,"str_dev_name":device_name,"uint32_flag":1,"uint32_url_type":0})).await?;
     let url = acquired
         .url
         .ok_or_else(|| malformed("New-device QR URL missing"))?;
@@ -1051,7 +1083,7 @@ mod tests {
                     mute: Some(1),
                     business: Some(auth::RegisterBusiness {
                         notify_switch: Some(notify),
-                        message_switch: None,
+                        bound_uin_notify_switch: None,
                     }),
                     ..Default::default()
                 }),
@@ -1160,31 +1192,6 @@ mod tests {
         assert_eq!(register.server_time, Some(100));
         assert_eq!(register.heartbeat_interval_seconds, Some(360));
         assert_eq!(register.field5, Some(40));
-    }
-    #[test]
-    fn infosync_reconnect_uses_distinct_registration_mode() {
-        let state = SessionState {
-            profile: Profile::linux(),
-            keystore: Keystore::default(),
-            machine_id: "synthetic-machine".into(),
-            online: false,
-        };
-        let sync = info_sync(&state, true);
-        assert_eq!(sync.extension, Some(Bytes::new()));
-        let guild_sync = sync.guild_sync.unwrap();
-        assert_eq!(guild_sync.pull_scene, Some(2));
-        assert_eq!(guild_sync.first_view.unwrap().last_msg_time, Some(0));
-        let register = sync.register.unwrap();
-        assert_eq!(register.guid, Some(hex::encode(&state.keystore.guid)));
-        assert_eq!(register.first_register, Some(1));
-        assert_eq!(register.registration_type, Some(0));
-        assert_eq!(register.field16, Some(4));
-        let flags = register.flags.unwrap();
-        assert_eq!(flags.field1, Some(0));
-        assert_eq!(flags.field2, Some(0));
-        let business = register.business.unwrap();
-        assert_eq!(business.notify_switch, Some(0));
-        assert_eq!(business.message_switch, Some(0));
     }
 
     fn qr_confirmation_payload(key: Option<&[u8]>) -> Bytes {

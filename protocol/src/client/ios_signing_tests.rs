@@ -5,7 +5,7 @@ use ::signing::ios::{
     proto::SecurityExtra,
 };
 
-fn config(profile: Profile) -> ClientConfig {
+pub(super) fn config(profile: Profile) -> ClientConfig {
     ClientConfig {
         profile,
         ios_device: Some(IosDevice {
@@ -23,6 +23,8 @@ fn resources() -> IosSigningResources {
     IosSigningResources {
         provenance: "synthetic-client-unit-test-only".into(),
         raw_device_token: Bytes::from_static(b"synthetic-client-token"),
+        raw_device_token_expires_at: u64::MAX,
+        raw_device_token_uin: "0".into(),
         raw_xwid: Bytes::from_static(b"synthetic-client-xwid"),
         channel_state: None,
         command_policy: CommandPolicy::new([(SIGN_SWITCH, 1), (COMMAND_MODE_SWITCH, 0)]),
@@ -56,7 +58,7 @@ fn transport_resources() -> IosTransportResources {
     }
 }
 
-fn reserved(frame: Bytes) -> crate::proto::sso::Reserved {
+pub(super) fn reserved(frame: Bytes) -> crate::proto::sso::Reserved {
     let mut frame = Reader::new(frame);
     frame.u32().unwrap();
     assert_eq!(frame.u32().unwrap(), RequestType::D2 as u32);
@@ -159,7 +161,7 @@ fn mobile_client_never_starts_desktop_o3_work() {
     assert!(Client::new(missing, Keystore::default()).is_err());
 }
 
-fn request_parts(frame: Bytes, key: &[u8]) -> (u32, u8, Bytes, Reader, Bytes) {
+pub(super) fn request_parts(frame: Bytes, key: &[u8]) -> (u32, u8, Bytes, Reader, Bytes) {
     let length = frame.len();
     let mut outer = Reader::new(frame);
     assert_eq!(outer.u32().unwrap() as usize, length);
@@ -653,4 +655,40 @@ fn mobile_transport_rejects_invalid_effective_native_flags() {
     transport.effective_flags[9] = 0;
     transport.effective_flags[10] = 0;
     transport.validate().unwrap();
+}
+
+#[tokio::test]
+async fn successful_mobile_registration_does_not_become_first_registration_on_reauthentication() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let client = Client::new(ClientConfig {
+            profile: Profile::ipad(),
+            ios_virtual: Some(Arc::new(crate::ios_device::IosVirtualConfig::default())),
+            ..Default::default()
+        }, Keystore { uin: 42, ..Default::default() }).unwrap();
+        let (sender, mut queue) = mpsc::channel::<Outgoing>(16);
+        client.inner.lock().unwrap().connection = Some(Connection { generation: 0, sender });
+        for (reconnect, first_register, scene) in [(false, 0, 7), (false, 1, 7), (true, 1, 4)] {
+            let task = {
+                let client = client.clone();
+                tokio::spawn(async move { client.start_message_sync(reconnect).await })
+            };
+            let outgoing = queue.recv().await.unwrap();
+            assert_eq!(outgoing.command, crate::message_sync::INFO_COMMAND);
+            let request = auth::InfoSyncRequest::decode(request_parts(outgoing.frame, &[0; 16]).4).unwrap();
+            let register = request.register.unwrap();
+            assert_eq!(register.first_register, Some(first_register));
+            assert_eq!(register.scene, Some(scene));
+            let response = auth::InfoSyncResponse {
+                request_random: request.request_random,
+                register: Some(auth::InfoSyncRegisterResponse {
+                    message: Some("register success".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            client.receive(tests::incoming(outgoing.sequence, &outgoing.command, &response.encode_to_vec(), Some(&[0; 16])), 0).unwrap();
+            task.await.unwrap().unwrap();
+        }
+        client.terminate("registration test completed".into());
+    }).await.unwrap();
 }

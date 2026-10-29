@@ -66,6 +66,7 @@ impl NtResult {
 pub(super) struct NtLogin {
     ecdh: Ecdh,
     ios_device: Option<IosDevice>,
+    device_name: Option<String>,
     exchange_prepared: bool,
     exchange_platform: ClientPlatform,
     long_cookies: BTreeMap<String, Bytes>,
@@ -77,6 +78,7 @@ impl NtLogin {
         Ok(Self {
             ecdh: Ecdh::new(Curve::P256)?,
             ios_device: None,
+            device_name: None,
             exchange_prepared: false,
             exchange_platform: ClientPlatform::Linux,
             long_cookies: BTreeMap::new(),
@@ -91,8 +93,12 @@ impl NtLogin {
         Ok(codec)
     }
     pub fn with_device(device: Option<IosDevice>) -> Result<Self> {
+        Self::with_device_name(device, None)
+    }
+    pub fn with_device_name(device: Option<IosDevice>, device_name: Option<String>) -> Result<Self> {
         let mut codec = Self::new()?;
         codec.ios_device = device;
+        codec.device_name = device_name;
         Ok(codec)
     }
     pub fn key_exchange(&mut self, state: &SessionState, timestamp: u64) -> Result<Bytes> {
@@ -225,7 +231,7 @@ impl NtLogin {
             }),
             client: Some(auth::NtClient {
                 os: Some(os),
-                device_name: Some(k.device_name.clone()),
+                device_name: Some(self.device_name.as_ref().unwrap_or(&k.device_name).clone()),
                 platform: Some(platform),
                 guid: Some(Bytes::copy_from_slice(&k.guid)),
             }),
@@ -610,6 +616,7 @@ mod tests {
             );
         }
     }
+
 
     #[test]
     fn desktop_request_head_retains_linux_fields_and_security() {

@@ -2,12 +2,17 @@ syntax = "proto2";
 package atri.qq.guild;
 
 message GuildSyncRequest {
-  optional uint32 pull_scene = 2;
-  optional GuildFirstViewRequest first_view = 4;
+  optional uint64 pull_scene = 2;
+  optional GuildMemoryIncrement memory_increment = 4;
 }
-message GuildFirstViewRequest {
+message GuildMemoryIncrement {
   optional uint64 last_msg_time = 1;
   optional uint64 last_pull_time = 2;
+  repeated GuildIncrementEntry entries = 3;
+}
+message GuildIncrementEntry {
+  optional uint64 entry_key = 1;
+  optional uint64 entry_value = 2;
 }
 message GuildFirstViewData {
   optional uint32 result = 1;
@@ -21,6 +26,9 @@ message GuildFirstViewData {
   optional int32 first_sync_result = 12;
   optional GuildFirstViewExtra extra = 100;
 }
+message GuildFirstViewTransportInfo {
+  optional uint64 last_pull_time = 8;
+}
 message GuildFirstViewExtra {
   repeated bytes normal_nodes = 2;
   repeated bytes direct_nodes_12 = 12;
@@ -31,6 +39,7 @@ message FirstViewGuildNode {
   optional uint64 guild_id = 1;
   repeated bytes channels = 3;
   optional bytes name = 4;
+  optional uint64 incremental_cursor = 23;
   optional int32 node_kind = 25;
 }
 message FirstViewChannelNode {

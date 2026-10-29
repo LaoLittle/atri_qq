@@ -36,6 +36,7 @@ p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "std
 hex = "0.4"
 itoa = "1"
 base64 = "0.23"
+uuid = { version = "1", features = ["serde"] }
 quick-xml = "0.42"
 tracing = "0.1"
 signing = { package = "atri_qq_signing", path = "../signing" }

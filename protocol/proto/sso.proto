@@ -24,10 +24,11 @@ message Reserved {
   optional SecureInfo secure_info = 24;
   optional uint32 secure_signature_flag = 25;
   optional uint32 nt_core_version = 26;
-  optional uint32 route_cost = 27;
+  optional uint32 rtt_correction_ms = 27;
   optional uint32 ip_origin = 28;
   optional bytes pressure_token = 30;
   optional uint64 response_timestamp_ms = 31;
+  optional uint32 application_state = 34;
 }
 message TrpcResponse {
   optional int32 code = 1;

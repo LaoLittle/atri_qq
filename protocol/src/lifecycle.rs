@@ -42,6 +42,12 @@ async fn run_network(weak: Weak<Client>, generation: u64, cancel: CancellationTo
 }
 
 async fn run_club(weak: Weak<Client>, generation: u64, cancel: CancellationToken) {
+    if weak
+        .upgrade()
+        .is_none_or(|client| client.config.profile.platform.is_ios())
+    {
+        return;
+    }
     let mut next = Instant::now();
     let mut initial = true;
     loop {
@@ -75,6 +81,12 @@ async fn run_club(weak: Weak<Client>, generation: u64, cancel: CancellationToken
 }
 
 async fn run_config(weak: Weak<Client>, generation: u64, cancel: CancellationToken) {
+    if weak
+        .upgrade()
+        .is_none_or(|client| client.config.profile.platform.is_ios())
+    {
+        return;
+    }
     let mut next = Instant::now();
     let mut state = config::ConfigState::default();
     loop {

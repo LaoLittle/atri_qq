@@ -98,13 +98,13 @@ impl Config {
                 if self.signing.is_some() {
                     return Err(ApiError::new(
                         "invalid_config",
-                        "desktop signing configuration cannot be mixed with iPhone/iPad; use ios.signing raw resources instead",
+                        "desktop signing configuration cannot be mixed with iPhone/iPad; configure an explicit ios mode instead",
                     ));
                 }
                 self.ios.as_ref().ok_or_else(|| ApiError::new(
                     "invalid_config",
-                    "platform IPhone/IPad requires ios device, signing, transport and registration resources; automatic mobile token collection and local QR login are unavailable",
-                ))?.validate()?;
+                    "platform IPhone/IPad requires ios.mode = virtual or snapshot; local QR login is unavailable",
+                ))?.validate(self.platform)?;
             }
             ClientPlatform::Windows | ClientPlatform::MacOS => {
                 return Err(ApiError::new(
@@ -135,6 +135,7 @@ impl Config {
         let mut config = ClientConfig {
             profile,
             ios_device: None,
+            ios_virtual: None,
             ios_signing: None,
             ios_registration: None,
             ios_transport: None,
@@ -149,11 +150,7 @@ impl Config {
             server_selection: Default::default(),
         };
         if let Some(ios) = &self.ios {
-            let resources = ios.load(ctx).await?;
-            config.ios_device = Some(ios.device.clone());
-            config.ios_signing = Some(resources.signing);
-            config.ios_transport = Some(resources.transport);
-            config.ios_registration = Some(resources.registration);
+            ios.apply(ctx, &mut config).await?;
         }
         Ok(config)
     }
@@ -209,7 +206,7 @@ fn fresh_device_keystore(stored: Keystore) -> Keystore {
 mod tests {
     use super::*;
     use crate::mobile_config::{
-        MobileCommandPolicyConfig, MobileRegistrationConfig, MobileSigningConfig,
+        MobileCommandPolicyConfig, MobileRegistrationConfig, MobileSigningConfig, MobileSnapshotConfig,
         MobileTransportAccountConfig, MobileTransportConfig,
     };
     use atri_qq_protocol::IosDevice;
@@ -217,7 +214,8 @@ mod tests {
     fn mobile(platform: ClientPlatform) -> Config {
         Config {
             platform,
-            ios: Some(MobileConfig {
+            ios: Some(MobileConfig::Snapshot(MobileSnapshotConfig {
+                heartbeat: Default::default(),
                 device: IosDevice {
                     system_version: "18.0".into(),
                     hardware_model: "fixture-device".into(),
@@ -226,6 +224,8 @@ mod tests {
                 signing: MobileSigningConfig {
                     provenance: "offline adapter configuration test".into(),
                     raw_device_token_file: "ios/token.bin".into(),
+                    raw_device_token_expires_at: 0,
+                    raw_device_token_uin: String::new(),
                     raw_xwid_file: "ios/xwid.bin".into(),
                     channel_state_file: None,
                     command_policy: MobileCommandPolicyConfig::default(),
@@ -245,7 +245,7 @@ mod tests {
                     initial_file: "ios/initial.pb".into(),
                     reconnect_file: "ios/reconnect.pb".into(),
                 },
-            }),
+            })),
             ..Config::default()
         }
     }

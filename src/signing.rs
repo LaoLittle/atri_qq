@@ -4,7 +4,10 @@ use ::signing::token::{DeviceProperties, ReportResponse, TokenError, XwidAcquisi
 use atri_core::{ApiError, CallerKind, Value, from_value, to_value};
 use atri_qq_api::signing::{self as api, SigningConfig, SigningResources};
 use atri_qq_protocol::{Client, signing::SigningReport};
-use std::{collections::BTreeMap, sync::Mutex};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 #[derive(Default)]
 pub(crate) struct SigningService {
@@ -21,25 +24,57 @@ fn invalid(message: &str) -> ApiError {
     ApiError::new("qq.invalid_signing_resource", message)
 }
 
+fn property_map<T: From<Vec<u8>>>(
+    properties: Vec<api::DeviceProperty>,
+) -> Result<BTreeMap<i32, T>, ApiError> {
+    let mut native = BTreeMap::new();
+    for property in properties {
+        if native.insert(property.id, property.value.into()).is_some() {
+            return Err(invalid("device properties contain duplicate signed IDs"));
+        }
+    }
+    Ok(native)
+}
+
 fn properties(
     properties: Option<Vec<api::DeviceProperty>>,
 ) -> Result<Option<DeviceProperties>, ApiError> {
-    properties
-        .map(|properties| {
-            let mut native = BTreeMap::new();
-            for property in properties {
-                if native.insert(property.id, property.value).is_some() {
-                    return Err(invalid("device properties contain duplicate signed IDs"));
-                }
-            }
-            Ok(native)
-        })
-        .transpose()
+    properties.map(property_map).transpose()
 }
 
 fn footer(seed: &[u8]) -> Result<&[u8; 48], ApiError> {
     seed.try_into()
         .map_err(|_| invalid("a genuine footer seed must contain exactly 48 bytes"))
+}
+
+pub(crate) fn apply_ios_heartbeat(
+    client: &Client,
+    resources: &api::IosHeartbeatResources,
+) -> Result<(), ApiError> {
+    let source = match resources {
+        api::IosHeartbeatResources::Unregistered => None,
+        api::IosHeartbeatResources::Snapshot {
+            provenance,
+            silence_status,
+            silent_version,
+            battery_status,
+        } => {
+            if provenance.trim().is_empty() {
+                return Err(invalid(
+                    "mobile heartbeat snapshot requires actual resource provenance",
+                ));
+            }
+            Some(Arc::new(atri_qq_protocol::heartbeat::IosResources {
+                silence_status: *silence_status,
+                silent_version: *silent_version,
+                battery_status: *battery_status,
+            })
+                as Arc<dyn atri_qq_protocol::heartbeat::IosSource>)
+        }
+    };
+    client
+        .set_ios_heartbeat_source(source)
+        .map_err(protocol_error)
 }
 
 fn xwid(value: api::XwidCompletion) -> Result<XwidAcquisition, ApiError> {
@@ -97,7 +132,7 @@ fn token_error(error: TokenError) -> api::SigningTokenError {
 }
 
 impl SigningService {
-    pub(crate) fn call(
+    pub(crate) async fn call(
         &self,
         client: &Client,
         kind: CallerKind,
@@ -106,6 +141,76 @@ impl SigningService {
     ) -> Result<Value, ApiError> {
         authority::require_trusted(kind)?;
         match method {
+            "set_ios_heartbeat" => {
+                apply_ios_heartbeat(client, &from_value(&args)?)?;
+                Ok(Value::Null)
+            }
+            "set_ios_resources" => {
+                let resources: api::IosResources = from_value(&args)?;
+                let policy = crate::mobile_config::command_policy(
+                    resources
+                        .switches
+                        .iter()
+                        .map(|switch| (switch.key, switch.value)),
+                    resources.persisted_host_commands.iter().map(String::as_str),
+                )?;
+                client
+                    .set_ios_signing_resources(atri_qq_protocol::signing::IosSigningResources {
+                        provenance: resources.provenance,
+                        raw_device_token: resources.raw_device_token.into(),
+                        raw_device_token_expires_at: resources.raw_device_token_expires_at,
+                        raw_device_token_uin: resources.raw_device_token_uin,
+                        raw_xwid: resources.raw_xwid.into(),
+                        channel_state: resources.channel_state,
+                        command_policy: policy,
+                    })
+                    .map_err(protocol_error)?;
+                Ok(Value::Null)
+            }
+            "refresh_ios_token" => {
+                let request: api::RefreshIosToken = from_value(&args)?;
+                let properties = property_map(request.properties)?;
+                let payload = match request.native_payload {
+                    api::IosNativePayload::Disabled => {
+                        ::signing::ios::token::NativePayload::Disabled
+                    }
+                    api::IosNativePayload::Encoded { bytes } => {
+                        ::signing::ios::token::NativePayload::Encoded(bytes.into())
+                    }
+                    api::IosNativePayload::Session { fingerprint } => {
+                        ::signing::ios::token::NativePayload::Generate(
+                            client
+                                .create_ios_native_payload(fingerprint)
+                                .map_err(protocol_error)?,
+                        )
+                    }
+                    api::IosNativePayload::Generate {
+                        material,
+                        material_seed,
+                        fingerprint,
+                        unix_seconds,
+                        process_id,
+                        allocation_low32,
+                    } => ::signing::ios::token::NativePayload::Generate(
+                        ::signing::ios::token::NativePayloadResources {
+                            material,
+                            material_seed,
+                            fingerprint,
+                            unix_seconds,
+                            process_id,
+                            allocation_low32: Some(allocation_low32),
+                        },
+                    ),
+                };
+                let persistence = client
+                    .refresh_ios_token(&properties, payload)
+                    .await
+                    .map_err(protocol_error)?;
+                to_value(&persistence.map(|entry| api::IosTokenPersistence {
+                    key: entry.key,
+                    value: entry.value.into(),
+                }))
+            }
             "set_resources" => {
                 let resources: SigningResources = from_value(&args)?;
                 let properties = properties(resources.properties)?;

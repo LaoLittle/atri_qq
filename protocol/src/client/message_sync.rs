@@ -37,7 +37,15 @@ impl Client {
             {
                 return Err(Error::Disconnected);
             }
-            let template = login::info_sync_for_config(&inner.state, reconnect, &self.config)?;
+            let now = if inner.state.profile.platform.is_ios() {
+                u64::try_from(crate::ios_device::network::wall_millis()? / 1000)
+                    .map_err(|_| wire::malformed("iOS registration precedes Unix epoch"))?
+            } else {
+                0
+            };
+            let template = login::info_sync_for_config_at(
+                &inner.state, reconnect, &self.config, now, inner.signer.ios_background_since(),
+            )?;
             let (binding, action) =
                 self.message_sync
                     .begin(inner.generation, &inner.state, &inner.cancel, template);
@@ -183,6 +191,7 @@ async fn exchange(
             ));
         }
         let sender = inner.connection.as_ref().unwrap().sender.clone();
+        let ios = ios_network::RequestTiming::new(&inner)?;
         let (sequence, frame) =
             client.prepare_frame(&mut inner, command, body, RequestType::D2, Encryption::D2)?;
         inner.next_id = inner
@@ -201,6 +210,7 @@ async fn exchange(
                 key,
                 reply,
                 cancel: cancel.clone(),
+                ios,
                 message_sync: Some((binding.clone(), request)),
             },
         );
@@ -232,6 +242,11 @@ async fn exchange(
             sender.send(outgoing).await.map_err(|_| Error::Disconnected)?;
             receiver.await.map_err(|_| Error::Disconnected)??;
             Ok(())
-        }) => result.map_err(|_| Error::Timeout)?,
+        }) => result.map_err(|_| {
+            if let Some(client) = weak.upgrade() {
+                client.note_ios_timeout(_guard.sequence, _guard.id);
+            }
+            Error::Timeout
+        })?,
     }
 }

@@ -4,7 +4,7 @@ use bytes::Bytes;
 use prost::Message;
 
 use super::{
-    proto::{DeviceTokenItem, NativeTokenItem, NativeTokenProperties},
+    proto::{DevicePropertyId, DeviceTokenItem, NativeTokenItem, NativeTokenProperties},
     salsa8,
 };
 
@@ -15,7 +15,7 @@ pub struct NativePayloadResources {
     pub fingerprint: [u8; 32],
     pub unix_seconds: u64,
     pub process_id: i32,
-    pub allocation_low32: u32,
+    pub allocation_low32: Option<u32>,
 }
 
 impl NativePayloadResources {
@@ -52,10 +52,11 @@ impl NativePayloadResources {
                 });
             }
         }
-        let fingerprint_id = permutation[70];
+        let fingerprint_property = DevicePropertyId::Fingerprint as u32;
+        let fingerprint_id = permutation[fingerprint_property as usize];
         decimal_index(
             &mut mapping[fingerprint_id as usize * 3..fingerprint_id as usize * 3 + 3],
-            70,
+            fingerprint_property,
         );
         let mut nonce = self.material;
         let mut state = Wrapping(self.material_seed);
@@ -81,9 +82,12 @@ impl NativePayloadResources {
                 data: Bytes::from(self.process_id.to_string()),
             },
         ]);
-        let mask = (Wrapping(self.allocation_low32) + Wrapping(self.process_id as u32)).0 as u8;
-        let header = nonce.map(|byte| byte ^ mask);
         let mut output = Vec::with_capacity(16 + properties.encoded_len());
+        let allocation = self
+            .allocation_low32
+            .unwrap_or_else(|| output.as_ptr() as usize as u32);
+        let mask = (Wrapping(allocation) + Wrapping(self.process_id as u32)).0 as u8;
+        let header = nonce.map(|byte| byte ^ mask);
         output.extend_from_slice(&header);
         properties
             .encode(&mut output)
@@ -124,7 +128,7 @@ mod tests {
             fingerprint: *b"efcbf0da7fd8d81232fe2e7b912f3979",
             unix_seconds: 1700000000,
             process_id: 4242,
-            allocation_low32: 432880,
+            allocation_low32: Some(432880),
         }
     }
 
@@ -157,6 +161,27 @@ mod tests {
                 0x7c, 0xe8
             ]
         );
+    }
+
+    #[test]
+    fn allocated_header_uses_the_retained_output_address_without_changing_nonce() {
+        let mut source = resources();
+        source.allocation_low32 = None;
+        let encoded = source.encode(&[]);
+        let decoded = decode(&encoded);
+        let nonce = &decoded.items[0].data;
+        assert_eq!(
+            nonce.as_ref(),
+            &[
+                0x5c, 0x40, 0x72, 0x99, 0xf6, 0xa2, 0x48, 0xee, 0xc9, 0xf4, 0x4a, 0x9b, 0x82, 0x5c,
+                0xf6, 0xb5
+            ]
+        );
+        let mask = (Wrapping(encoded.as_ptr() as usize as u32) + Wrapping(source.process_id as u32))
+            .0 as u8;
+        for (header, nonce) in encoded[..16].iter().zip(nonce.iter()) {
+            assert_eq!(*header, nonce ^ mask);
+        }
     }
 
     #[test]

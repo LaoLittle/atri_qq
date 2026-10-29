@@ -87,15 +87,23 @@ message InfoSyncRequest {
   optional uint32 current_active_status = 4;
   optional uint64 group_last_message_time = 5;
   optional SyncState sync = 6;
-  optional bytes cookie = 8;
+  optional uint64 group_code = 7;
+  optional bytes platform_extension = 8;
   optional RegisterInfo register = 9;
   optional atri.qq.guild.GuildSyncRequest guild_sync = 10;
   optional AppState app = 11;
-  optional bytes extension = 13;
+  optional AiSyncRequest ai_sync = 13;
+}
+message AiSyncRequest { repeated AiSyncCursor businesses = 2; }
+message AiSyncCursor {
+  optional uint32 business_id = 1;
+  optional uint64 latest_message_time = 2;
+  optional uint64 latest_change_time = 3;
+  optional bool change_sync_enabled = 4;
 }
 message SyncState { optional bytes current_cookie = 1; optional uint64 last_message_time = 2; optional bytes previous_cookie = 3; }
 message RegisterDevice { optional string name = 1; optional string kernel = 2; optional string os_version = 3; optional string brand = 4; optional string os = 5; }
-message RegisterBusiness { optional uint32 notify_switch = 1; optional uint32 message_switch = 2; }
+message RegisterBusiness { optional uint32 notify_switch = 1; optional uint32 bound_uin_notify_switch = 2; }
 message RegisterInfo {
   optional string guid = 1;
   optional uint32 kick_pc = 2;
@@ -105,17 +113,17 @@ message RegisterInfo {
   optional RegisterDevice device = 6;
   optional uint32 mute = 7;
   optional uint32 vendor_type = 8;
-  optional uint32 registration_type = 9;
+  optional uint32 user_trigger = 9;
   optional RegisterBusiness business = 10;
   optional uint32 battery_status = 11;
   optional uint32 set_status = 12;
   optional RegisterFlags flags = 14;
-  optional uint32 field16 = 16;
-  optional uint32 field17 = 17;
-  optional uint32 field18 = 18;
+  optional uint32 scene = 16;
+  optional uint32 background_time = 17;
+  optional bool is_chat_on_focus = 18;
 }
-message RegisterFlags { optional uint32 field1 = 1; optional uint32 field2 = 2; }
-message AppState { optional uint32 foreground = 1; optional uint32 full_screen = 2; optional uint32 background = 3; }
+message RegisterFlags { optional uint32 silence_status = 1; optional uint32 silent_version = 2; }
+message AppState { optional uint32 is_delay_req = 1; optional uint32 app_status = 2; optional uint32 silence_status = 3; }
 message InfoSyncRegisterResponse {
   optional string message = 2;
   optional uint64 server_time = 3;

@@ -5,17 +5,23 @@ use crate::{
 };
 use ::signing::{
     SecureInfo, Signature,
-    ios::{command_policy::CommandPolicy, sdk, signer, source::SystemSource},
+    ios::{command_policy::CommandPolicy, sdk, signer, source::SystemSource, token as ios_token},
     token::{DeviceProperties, ReportResponse, TokenError, XwidAcquisition},
 };
 use bytes::Bytes;
+use prost::Message;
 use rand::TryRng;
+use std::collections::BTreeMap;
 use tokio::time::Instant;
+
+mod virtual_device;
 
 #[derive(Clone)]
 pub struct IosSigningResources {
     pub provenance: String,
     pub raw_device_token: Bytes,
+    pub raw_device_token_expires_at: u64,
+    pub raw_device_token_uin: String,
     pub raw_xwid: Bytes,
     pub channel_state: Option<[u8; 32]>,
     pub command_policy: CommandPolicy,
@@ -28,8 +34,8 @@ impl IosSigningResources {
                 "iOS raw signing resources require an explicit snapshot source".into(),
             ));
         }
-        if self.raw_device_token.is_empty() || self.raw_xwid.is_empty() {
-            return Err(Error::Malformed("iOS requires real raw device-token and XWID snapshots; automatic token collection is unavailable".into()));
+        if self.raw_xwid.is_empty() {
+            return Err(Error::Malformed("iOS signing requires nonempty raw XWID bytes; the previous device-token may be empty before bootstrap".into()));
         }
         Ok(())
     }
@@ -39,17 +45,25 @@ struct IosSession {
     sdk: sdk::SdkSigner,
     source: SystemSource,
     resource_provenance: String,
-    raw_device_token: Bytes,
+    token_state: ios_token::TokenState,
     raw_xwid: Bytes,
     channel_state: Option<[u8; 32]>,
+    native_material: Option<[u8; 16]>,
     platform: ClientPlatform,
     qua: Bytes,
     machine_id: String,
     account: Option<u64>,
     generation: u64,
+    virtual_device: Option<virtual_device::VirtualSdk>,
 }
 
 impl IosSession {
+    fn token_state(record: ios_token::TokenRecord) -> ios_token::TokenState {
+        let mut state = ios_token::TokenState::default();
+        state.restore_record(record);
+        state
+    }
+
     fn initialize(&mut self, state: &SessionState) -> Result<()> {
         if state.profile.platform != self.platform {
             return Err(Error::Unsupported(
@@ -67,6 +81,7 @@ impl IosSession {
         if self.account != Some(account) {
             self.account = Some(account);
             self.generation = self.generation.wrapping_add(1);
+            self.token_state.update_account(account.to_string());
         }
     }
 
@@ -91,6 +106,14 @@ impl IosSession {
         if !self.sdk.policy.host_requires_security(command) {
             return Ok(None);
         }
+        let device_token = if self.sdk.policy.switch(1) == 1 {
+            self.token_state
+                .record()
+                .signing_token_at(crate::o3::unix_seconds()?)
+        } else {
+            Bytes::new()
+        };
+        self.before_virtual_sign(state);
         let security = self
             .sdk
             .sign(
@@ -99,12 +122,13 @@ impl IosSession {
                     body,
                     qua: self.qua.clone(),
                     raw_xwid: self.raw_xwid.clone(),
-                    device_token: self.raw_device_token.clone(),
+                    device_token,
                     channel_state: self.channel_state.as_ref(),
                 },
                 &mut self.source,
             )
             .map_err(|error| Error::Crypto(format!("Native iOS signer: {error}")))?;
+        self.after_virtual_sign(state);
         let mut security = SecureInfo {
             sign: security.sign.map_or(Signature::Empty, Signature::Ios),
             token: security.token.to_vec(),
@@ -126,6 +150,60 @@ impl IosSession {
                 .map_err(|error| Error::Crypto(format!("Signing entropy unavailable: {error}")))?;
         }
         Ok(Some(security))
+    }
+
+    fn validate_token_request(
+        &self,
+        items: &BTreeMap<i32, Bytes>,
+        payload: &ios_token::NativePayload,
+    ) -> Result<()> {
+        if items.is_empty() {
+            return Err(Error::Malformed(
+                "iOS token collection returned no properties".into(),
+            ));
+        }
+        if self.sdk.policy.switch(46) == 1 && matches!(payload, ios_token::NativePayload::Disabled)
+        {
+            return Err(Error::Malformed(
+                "iOS token native payload is enabled but no real payload resources were provided"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn token_request(
+        &self,
+        items: &BTreeMap<i32, Bytes>,
+        payload: ios_token::NativePayload,
+    ) -> ios_token::DeviceTokenRequest {
+        if matches!(payload, ios_token::NativePayload::Encoded(_)) {
+            return self
+                .token_state
+                .capture_request()
+                .build_request(items, payload);
+        }
+        let raw_xwid_id = ios_token::DevicePropertyId::RawXwid as i32;
+        let end = self
+            .raw_xwid
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(self.raw_xwid.len());
+        let raw_xwid = if std::str::from_utf8(&self.raw_xwid[..end]).is_ok() {
+            self.raw_xwid.slice(..end)
+        } else {
+            Bytes::new()
+        };
+        let items = items
+            .range(..raw_xwid_id)
+            .chain(std::iter::once((&raw_xwid_id, &raw_xwid)))
+            .chain(items.range((
+                std::ops::Bound::Excluded(raw_xwid_id),
+                std::ops::Bound::Unbounded,
+            )));
+        self.token_state
+            .capture_request()
+            .build_request(items, payload)
     }
 }
 
@@ -157,7 +235,7 @@ impl SessionSigner {
         ios: Option<IosSigningResources>,
     ) -> Result<Self> {
         let backend = if state.profile.platform.is_ios() {
-            let resources = ios.ok_or_else(|| Error::Malformed("iOS profile requires ClientConfig.ios_signing with real raw resources; automatic iOS token collection is unavailable".into()))?;
+            let resources = ios.ok_or_else(|| Error::Malformed("iOS profile requires explicit signing snapshots or a configured virtual device".into()))?;
             resources.validate()?;
             let mut source = SystemSource;
             let core = signer::Signer::new(&mut source).map_err(|error| {
@@ -167,14 +245,20 @@ impl SessionSigner {
                 sdk: sdk::SdkSigner::new(core, resources.command_policy),
                 source,
                 resource_provenance: resources.provenance,
-                raw_device_token: resources.raw_device_token,
+                token_state: IosSession::token_state(ios_token::TokenRecord {
+                    token: resources.raw_device_token,
+                    expires_at: resources.raw_device_token_expires_at,
+                    associated_uin: resources.raw_device_token_uin,
+                }),
                 raw_xwid: resources.raw_xwid,
                 channel_state: resources.channel_state,
+                native_material: None,
                 platform: state.profile.platform,
                 qua: Bytes::copy_from_slice(state.profile.qua.as_bytes()),
                 machine_id: state.machine_id.clone(),
                 account: None,
                 generation: 0,
+                virtual_device: None,
             })
         } else {
             if ios.is_some() {
@@ -226,6 +310,7 @@ impl SessionSigner {
             Backend::Ios(session) => {
                 session.generation = session.generation.wrapping_add(1);
                 session.account = Some(0);
+                session.token_state.update_account("0");
                 Ok(())
             }
         }
@@ -333,12 +418,119 @@ impl SessionSigner {
                 "iOS resources cannot update a desktop signing session".into(),
             )),
             Backend::Ios(session) => {
+                if session.virtual_device.is_some() {
+                    return Err(Error::Unsupported("A virtual iOS device owns its signing resources; snapshot replacement requires snapshot mode".into()));
+                }
                 session.sdk.policy = resources.command_policy;
                 session.resource_provenance = resources.provenance;
-                session.raw_device_token = resources.raw_device_token;
+                if session.token_state.record().token != resources.raw_device_token
+                    || session.token_state.record().expires_at
+                        != resources.raw_device_token_expires_at
+                    || session.token_state.record().associated_uin != resources.raw_device_token_uin
+                {
+                    session.token_state.restore_record(ios_token::TokenRecord {
+                        token: resources.raw_device_token,
+                        expires_at: resources.raw_device_token_expires_at,
+                        associated_uin: resources.raw_device_token_uin,
+                    });
+                }
                 session.raw_xwid = resources.raw_xwid;
                 session.channel_state = resources.channel_state;
                 Ok(())
+            }
+        }
+    }
+
+    pub fn ios_resources_snapshot(&self) -> Result<IosSigningResources> {
+        match &self.backend {
+            Backend::Desktop(_) => Err(desktop_only()),
+            Backend::Ios(session) => Ok(IosSigningResources {
+                provenance: session.resource_provenance.clone(),
+                raw_device_token: session.token_state.record().token.clone(),
+                raw_device_token_expires_at: session.token_state.record().expires_at,
+                raw_device_token_uin: session.token_state.record().associated_uin.clone(),
+                raw_xwid: session.raw_xwid.clone(),
+                channel_state: session.channel_state,
+                command_policy: session.sdk.policy.clone(),
+            }),
+        }
+    }
+
+    pub(crate) fn apply_ios_switches(&mut self, update: &crate::o3::ios::SwitchUpdate) {
+        if let Backend::Ios(session) = &mut self.backend {
+            for (index, value) in update.values.iter().enumerate() {
+                if let Some(value) = value {
+                    session.sdk.policy.set_switch(index as u32 + 1, *value);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn create_ios_native_payload(
+        &mut self,
+        state: &SessionState,
+        fingerprint: [u8; 32],
+        now: u64,
+    ) -> Result<ios_token::NativePayloadResources> {
+        let Backend::Ios(session) = &mut self.backend else {
+            return Err(desktop_only());
+        };
+        session.native_payload_resources(state, fingerprint, now)
+    }
+
+    pub(crate) fn create_ios_token_request(
+        &mut self,
+        state: &SessionState,
+        items: &BTreeMap<i32, Bytes>,
+        payload: ios_token::NativePayload,
+    ) -> Result<ios_token::DeviceTokenRequest> {
+        let Backend::Ios(session) = &mut self.backend else {
+            return Err(desktop_only());
+        };
+        session.initialize(state)?;
+        session.validate_token_request(items, &payload)?;
+        Ok(session.token_request(items, payload))
+    }
+
+    pub(crate) fn prepare_ios_token(
+        &mut self,
+        state: &SessionState,
+        items: &BTreeMap<i32, Bytes>,
+        payload: ios_token::NativePayload,
+        now: u64,
+    ) -> Result<(Bytes, ios_token::TokenSubmission)> {
+        let Backend::Ios(session) = &mut self.backend else {
+            return Err(desktop_only());
+        };
+        session.initialize(state)?;
+        session.validate_token_request(items, &payload)?;
+        if !session.token_state.begin_refresh(now, true) {
+            return Err(Error::Authentication(
+                "iOS token collection is already in progress".into(),
+            ));
+        }
+        let body = session.token_request(items, payload).encode_to_vec().into();
+        let submission = session.token_state.capture_submission();
+        session.token_state.collection_worker_exited();
+        Ok((body, submission))
+    }
+
+    pub(crate) fn complete_ios_token(
+        &mut self,
+        submission: &ios_token::TokenSubmission,
+        response: Result<Bytes>,
+    ) -> Result<Option<ios_token::TokenPersistence>> {
+        let Backend::Ios(session) = &mut self.backend else {
+            return Err(desktop_only());
+        };
+        match response {
+            Ok(body) => session
+                .token_state
+                .commit_response_bytes(submission, body)
+                .map_err(Into::into),
+            Err(error) => {
+                session.token_state.commit_failure();
+                Err(error)
             }
         }
     }
@@ -447,7 +639,15 @@ impl SessionSigner {
     pub(crate) fn token_status(&self) -> (usize, Option<i64>) {
         match &self.backend {
             Backend::Desktop(session) => session.token_status(),
-            Backend::Ios(session) => (session.raw_device_token.len(), None),
+            Backend::Ios(session) => {
+                let record = session.token_state.record();
+                (
+                    record.token.len(),
+                    (record.expires_at != 0)
+                        .then(|| i64::try_from(record.expires_at).ok())
+                        .flatten(),
+                )
+            }
         }
     }
 
@@ -500,6 +700,8 @@ mod tests {
         IosSigningResources {
             provenance: "synthetic-unit-test-only".into(),
             raw_device_token: Bytes::from_static(b"synthetic-raw-token"),
+            raw_device_token_expires_at: u64::MAX,
+            raw_device_token_uin: "0".into(),
             raw_xwid: Bytes::from_static(b"synthetic-raw-xwid"),
             channel_state: None,
             command_policy: CommandPolicy::default(),
@@ -523,11 +725,6 @@ mod tests {
         missing_source.provenance.clear();
         assert!(
             SessionSigner::for_client("desktop-only".into(), &state, Some(missing_source)).is_err()
-        );
-        let mut missing_token = resources();
-        missing_token.raw_device_token = Bytes::new();
-        assert!(
-            SessionSigner::for_client("desktop-only".into(), &state, Some(missing_token)).is_err()
         );
         let desktop = SessionState {
             profile: Profile::default(),

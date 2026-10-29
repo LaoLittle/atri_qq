@@ -16,6 +16,46 @@ message EstablishShareKeyRequest {
   bytes encrypted_body = 5;
   bytes channel_uuid = 6;
 }
+message IosEstablishShareKeyRequest {
+  bytes method = 1;
+  bytes client_public_key = 2;
+  bool local_derivation_failed = 3;
+  bytes key_identifier = 4;
+  bytes encrypted_body = 5;
+  bytes channel_uuid = 6;
+  bytes check = 7;
+  uint32 version = 8;
+}
+message IosEstablishShareKeyResponse {
+  repeated bytes encrypted_body = 1;
+  uint32 status = 2;
+  uint64 unavailable_duration_seconds = 3;
+}
+message IosSecureAccessResponse {
+  repeated bytes encrypted_body = 1;
+  uint32 status = 2;
+  repeated bytes extra = 3;
+  uint64 unavailable_duration_seconds = 4;
+}
+message IosEstablishInnerResponse {
+  repeated bytes material = 1;
+  uint64 parameter = 2;
+  uint64 channel_time = 3;
+  repeated bytes business_response = 4;
+  IosChannelConfig config = 5;
+}
+message IosChannelConfig {
+  optional uint32 option1 = 1;
+  optional uint32 option2 = 2;
+  optional uint32 option3 = 3;
+  optional uint32 option4 = 4;
+  optional uint32 option5 = 5;
+  optional uint32 option6 = 6;
+  optional uint32 option7 = 7;
+  optional uint32 option8 = 8;
+  optional uint32 option9 = 9;
+  uint32 skip_update = 10;
+}
 message EstablishShareKeyResponse {
   repeated bytes encrypted_body = 1;
   optional uint32 status = 2;

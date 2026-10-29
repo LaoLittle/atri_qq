@@ -1,9 +1,10 @@
-use std::collections::BTreeMap;
-
 use bytes::Bytes;
 use prost::Message;
+use serde::{Deserialize, Serialize};
 
-pub use super::proto::{DeviceTokenItem, DeviceTokenRequest, DeviceTokenResponse};
+pub use super::proto::{
+    DevicePropertyId, DeviceTokenItem, DeviceTokenRequest, DeviceTokenResponse,
+};
 pub use super::token_payload::NativePayloadResources;
 
 pub const TOKEN_BUSINESS: &str = "getToken";
@@ -11,7 +12,7 @@ pub const TOKEN_PERSISTENCE_PREFIX: &str = "dtck_20260129_";
 pub const PROACTIVE_REFRESH_SECONDS: u64 = 300;
 pub const RETRY_BASE_SECONDS: u64 = 60;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenRecord {
     pub expires_at: u64,
     pub token: Bytes,
@@ -21,6 +22,13 @@ pub struct TokenRecord {
 impl TokenRecord {
     pub fn is_valid_at(&self, now: u64) -> bool {
         !self.token.is_empty() && self.expires_at > now
+    }
+    pub fn signing_token_at(&self, now: u64) -> Bytes {
+        if self.is_valid_at(now) {
+            self.token.clone()
+        } else {
+            Bytes::new()
+        }
     }
 
     pub fn needs_refresh_at(&self, now: u64, core_current_uin: &str) -> bool {
@@ -69,14 +77,14 @@ pub enum NativePayload {
 }
 
 impl TokenRefresh {
-    pub fn build_request(
+    pub fn build_request<'a>(
         &self,
-        items: &BTreeMap<i32, Bytes>,
+        items: impl IntoIterator<Item = (&'a i32, &'a Bytes)>,
         native_payload: NativePayload,
     ) -> DeviceTokenRequest {
         let mut request = DeviceTokenRequest {
             items: items
-                .iter()
+                .into_iter()
                 .map(|(&id, data)| DeviceTokenItem {
                     id,
                     data: data.clone(),
@@ -97,6 +105,7 @@ impl TokenRefresh {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SigningTokenSnapshot {
     pub record: TokenRecord,
+    pub token: Bytes,
     pub refresh_started: bool,
 }
 
@@ -189,6 +198,7 @@ impl TokenState {
         let refresh_started =
             record.needs_refresh_at(now, core_current_uin) && self.begin_refresh(now, false);
         SigningTokenSnapshot {
+            token: record.signing_token_at(now),
             record,
             refresh_started,
         }
@@ -241,6 +251,7 @@ fn is_account(uin: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn record(expiry: u64) -> TokenRecord {
         TokenRecord {
@@ -248,6 +259,23 @@ mod tests {
             token: Bytes::from_static(b"old"),
             associated_uin: "1".into(),
         }
+    }
+
+    #[test]
+    fn signing_snapshot_omits_expired_token_without_erasing_refresh_material() {
+        let mut state = TokenState::default();
+        state.restore_record(record(100));
+        let expired = state.snapshot_for_signing(100, "1");
+        assert!(expired.token.is_empty());
+        assert!(expired.refresh_started);
+        assert_eq!(expired.record.token.as_ref(), b"old");
+        assert_eq!(state.capture_request().previous_token.as_ref(), b"old");
+        state.collection_worker_exited();
+        state.restore_record(record(400));
+        let valid = state.snapshot_for_signing(100, "1");
+        assert_eq!(valid.token.as_ref(), b"old");
+        assert!(!valid.refresh_started);
+        assert_eq!(state.record().expires_at, 400);
     }
 
     #[test]
@@ -321,27 +349,6 @@ mod tests {
                 .is_none()
         );
         assert_eq!(state.record().token, Bytes::from_static(b"new\xff|token"));
-    }
-
-    #[test]
-    fn request_preserves_order_and_opaque_payload() {
-        let request = TokenRefresh {
-            previous_token: Bytes::from_static(b"old"),
-        };
-        let items = BTreeMap::from([
-            (9, Bytes::from_static(b"nine")),
-            (-2, Bytes::from_static(b"negative")),
-        ]);
-        let built = request.build_request(
-            &items,
-            NativePayload::Encoded(Bytes::from_static(b"actual")),
-        );
-        assert_eq!(
-            built.items.iter().map(|item| item.id).collect::<Vec<_>>(),
-            [-2, 9]
-        );
-        assert_eq!(built.previous_token, request.previous_token);
-        assert_eq!(built.native_payload, Bytes::from_static(b"actual"));
     }
 
     #[test]

@@ -573,6 +573,8 @@ pub(crate) fn encode_sso(
     state: &SessionState,
     signature: Option<signing_engine::SecureInfo>,
     ios_transport: Option<(&IosTransportResources, &[u8])>,
+    ios_network: Option<&crate::ios_device::network::IosNetworkSession>,
+    is_nt_request: bool,
 ) -> Result<Bytes> {
     use prost::Message;
     if body.len() > MAX_FRAME_SIZE - 4096 || command.len() > 1024 * 1024 {
@@ -593,7 +595,7 @@ pub(crate) fn encode_sso(
     } else {
         None
     };
-    let reserve = sso::Reserved {
+    let mut reserve = sso::Reserved {
         trace_parent: Some(format!(
             "01-{}-{}-01",
             hex::encode(random_bytes(16)),
@@ -607,6 +609,9 @@ pub(crate) fn encode_sso(
         }),
         ..Default::default()
     };
+    if let Some(network) = ios_network {
+        network.apply_reserved(&mut reserve, is_nt_request, kind == RequestType::D2);
+    }
     let reserve = reserve.encode_to_vec();
     let payload = encode_sso_payload(
         command,
@@ -615,6 +620,7 @@ pub(crate) fn encode_sso(
         kind,
         state,
         ios_transport,
+        ios_network,
         &reserve,
     )?;
     let encrypted = match encryption {
@@ -663,6 +669,7 @@ fn encode_sso_payload(
     kind: RequestType,
     state: &SessionState,
     ios_transport: Option<(&IosTransportResources, &[u8])>,
+    ios_network: Option<&crate::ios_device::network::IosNetworkSession>,
     reserve: &[u8],
 ) -> Result<Vec<u8>> {
     let store = &state.keystore;
@@ -673,7 +680,13 @@ fn encode_sso_payload(
             head.u32(state.profile.sub_app_id);
             head.u32(0x20027635);
             head.u8(resources.network_type);
-            head.bytes(resources.effective_flags);
+            if let Some(network) = ios_network {
+                head.bytes(&resources.effective_flags[..9]);
+                head.u8(network.ip_stack());
+                head.u8(resources.effective_flags[10]);
+            } else {
+                head.bytes(resources.effective_flags);
+            }
             head.p32(&store.a2)?;
             head.p32(command)?;
             head.p32(cookie)?;
@@ -724,7 +737,11 @@ fn encode_sso_payload(
         }
     }
     if let Some((resources, _)) = ios_transport {
-        let template = resources.reserved.as_bytes();
+        let template = if ios_network.is_some() && kind == RequestType::Simple {
+            &[][..]
+        } else {
+            resources.reserved.as_bytes()
+        };
         let length = template
             .len()
             .checked_add(reserve.len())
@@ -909,6 +926,7 @@ mod tests {
                 RequestType::D2,
                 &state,
                 Some((&resources, b"\xff\0cookie")),
+                None,
                 &[],
             )
             .unwrap();
@@ -926,6 +944,7 @@ mod tests {
                 RequestType::Simple,
                 &state,
                 Some((&resources, b"\xff\0cookie")),
+                None,
                 &[],
             )
             .unwrap();

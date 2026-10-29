@@ -295,7 +295,7 @@ impl Channel {
     }
 }
 
-fn merge_bytes(mut parts: Vec<Bytes>) -> Bytes {
+pub(super) fn merge_bytes(mut parts: Vec<Bytes>) -> Bytes {
     match parts.len() {
         0 => Bytes::new(),
         1 => parts.pop().unwrap(),

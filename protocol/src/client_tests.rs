@@ -30,7 +30,7 @@ fn outgoing_identity(frame: Bytes) -> (i32, String, String) {
     let command = String::from_utf8(head.p32().unwrap().to_vec()).unwrap();
     (sequence, command, uin)
 }
-fn incoming(sequence: i32, command: &str, body: &[u8], key: Option<&[u8]>) -> Bytes {
+pub(super) fn incoming(sequence: i32, command: &str, body: &[u8], key: Option<&[u8]>) -> Bytes {
     incoming_status(sequence, command, body, key, 0, "")
 }
 fn incoming_status(
