@@ -60,8 +60,11 @@ impl Client {
         Ok(configuration)
     }
 
-    pub(crate) fn apply_network_push(&self, generation: u64, body: Bytes) -> Result<Option<Bytes>> {
-        let push = network::decode_push(body)?;
+    pub(crate) fn apply_network_push(
+        &self,
+        generation: u64,
+        push: network::ConfigPush,
+    ) -> Result<Option<Bytes>> {
         if let network::ConfigPushBody::SsoServers(configuration) = push.body {
             match configuration {
                 Ok(configuration) => {
@@ -72,6 +75,7 @@ impl Client {
                     {
                         return Err(Error::Disconnected);
                     }
+                    self.enqueue_ios_config_probes(&mut inner, &configuration.servers);
                     inner.sso_configuration = Some(Arc::new(configuration));
                     inner.server_cursor = 0;
                 }
@@ -84,6 +88,16 @@ impl Client {
     }
 
     pub(crate) async fn connect_socket(&self) -> Result<TcpStream> {
+        if self.config.profile.platform.is_ios() {
+            if self.config.host != "msfwifi.3g.qq.com" || self.config.port != 8080 {
+                return TcpStream::connect((self.config.host.as_str(), self.config.port))
+                    .await
+                    .map_err(Into::into);
+            }
+            if let Some(socket) = self.connect_ios_cached_socket().await {
+                return Ok(socket);
+            }
+        }
         let (configuration, cursor) = {
             let inner = self.inner.lock().unwrap();
             (inner.sso_configuration.clone(), inner.server_cursor)
@@ -137,6 +151,7 @@ impl Client {
                         }
                         return Ok(socket);
                     }
+                    self.start_ios_discovery(self.connection_generation(), true);
                 }
             }
         }

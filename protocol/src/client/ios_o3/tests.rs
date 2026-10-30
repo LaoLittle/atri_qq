@@ -18,7 +18,7 @@ fn client(
     uin: u64,
 ) -> (Arc<Client>, mpsc::Receiver<Outgoing>, EcKey<Private>) {
     let mut config = ios_signing_tests::config(profile);
-    config.ios_signing.as_mut().unwrap().raw_device_token = Bytes::from_static(token);
+    config.ios_snapshot_mut().unwrap().signing.raw_device_token = Bytes::from_static(token);
     let client = Client::new(
         config,
         Keystore {
@@ -35,7 +35,7 @@ fn client(
             generation: 0,
             sender,
         });
-        inner.ios_o3 = Some(Channel::with_peer(CheckMode::Sdk, peer));
+        inner.ios_mut().unwrap().channel = Some(Channel::with_peer(CheckMode::Sdk, peer));
     }
     (client, queue, key)
 }
@@ -46,8 +46,13 @@ fn server_material() -> (EcKey<Private>, [u8; 33]) {
     let mut context = BigNumContext::new().unwrap();
     let mut point = EcPoint::new(&group).unwrap();
     point.mul_generator2(&group, &scalar, &mut context).unwrap();
-    let peer = point.to_bytes(&group, PointConversionForm::COMPRESSED, &mut context).unwrap();
-    (EcKey::from_private_components(&group, &scalar, &point).unwrap(), peer.try_into().unwrap())
+    let peer = point
+        .to_bytes(&group, PointConversionForm::COMPRESSED, &mut context)
+        .unwrap();
+    (
+        EcKey::from_private_components(&group, &scalar, &point).unwrap(),
+        peer.try_into().unwrap(),
+    )
 }
 
 fn refresh(client: &Arc<Client>) -> JoinHandle<Result<Option<TokenPersistence>>> {
@@ -639,128 +644,251 @@ async fn token_collector_uses_current_xwid_at_59_without_overwriting_r0_or_guid(
 }
 
 fn virtual_frame(frame: Bytes) -> (i32, String, Bytes, String, crate::proto::sso::Reserved) {
+    let mut outer = crate::wire::Reader::new(frame.clone());
+    outer.u32().unwrap();
+    let protocol = outer.u32().unwrap();
+    outer.u8().unwrap();
+    let outer_sequence = if protocol == 13 {
+        outer.i32().unwrap()
+    } else {
+        outer.p32().unwrap();
+        0
+    };
     let (_, _, _, mut head, body) = ios_signing_tests::request_parts(frame, &[0; 16]);
-    let sequence = head.i32().unwrap();
-    head.skip(20).unwrap();
-    head.p32().unwrap();
-    let command = String::from_utf8(head.p32().unwrap().to_vec()).unwrap();
-    for _ in 0..3 {
+    let sequence = if protocol == 12 {
+        let sequence = head.i32().unwrap();
+        head.skip(20).unwrap();
         head.p32().unwrap();
-    }
-    let trailer = String::from_utf8(head.pref(2, true).unwrap().to_vec()).unwrap();
+        sequence
+    } else {
+        outer_sequence
+    };
+    let command = String::from_utf8(head.p32().unwrap().to_vec()).unwrap();
+    head.p32().unwrap();
+    let trailer = if protocol == 12 {
+        head.p32().unwrap();
+        head.p32().unwrap();
+        String::from_utf8(head.pref(2, true).unwrap().to_vec()).unwrap()
+    } else {
+        String::new()
+    };
     let reserve = crate::proto::sso::Reserved::decode(head.p32().unwrap()).unwrap();
     assert!(head.rest().is_empty());
     (sequence, command, body, trailer, reserve)
 }
 
-fn virtual_request(client: &Arc<Client>, command: &'static str, wait: Duration) -> JoinHandle<Result<Bytes>> {
+fn virtual_request(
+    client: &Arc<Client>,
+    command: &'static str,
+    wait: Duration,
+) -> JoinHandle<Result<Bytes>> {
     let client = client.clone();
     tokio::spawn(async move {
-        client.request(command, Bytes::from_static(b"business"), RequestType::D2, Encryption::D2, wait).await
+        client
+            .request(
+                command,
+                Bytes::from_static(b"business"),
+                RequestType::D2,
+                Encryption::D2,
+                wait,
+            )
+            .await
     })
 }
 
 #[tokio::test]
 async fn virtual_device_tcp_bootstrap_publishes_authenticated_token_and_consumes_real_statistics() {
     tokio::time::timeout(Duration::from_secs(20), async {
-    for profile in [Profile::iphone(), Profile::ipad()] {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let config = ClientConfig {
-            profile,
-            host: "127.0.0.1".into(),
-            port: listener.local_addr().unwrap().port(),
-            ios_virtual: Some(Arc::new(crate::ios_device::IosVirtualConfig::default())),
-            ..Default::default()
-        };
-        let client = Client::new(config.clone(), Keystore::default()).unwrap();
-        let mut events = client.login_events();
-        client.connect().await.unwrap();
-        let (socket, _) = listener.accept().await.unwrap();
-        let mut socket = Framed::new(socket, SsoFrameCodec);
-        let (server, public) = server_material();
-        client.inner.lock().unwrap().ios_o3 = Some(Channel::with_peer(CheckMode::Sdk, public));
-        let first = virtual_request(&client, "AvatarInfoSvr.QQHeadUrlReq", Duration::from_secs(3));
-        let mut sequence_marker = None;
-        for _ in 0..2 {
-            let frame = tokio::time::timeout(Duration::from_secs(3), socket.next()).await.unwrap().unwrap().unwrap();
-            let (sequence, command, body, _, reserve) = virtual_frame(frame);
-            let marker = reserve.trans_info.iter().find(|entry| entry.key.as_deref() == Some("client_conn_seq")).unwrap().value.clone().unwrap();
-            if let Some(expected) = &sequence_marker {
-                assert_eq!(&marker, expected);
+        for profile in [Profile::iphone(), Profile::ipad()] {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let mut model = crate::ios_device::IosVirtualConfig::default();
+            let (carrier_code, numeric_carrier) = if profile.platform == ClientPlatform::IPad {
+                model.carrier = Some(crate::ios_device::IosVirtualCarrier {
+                    country_code: "us".into(),
+                    mobile_country_code: "310".into(),
+                    mobile_network_code: "260".into(),
+                    name: "T-Mobile".into(),
+                });
+                ("310260", 310260)
             } else {
-                sequence_marker = Some(marker);
-            }
-            assert_eq!(reserve.ip_stack_type, Some(1));
-            assert_eq!(reserve.ip_origin, Some(1));
-            let response = if command == crate::o3::ESTABLISH_COMMAND {
-                assert_eq!(reserve.message_type, Some(0));
-                let envelope = pb::IosEstablishShareKeyRequest::decode(body.clone()).unwrap();
-                let (response, key) = establish(&server, body, b"authenticated-virtual-token", true);
-                let plaintext = crate::crypto::aes_gcm_decrypt(&envelope.encrypted_body, &key).unwrap();
-                let plaintext = pb::ChannelPlaintext::decode(plaintext.as_slice()).unwrap();
-                let request = DeviceTokenRequest::decode(plaintext.body).unwrap();
-                assert_eq!(request.previous_token.as_ref(), b"");
-                response
-            } else {
-                assert_eq!(command, "AvatarInfoSvr.QQHeadUrlReq");
-                assert_eq!(reserve.message_type, Some(32));
-                assert_eq!(reserve.secure_info.unwrap().token.unwrap().as_ref(), b"");
-                Bytes::from_static(b"first-business-response")
+                ("000000", 0)
             };
-            socket.send(incoming(sequence, &command, &response, Some(&[0; 16]))).await.unwrap();
-        }
-        assert_eq!(first.await.unwrap().unwrap().as_ref(), b"first-business-response");
-        let saved = tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if let LoginEvent::KeystoreChanged(saved) = events.recv().await.unwrap() {
-                    if saved.ios_virtual_state.as_ref().unwrap().token.token.as_ref() == b"authenticated-virtual-token" {
-                        break saved;
+            let expected_trailer = format!("|{carrier_code}|I{}", model.bundle_version);
+            let config = ClientConfig {
+                profile,
+                host: "127.0.0.1".into(),
+                port: listener.local_addr().unwrap().port(),
+                platform: Some(crate::models::PlatformConfig::Ios(
+                    crate::models::IosConfig::Virtual(Arc::new(model)),
+                )),
+                ..Default::default()
+            };
+            let client = Client::new(config.clone(), Keystore::default()).unwrap();
+            let mut events = client.login_events();
+            client.connect().await.unwrap();
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = Framed::new(socket, SsoFrameCodec);
+            let (server, public) = server_material();
+            client.inner.lock().unwrap().ios_mut().unwrap().channel =
+                Some(Channel::with_peer(CheckMode::Sdk, public));
+            let first = virtual_request(
+                &client,
+                "AvatarInfoSvr.QQHeadUrlReq",
+                Duration::from_secs(3),
+            );
+            let mut sequence_marker = None;
+            for _ in 0..2 {
+                let frame = tokio::time::timeout(Duration::from_secs(3), socket.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                let (sequence, command, body, trailer, reserve) = virtual_frame(frame);
+                assert_eq!(trailer, expected_trailer);
+                assert_eq!(reserve.imsi, Some(numeric_carrier));
+                let marker = reserve
+                    .trans_info
+                    .iter()
+                    .find(|entry| entry.key.as_deref() == Some("client_conn_seq"))
+                    .unwrap()
+                    .value
+                    .clone()
+                    .unwrap();
+                if let Some(expected) = &sequence_marker {
+                    assert_eq!(&marker, expected);
+                } else {
+                    sequence_marker = Some(marker);
+                }
+                assert_eq!(reserve.ip_stack_type, Some(1));
+                assert_eq!(reserve.ip_origin, Some(1));
+                let response = if command == crate::o3::ESTABLISH_COMMAND {
+                    assert_eq!(reserve.message_type, Some(0));
+                    let envelope = pb::IosEstablishShareKeyRequest::decode(body.clone()).unwrap();
+                    let (response, key) =
+                        establish(&server, body, b"authenticated-virtual-token", true);
+                    let plaintext =
+                        crate::crypto::aes_gcm_decrypt(&envelope.encrypted_body, &key).unwrap();
+                    let plaintext = pb::ChannelPlaintext::decode(plaintext.as_slice()).unwrap();
+                    let request = DeviceTokenRequest::decode(plaintext.body).unwrap();
+                    assert_eq!(request.previous_token.as_ref(), b"");
+                    response
+                } else {
+                    assert_eq!(command, "AvatarInfoSvr.QQHeadUrlReq");
+                    assert_eq!(reserve.message_type, Some(32));
+                    assert_eq!(reserve.secure_info.unwrap().token.unwrap().as_ref(), b"");
+                    Bytes::from_static(b"first-business-response")
+                };
+                socket
+                    .send(incoming(sequence, &command, &response, Some(&[0; 16])))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                first.await.unwrap().unwrap().as_ref(),
+                b"first-business-response"
+            );
+            let saved = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if let LoginEvent::KeystoreChanged(saved) = events.recv().await.unwrap() {
+                        if saved
+                            .ios_virtual_state
+                            .as_ref()
+                            .unwrap()
+                            .token
+                            .token
+                            .as_ref()
+                            == b"authenticated-virtual-token"
+                        {
+                            break saved;
+                        }
                     }
                 }
-            }
-        }).await.unwrap();
-        let token = &saved.ios_virtual_state.as_ref().unwrap().token;
-        assert_eq!(token.associated_uin, "0");
-        assert!(token.expires_at > crate::o3::unix_seconds().unwrap());
-        let signed = virtual_request(&client, "AvatarInfoSvr.QQHeadUrlReq", Duration::from_secs(3));
-        let frame = socket.next().await.unwrap().unwrap();
-        let (sequence, command, _, _, reserve) = virtual_frame(frame);
-        assert_eq!(reserve.secure_info.unwrap().token.unwrap().as_ref(), b"authenticated-virtual-token");
-        socket.send(incoming(sequence, &command, b"updated-token-response", Some(&[0; 16]))).await.unwrap();
-        assert_eq!(signed.await.unwrap().unwrap().as_ref(), b"updated-token-response");
-        let missing = virtual_request(&client, "virtual.unanswered.business", Duration::from_millis(200));
-        let frame = socket.next().await.unwrap().unwrap();
-        let (_, command, _, _, _) = virtual_frame(frame);
-        assert_eq!(command, "virtual.unanswered.business");
-        assert!(matches!(missing.await.unwrap(), Err(Error::Timeout)));
-        for expected in [(3, 1), (1, 0)] {
-            let push = virtual_request(&client, "PushService.get", Duration::from_secs(3));
+            })
+            .await
+            .unwrap();
+            let token = &saved.ios_virtual_state.as_ref().unwrap().token;
+            assert_eq!(token.associated_uin, "0");
+            assert!(token.expires_at > crate::o3::unix_seconds().unwrap());
+            let signed = virtual_request(
+                &client,
+                "AvatarInfoSvr.QQHeadUrlReq",
+                Duration::from_secs(3),
+            );
             let frame = socket.next().await.unwrap().unwrap();
-            let (sequence, command, _, trailer, _) = virtual_frame(frame);
-            assert_eq!(command, "PushService.get");
-            let statistics: Vec<&str> = trailer.split_once('|').unwrap().0.split(',').collect();
-            assert_eq!(statistics.len(), 3);
-            assert_eq!(statistics[0].parse::<i32>().unwrap(), expected.0);
-            assert!(statistics[1].parse::<i64>().unwrap() >= 0);
-            assert_eq!(statistics[2].parse::<i32>().unwrap(), expected.1);
-            socket.send(incoming(sequence, &command, b"push-response", Some(&[0; 16]))).await.unwrap();
-            assert_eq!(push.await.unwrap().unwrap().as_ref(), b"push-response");
+            let (sequence, command, _, _, reserve) = virtual_frame(frame);
+            assert_eq!(
+                reserve.secure_info.unwrap().token.unwrap().as_ref(),
+                b"authenticated-virtual-token"
+            );
+            socket
+                .send(incoming(
+                    sequence,
+                    &command,
+                    b"updated-token-response",
+                    Some(&[0; 16]),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                signed.await.unwrap().unwrap().as_ref(),
+                b"updated-token-response"
+            );
+            let missing = virtual_request(
+                &client,
+                "virtual.unanswered.business",
+                Duration::from_millis(200),
+            );
+            let frame = socket.next().await.unwrap().unwrap();
+            let (_, command, _, _, _) = virtual_frame(frame);
+            assert_eq!(command, "virtual.unanswered.business");
+            assert!(matches!(missing.await.unwrap(), Err(Error::Timeout)));
+            for expected in [(3, 1), (1, 0)] {
+                let push = virtual_request(&client, "PushService.get", Duration::from_secs(3));
+                let frame = socket.next().await.unwrap().unwrap();
+                let (sequence, command, _, trailer, _) = virtual_frame(frame);
+                assert_eq!(command, "PushService.get");
+                let statistics: Vec<&str> = trailer.split_once('|').unwrap().0.split(',').collect();
+                assert_eq!(statistics.len(), 3);
+                assert_eq!(statistics[0].parse::<i32>().unwrap(), expected.0);
+                assert!(statistics[1].parse::<i64>().unwrap() >= 0);
+                assert_eq!(statistics[2].parse::<i32>().unwrap(), expected.1);
+                socket
+                    .send(incoming(
+                        sequence,
+                        &command,
+                        b"push-response",
+                        Some(&[0; 16]),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(push.await.unwrap().unwrap().as_ref(), b"push-response");
+            }
+            let mut encoded = Vec::new();
+            ciborium::into_writer(&saved, &mut encoded).unwrap();
+            let restored: Keystore = ciborium::from_reader(encoded.as_slice()).unwrap();
+            let original_identity = restored.ios_virtual_state.clone().unwrap();
+            client.terminate_generation(1, "test completed".into());
+            drop(socket);
+            let recreated = Client::new(config, restored).unwrap();
+            recreated.connect().await.unwrap();
+            let (_socket, _) = listener.accept().await.unwrap();
+            let next = recreated
+                .snapshot()
+                .await
+                .keystore
+                .ios_virtual_state
+                .unwrap();
+            assert_eq!(next.collector_uuid, original_identity.collector_uuid);
+            assert_eq!(next.xwid_candidate, original_identity.xwid_candidate);
+            assert_eq!(next.token, original_identity.token);
+            assert!(
+                next.connection_sequence.unwrap() > original_identity.connection_sequence.unwrap()
+            );
+            recreated.terminate_generation(1, "test completed".into());
         }
-        let mut encoded = Vec::new();
-        ciborium::into_writer(&saved, &mut encoded).unwrap();
-        let restored: Keystore = ciborium::from_reader(encoded.as_slice()).unwrap();
-        let original_identity = restored.ios_virtual_state.clone().unwrap();
-        client.terminate_generation(1, "test completed".into());
-        drop(socket);
-        let recreated = Client::new(config, restored).unwrap();
-        recreated.connect().await.unwrap();
-        let (_socket, _) = listener.accept().await.unwrap();
-        let next = recreated.snapshot().await.keystore.ios_virtual_state.unwrap();
-        assert_eq!(next.collector_uuid, original_identity.collector_uuid);
-        assert_eq!(next.xwid_candidate, original_identity.xwid_candidate);
-        assert_eq!(next.token, original_identity.token);
-        assert!(next.connection_sequence.unwrap() > original_identity.connection_sequence.unwrap());
-        recreated.terminate_generation(1, "test completed".into());
-    }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 }

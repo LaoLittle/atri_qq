@@ -50,6 +50,7 @@ pub(super) struct NtResult {
     pub unusual_signature: Option<Bytes>,
     pub captcha_url: Option<String>,
     pub long_cookie: Option<Bytes>,
+    pub security: IosLoginSecurityChallenge,
 }
 impl NtResult {
     pub fn require_success(&self) -> Result<()> {
@@ -58,15 +59,20 @@ impl NtResult {
         } else {
             Err(Error::Server {
                 code: self.code as i32,
-                message: format!("{}: {}", self.title, self.message),
+                message: format!(
+                    "{}: {}",
+                    super::redact_login_urls(&self.title),
+                    super::redact_login_urls(&self.message)
+                ),
             })
         }
+    }
+    pub fn security_challenge(&self) -> LoginChallenge {
+        LoginChallenge::IosSecurity(self.security.clone())
     }
 }
 pub(super) struct NtLogin {
     ecdh: Ecdh,
-    ios_device: Option<IosDevice>,
-    device_name: Option<String>,
     exchange_prepared: bool,
     exchange_platform: ClientPlatform,
     long_cookies: BTreeMap<String, Bytes>,
@@ -77,8 +83,6 @@ impl NtLogin {
     pub fn new() -> Result<Self> {
         Ok(Self {
             ecdh: Ecdh::new(Curve::P256)?,
-            ios_device: None,
-            device_name: None,
             exchange_prepared: false,
             exchange_platform: ClientPlatform::Linux,
             long_cookies: BTreeMap::new(),
@@ -92,14 +96,9 @@ impl NtLogin {
         codec.verifier_override = Some(verifier);
         Ok(codec)
     }
-    pub fn with_device(device: Option<IosDevice>) -> Result<Self> {
-        Self::with_device_name(device, None)
-    }
-    pub fn with_device_name(device: Option<IosDevice>, device_name: Option<String>) -> Result<Self> {
-        let mut codec = Self::new()?;
-        codec.ios_device = device;
-        codec.device_name = device_name;
-        Ok(codec)
+    #[cfg(test)]
+    pub(super) fn set_verifier(&mut self, verifier: crypto::P256Verifier) {
+        self.verifier_override = Some(verifier);
     }
     pub fn key_exchange(&mut self, state: &SessionState, timestamp: u64) -> Result<Bytes> {
         if self.exchange_prepared {
@@ -211,9 +210,11 @@ impl NtLogin {
         let k = &state.keystore;
         let ios = p.platform.is_ios();
         let os = if ios {
-            let device = self.ios_device.as_ref().ok_or_else(|| {
-                Error::Authentication("NT iOS login requires actual IosDevice resources".into())
-            })?;
+            let PlatformState::Ios { device, .. } = &state.platform else {
+                return Err(Error::Authentication(
+                    "NT iOS login requires actual IosDevice resources".into(),
+                ));
+            };
             device.validate()?;
             device.system_version.clone()
         } else {
@@ -231,7 +232,7 @@ impl NtLogin {
             }),
             client: Some(auth::NtClient {
                 os: Some(os),
-                device_name: Some(self.device_name.as_ref().unwrap_or(&k.device_name).clone()),
+                device_name: Some(state.device_name().to_owned()),
                 platform: Some(platform),
                 guid: Some(Bytes::copy_from_slice(&k.guid)),
             }),
@@ -368,6 +369,39 @@ impl NtLogin {
         *store = candidate;
         Ok(NtResult {
             code,
+            security: IosLoginSecurityChallenge {
+                code: error.code,
+                title: error.title.clone(),
+                message: error.message.clone(),
+                jump_word: error.jump_word.clone(),
+                jump_url: error.jump_url.clone(),
+                detail: error.detail.map(|detail| IosLoginSecurityDetail {
+                    need_new_device: detail
+                        .need_new_device
+                        .map(|value| IosLoginSecurityNewDevice { value: value.value }),
+                    unregistered: detail
+                        .unregistered
+                        .map(|value| IosLoginSecurityText { value: value.value }),
+                    forbidden: detail
+                        .forbidden
+                        .map(|value| IosLoginSecurityForbidden { area: value.area }),
+                    nice_account_expired: detail
+                        .nice_account_expired
+                        .map(|value| IosLoginSecurityText { value: value.value }),
+                    sms_check: detail
+                        .sms_check
+                        .map(|value| IosLoginSecurityText { value: value.value }),
+                }),
+                buttons: error
+                    .buttons
+                    .into_iter()
+                    .map(|button| IosLoginSecurityButton {
+                        wording: button.wording,
+                        url: button.url,
+                    })
+                    .collect(),
+                unknown8: error.unknown8,
+            },
             title: error.title.unwrap_or_default(),
             message: error.message.unwrap_or_default(),
             jump_word: error.jump_word.unwrap_or_default(),
@@ -547,12 +581,7 @@ mod tests {
 
     #[test]
     fn ios_request_head_matches_native_serialization_without_desktop_security() {
-        let codec = NtLogin::with_device(Some(IosDevice {
-            system_version: "18.0".into(),
-            hardware_model: "iPhone17,1".into(),
-            system_name: "iOS".into(),
-        }))
-        .unwrap();
+        let codec = NtLogin::new().unwrap();
         let golden = "0a080a06313233343536122c0a0431382e30121073796e7468657469632d64657669636518012210313131313131313131313131313131311a350a06392e332e373510101a0f636f6d2e74656e63656e742e6d71712a1856315f4950485f53515f392e332e37355f315f4150505f41";
         for (json, bid) in [
             (r#"{"platform":"IPhone"}"#, 537_396_808),
@@ -569,7 +598,15 @@ mod tests {
                     key_exchange_session: Some(test_session()),
                     ..Default::default()
                 },
-                machine_id: "synthetic-machine".into(),
+                platform: PlatformState::Ios {
+                    device: IosDevice {
+                        system_version: "18.0".into(),
+                        hardware_model: "iPhone17,1".into(),
+                        system_name: "iOS".into(),
+                    }
+                    .into(),
+                    device_name: "synthetic-device".into(),
+                },
                 online: false,
             };
             assert_eq!(
@@ -608,6 +645,9 @@ mod tests {
                 ),
                 format!("{golden}2a120a1073796e7468657469632d636f6f6b6965"),
             );
+            state.platform = PlatformState::Linux {
+                machine_id: "synthetic-machine".into(),
+            };
             assert!(
                 NtLogin::new()
                     .unwrap()
@@ -617,13 +657,14 @@ mod tests {
         }
     }
 
-
     #[test]
     fn desktop_request_head_retains_linux_fields_and_security() {
         let state = SessionState {
             profile: serde_json::from_str("{}").unwrap(),
             keystore: Keystore::default(),
-            machine_id: "synthetic-machine".into(),
+            platform: PlatformState::Linux {
+                machine_id: "synthetic-machine".into(),
+            },
             online: false,
         };
         let head = NtLogin::new()
@@ -638,19 +679,14 @@ mod tests {
 
     #[test]
     fn profile_overrides_reach_nt_headers_and_uncatalogued_platforms_require_complete_input() {
-        let codec = NtLogin::with_device(Some(IosDevice {
-            system_version: "18.0".into(),
-            hardware_model: "synthetic-hardware".into(),
-            system_name: "iOS".into(),
-        }))
-        .unwrap();
+        let codec = NtLogin::new().unwrap();
         let state = SessionState {
             profile: serde_json::from_str(
                 r#"{"platform":"IPad","qua":"explicit-qua","app_id":42,"version":"explicit-version","package_name":"explicit-package"}"#,
             )
             .unwrap(),
             keystore: Keystore::default(),
-            machine_id: "synthetic-machine".into(),
+            platform: PlatformState::Ios { device: IosDevice { system_version: "18.0".into(), hardware_model: "synthetic-hardware".into(), system_name: "iOS".into() }.into(), device_name: "synthetic-device".into() },
             online: false,
         };
         let head = codec
@@ -672,6 +708,9 @@ mod tests {
             );
             let explicit = SessionState {
                 profile: serde_json::from_str(&input).unwrap(),
+                platform: PlatformState::Linux {
+                    machine_id: "synthetic-machine".into(),
+                },
                 ..state.clone()
             };
             let head = codec
@@ -699,7 +738,9 @@ mod tests {
                 tgtgt_key: vec![0x31; 16],
                 ..Default::default()
             },
-            machine_id: "synthetic-machine".into(),
+            platform: PlatformState::Linux {
+                machine_id: "synthetic-machine".into(),
+            },
             online: false,
         };
         let mut codec = super::super::wt::WtLogin::new().unwrap();
@@ -747,7 +788,9 @@ mod tests {
         let state = SessionState {
             profile: Profile::linux(),
             keystore: Keystore::default(),
-            machine_id: "synthetic-machine".into(),
+            platform: PlatformState::Linux {
+                machine_id: "synthetic-machine".into(),
+            },
             online: false,
         };
         codec.key_exchange(&state, 1_700_000_000).unwrap();
@@ -1235,7 +1278,9 @@ mod tests {
             let state = SessionState {
                 profile: Profile::linux(),
                 keystore: store,
-                machine_id: "synthetic-machine".into(),
+                platform: PlatformState::Linux {
+                    machine_id: "synthetic-machine".into(),
+                },
                 online: false,
             };
             let request: auth::NtForward = proto::decode(
@@ -1333,7 +1378,9 @@ mod tests {
                 uin: 123456,
                 ..Default::default()
             },
-            machine_id: "synthetic-machine".into(),
+            platform: PlatformState::Linux {
+                machine_id: "synthetic-machine".into(),
+            },
             online: false,
         };
         let timestamp = u64::from(u32::MAX) + 123;
@@ -1405,7 +1452,9 @@ mod tests {
         let state = SessionState {
             profile: Profile::linux(),
             keystore: Keystore::default(),
-            machine_id: "synthetic-machine".into(),
+            platform: PlatformState::Linux {
+                machine_id: "synthetic-machine".into(),
+            },
             online: false,
         };
         let peer = Ecdh::new(Curve::P256).unwrap();
@@ -1635,7 +1684,9 @@ mod tests {
                     guid: vec![0x31; 16],
                     ..Default::default()
                 },
-                machine_id: "synthetic-machine".into(),
+                platform: PlatformState::Linux {
+                    machine_id: "synthetic-machine".into(),
+                },
                 online: false,
             };
             let a1 = NtLogin::password_a1(&digest, &state).unwrap();
@@ -1717,7 +1768,9 @@ mod tests {
                 key_exchange_session: Some(test_session()),
                 ..Default::default()
             },
-            machine_id: "synthetic-machine".into(),
+            platform: PlatformState::Linux {
+                machine_id: "synthetic-machine".into(),
+            },
             online: false,
         }
     }
@@ -2111,14 +2164,18 @@ mod tests {
     #[test]
     fn mobile_uin_password_replays_long_cookie_for_each_profile() {
         for profile in [Profile::iphone(), Profile::ipad()] {
-            let mut codec = NtLogin::with_device(Some(IosDevice {
-                system_version: "18.0".into(),
-                hardware_model: "synthetic-model".into(),
-                system_name: "iOS".into(),
-            }))
-            .unwrap();
+            let mut codec = NtLogin::new().unwrap();
             let mut state = long_cookie_state(123456);
             state.profile = profile;
+            state.platform = PlatformState::Ios {
+                device: IosDevice {
+                    system_version: "18.0".into(),
+                    hardware_model: "synthetic-model".into(),
+                    system_name: "iOS".into(),
+                }
+                .into(),
+                device_name: "synthetic-device".into(),
+            };
             let response = long_cookie_response(
                 &state.keystore,
                 NtResponseKind::Password,

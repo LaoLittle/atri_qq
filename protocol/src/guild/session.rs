@@ -24,7 +24,7 @@ struct State {
     self_tiny_id: Option<u64>,
     guilds: BTreeMap<u64, WorkingGuild>,
     cursor: IosGuildSyncState,
-    cursor_received: bool,
+    cursor_taken: bool,
 }
 
 #[derive(Default)]
@@ -48,15 +48,34 @@ impl Session {
         *self.state.lock().unwrap() = State {
             generation: Some(generation),
             request_random,
+            cursor: IosGuildSyncState {
+                last_pull_time: Some(0),
+                ..Default::default()
+            },
             ..State::default()
         };
         self.changed.send_replace(());
     }
 
-    pub(crate) fn set_request_random(&self, generation: u64, request_random: u32) {
+    pub(crate) fn prepare_info_request(
+        &self,
+        generation: u64,
+        request_random: u32,
+        sync_flag: u32,
+    ) {
         let mut state = self.state.lock().unwrap();
         if state.generation == Some(generation) {
             state.request_random = request_random;
+            if sync_flag & 0x10 != 0 {
+                state.cursor = IosGuildSyncState {
+                    last_pull_time: Some(0),
+                    ..Default::default()
+                };
+                state.cursor_taken = false;
+                state.complete = false;
+                state.error = None;
+                self.changed.send_replace(());
+            }
         }
     }
 
@@ -191,11 +210,11 @@ impl Session {
         if state.generation != Some(generation)
             || !state.complete
             || state.error.is_some()
-            || !state.cursor_received
+            || state.cursor_taken
         {
             return None;
         }
-        state.cursor_received = false;
+        state.cursor_taken = true;
         Some(std::mem::take(&mut state.cursor))
     }
 }
@@ -234,9 +253,14 @@ impl State {
             return Ok(());
         }
         let mut cursor = IosGuildSyncState::default();
-        if let Some(bytes) = guild.transport_info.as_ref().filter(|bytes| !bytes.is_empty()) {
-            let transport: proto::guild::GuildFirstViewTransportInfo = proto::decode(bytes.as_ref())?;
-            cursor.last_pull_time = transport.last_pull_time;
+        if let Some(bytes) = guild
+            .transport_info
+            .as_ref()
+            .filter(|bytes| !bytes.is_empty())
+        {
+            let transport: proto::guild::GuildFirstViewTransportInfo =
+                proto::decode(bytes.as_ref())?;
+            cursor.last_pull_time = Some(transport.last_pull_time.unwrap_or(0));
         }
         for node in &guild.in_tab_nodes {
             self.merge_node(node, &mut cursor)?;
@@ -246,15 +270,16 @@ impl State {
                 self.merge_node(node, &mut cursor)?;
             }
         }
-        if cursor.last_pull_time.is_some() || !cursor.entries.is_empty() {
-            self.cursor_received = true;
-            if cursor.last_pull_time.is_some() {
-                self.cursor.last_pull_time = cursor.last_pull_time;
-            }
-            for (guild_id, value) in cursor.entries {
-                let current = self.cursor.entries.entry(guild_id).or_default();
-                *current = (*current).max(value);
-            }
+        if cursor.last_pull_time.is_some() {
+            self.cursor.last_pull_time = cursor.last_pull_time;
+        }
+        if let Some(time) = cursor.last_msg_time {
+            self.cursor.last_msg_time =
+                Some(self.cursor.last_msg_time.unwrap_or_default().max(time));
+        }
+        for (guild_id, value) in cursor.entries {
+            let current = self.cursor.entries.entry(guild_id).or_default();
+            *current = (*current).max(value);
         }
         if push.stage == Some(4) && self.initial_result == Some(1) {
             self.complete = true;
@@ -271,8 +296,8 @@ impl State {
         let guild_id = node.guild_id.unwrap_or_default();
         let current = cursor.entries.entry(guild_id).or_default();
         *current = (*current).max(node.incremental_cursor.unwrap_or_default());
-        let mut guild = (node_kind == 0 && guild_id > 0)
-            .then(|| self.guilds.entry(guild_id).or_default());
+        let mut guild =
+            (node_kind == 0 && guild_id > 0).then(|| self.guilds.entry(guild_id).or_default());
         if let Some(guild) = &mut guild {
             if let Some(name) = node.name.filter(|name| !name.is_empty()) {
                 guild.name = decode_name(name);
@@ -280,6 +305,20 @@ impl State {
         }
         for bytes in node.channels {
             let channel: proto::guild::FirstViewChannelNode = proto::decode(bytes.as_ref())?;
+            if node_kind == 0 {
+                if let Some(first) = channel.messages.first() {
+                    let message: proto::guild::FirstViewRawMessage = proto::decode(first.as_ref())?;
+                    if let Some(content) = message
+                        .head
+                        .filter(|head| head.routing.is_some())
+                        .and_then(|head| head.content)
+                    {
+                        let time = content.time.unwrap_or_default();
+                        cursor.last_msg_time =
+                            Some(cursor.last_msg_time.unwrap_or_default().max(time));
+                    }
+                }
+            }
             let Some(guild) = &mut guild else {
                 continue;
             };
@@ -364,6 +403,7 @@ mod tests {
                         channel_id: Some(id),
                         name: name.map(|name| Bytes::copy_from_slice(name.as_bytes())),
                         kind,
+                        ..Default::default()
                     }
                     .encode_to_vec()
                     .into()
@@ -373,6 +413,341 @@ mod tests {
         }
         .encode_to_vec()
         .into()
+    }
+
+    fn raw_message(time: Option<u64>) -> Bytes {
+        proto::guild::ChannelMessage {
+            head: Some(proto::guild::MessageHead {
+                routing: Some(proto::guild::RoutingHead::default()),
+                content: Some(proto::guild::ContentHead {
+                    time,
+                    ..Default::default()
+                }),
+            }),
+            body: Some(Bytes::from_static(&[0xff])),
+            ..Default::default()
+        }
+        .encode_to_vec()
+        .into()
+    }
+
+    fn message_node(guild_id: u64, kind: i32, messages: Vec<Vec<Bytes>>) -> Bytes {
+        proto::guild::FirstViewGuildNode {
+            guild_id: Some(guild_id),
+            node_kind: Some(kind),
+            incremental_cursor: Some(guild_id * 10),
+            channels: messages
+                .into_iter()
+                .enumerate()
+                .map(|(index, messages)| {
+                    proto::guild::FirstViewChannelNode {
+                        channel_id: Some(index as u64 + 1),
+                        messages,
+                        ..Default::default()
+                    }
+                    .encode_to_vec()
+                    .into()
+                })
+                .collect(),
+            ..Default::default()
+        }
+        .encode_to_vec()
+        .into()
+    }
+
+    #[test]
+    fn first_normal_message_preserves_numeric_identity_without_decoding_body() {
+        for time in [0, 1_700_000_123, 1_700_000_123_456, u64::MAX - 1] {
+            let session = started();
+            session
+                .ingest(
+                    GENERATION,
+                    &info(
+                        1,
+                        Some(proto::guild::GuildFirstViewData {
+                            in_tab_nodes: vec![message_node(
+                                10,
+                                0,
+                                vec![vec![raw_message(Some(time)), raw_message(Some(u64::MAX))]],
+                            )],
+                            ..initial()
+                        }),
+                    ),
+                )
+                .unwrap();
+            session
+                .ingest(GENERATION, &info(4, Some(Default::default())))
+                .unwrap();
+            assert_eq!(
+                session.take_ios_cursor(GENERATION).unwrap().last_msg_time,
+                Some(time)
+            );
+        }
+    }
+
+    #[test]
+    fn normal_channels_and_batches_use_unsigned_max_excluding_other_sources() {
+        let session = started();
+        let high = (1_u64 << 63) + 7;
+        session
+            .ingest(
+                GENERATION,
+                &info(
+                    1,
+                    Some(proto::guild::GuildFirstViewData {
+                        in_tab_nodes: vec![
+                            message_node(
+                                10,
+                                0,
+                                vec![
+                                    vec![raw_message(Some(17))],
+                                    vec![raw_message(Some(high - 1))],
+                                ],
+                            ),
+                            message_node(11, 1, vec![vec![raw_message(Some(u64::MAX))]]),
+                            message_node(12, 2, vec![vec![Bytes::from_static(&[0xff])]]),
+                        ],
+                        group_nodes: vec![message_node(
+                            13,
+                            0,
+                            vec![vec![raw_message(Some(u64::MAX))]],
+                        )],
+                        extra: Some(proto::guild::GuildFirstViewExtra {
+                            normal_nodes: vec![message_node(
+                                14,
+                                0,
+                                vec![vec![raw_message(Some(high))]],
+                            )],
+                            direct_nodes_12: vec![message_node(
+                                15,
+                                0,
+                                vec![vec![raw_message(Some(u64::MAX))]],
+                            )],
+                            direct_nodes_15: vec![message_node(
+                                16,
+                                0,
+                                vec![vec![Bytes::from_static(&[0xff])]],
+                            )],
+                            ..Default::default()
+                        }),
+                        ..initial()
+                    }),
+                ),
+            )
+            .unwrap();
+        session
+            .ingest(
+                GENERATION,
+                &info(
+                    4,
+                    Some(proto::guild::GuildFirstViewData {
+                        in_tab_nodes: vec![message_node(10, 0, vec![vec![raw_message(Some(19))]])],
+                        ..Default::default()
+                    }),
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            session.take_ios_cursor(GENERATION).unwrap().last_msg_time,
+            Some(high)
+        );
+    }
+
+    #[test]
+    fn missing_message_time_is_zero_and_does_not_fall_back_to_second_message() {
+        let session = started();
+        session
+            .ingest(
+                GENERATION,
+                &info(
+                    1,
+                    Some(proto::guild::GuildFirstViewData {
+                        in_tab_nodes: vec![message_node(
+                            10,
+                            0,
+                            vec![vec![raw_message(None), raw_message(Some(u64::MAX))]],
+                        )],
+                        ..initial()
+                    }),
+                ),
+            )
+            .unwrap();
+        session
+            .ingest(GENERATION, &info(4, Some(Default::default())))
+            .unwrap();
+        assert_eq!(
+            session.take_ios_cursor(GENERATION).unwrap().last_msg_time,
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn missing_headers_skip_only_first_message_time_without_falling_back() {
+        let missing_routing = proto::guild::FirstViewRawMessage {
+            head: Some(proto::guild::MessageHead {
+                routing: None,
+                content: Some(proto::guild::ContentHead::default()),
+            }),
+        }
+        .encode_to_vec()
+        .into();
+        let missing_content = proto::guild::FirstViewRawMessage {
+            head: Some(proto::guild::MessageHead {
+                routing: Some(proto::guild::RoutingHead::default()),
+                content: None,
+            }),
+        }
+        .encode_to_vec()
+        .into();
+        for first in [Bytes::new(), missing_routing, missing_content] {
+            let session = started();
+            session
+                .ingest(
+                    GENERATION,
+                    &info(
+                        1,
+                        Some(proto::guild::GuildFirstViewData {
+                            in_tab_nodes: vec![message_node(
+                                10,
+                                0,
+                                vec![vec![first.clone(), raw_message(Some(u64::MAX))]],
+                            )],
+                            ..initial()
+                        }),
+                    ),
+                )
+                .unwrap();
+            assert_eq!(session.state.lock().unwrap().cursor.last_msg_time, None);
+            session
+                .ingest(
+                    GENERATION,
+                    &info(
+                        4,
+                        Some(proto::guild::GuildFirstViewData {
+                            transport_info: Some(
+                                proto::guild::GuildFirstViewTransportInfo {
+                                    last_pull_time: Some(999),
+                                }
+                                .encode_to_vec()
+                                .into(),
+                            ),
+                            in_tab_nodes: vec![message_node(
+                                20,
+                                0,
+                                vec![
+                                    vec![raw_message(Some(17))],
+                                    vec![first, raw_message(Some(u64::MAX))],
+                                    vec![raw_message(Some(29))],
+                                ],
+                            )],
+                            ..Default::default()
+                        }),
+                    ),
+                )
+                .unwrap();
+            let cursor = session.take_ios_cursor(GENERATION).unwrap();
+            assert_eq!(cursor.last_msg_time, Some(29));
+            assert_eq!(cursor.last_pull_time, Some(999));
+            assert_eq!(cursor.entries, BTreeMap::from([(10, 100), (20, 200)]));
+            let snapshot = session.snapshot(GENERATION).unwrap();
+            assert_eq!(snapshot.guilds[0].channels.len(), 1);
+            assert_eq!(snapshot.guilds[1].channels.len(), 3);
+        }
+    }
+
+    #[test]
+    fn malformed_first_message_never_falls_back_or_commits_partial_batch_cursor() {
+        for first in [
+            Bytes::from_static(&[0xff]),
+            Bytes::from_static(&[0x0a, 0x02, 0x12]),
+            Bytes::from_static(&[0x0a, 0x06, 0x0a, 0x00, 0x12, 0x02, 0x30, 0x80]),
+        ] {
+            let session = started();
+            session
+                .ingest(
+                    GENERATION,
+                    &info(
+                        1,
+                        Some(proto::guild::GuildFirstViewData {
+                            in_tab_nodes: vec![message_node(
+                                10,
+                                0,
+                                vec![vec![raw_message(Some(17))]],
+                            )],
+                            ..initial()
+                        }),
+                    ),
+                )
+                .unwrap();
+            let before = session.state.lock().unwrap().cursor.clone();
+            assert!(
+                session
+                    .ingest(
+                        GENERATION,
+                        &info(
+                            4,
+                            Some(proto::guild::GuildFirstViewData {
+                                transport_info: Some(
+                                    proto::guild::GuildFirstViewTransportInfo {
+                                        last_pull_time: Some(999),
+                                    }
+                                    .encode_to_vec()
+                                    .into(),
+                                ),
+                                in_tab_nodes: vec![
+                                    message_node(20, 0, vec![vec![raw_message(Some(500))]]),
+                                    message_node(
+                                        21,
+                                        0,
+                                        vec![vec![first, raw_message(Some(u64::MAX))]]
+                                    ),
+                                ],
+                                ..Default::default()
+                            }),
+                        ),
+                    )
+                    .is_err()
+            );
+            assert_eq!(session.state.lock().unwrap().cursor, before);
+            assert!(session.take_ios_cursor(GENERATION).is_none());
+            assert!(session.snapshot(GENERATION).is_err());
+        }
+    }
+
+    #[test]
+    fn retry_and_new_round_reset_raw_message_time() {
+        let session = started();
+        let round = |time| {
+            info(
+                1,
+                Some(proto::guild::GuildFirstViewData {
+                    in_tab_nodes: vec![message_node(10, 0, vec![vec![raw_message(Some(time))]])],
+                    ..initial()
+                }),
+            )
+        };
+        session.ingest(GENERATION, &round(u64::MAX)).unwrap();
+        session.prepare_info_request(GENERATION, RANDOM, 1759);
+        session.ingest(GENERATION, &round(7)).unwrap();
+        session
+            .ingest(GENERATION, &info(4, Some(Default::default())))
+            .unwrap();
+        assert_eq!(
+            session.take_ios_cursor(GENERATION).unwrap().last_msg_time,
+            Some(7)
+        );
+        session.begin(GENERATION + 1, RANDOM);
+        session.ingest(GENERATION + 1, &round(3)).unwrap();
+        session
+            .ingest(GENERATION + 1, &info(4, Some(Default::default())))
+            .unwrap();
+        assert_eq!(
+            session
+                .take_ios_cursor(GENERATION + 1)
+                .unwrap()
+                .last_msg_time,
+            Some(3)
+        );
     }
 
     fn started() -> Session {
@@ -954,7 +1329,10 @@ mod tests {
         let cursor = session.take_ios_cursor(GENERATION).unwrap();
         assert_eq!(cursor.last_pull_time, Some(123));
         assert_eq!(cursor.last_msg_time, None);
-        assert_eq!(cursor.entries, BTreeMap::from([(10, 100), (11, 70), (14, 0)]));
+        assert_eq!(
+            cursor.entries,
+            BTreeMap::from([(10, 100), (11, 70), (14, 0)])
+        );
         assert!(session.take_ios_cursor(GENERATION).is_none());
         session.begin(GENERATION + 1, RANDOM);
         assert!(session.take_ios_cursor(GENERATION + 1).is_none());
@@ -991,25 +1369,42 @@ mod tests {
     }
 
     #[test]
-    fn empty_transport_does_not_synthesize_ios_cursor() {
-        for transport_info in [None, Some(Bytes::new()), Some(Bytes::from_static(&[0x08, 1]))] {
-            let session = started();
-            session
-                .ingest(
-                    GENERATION,
-                    &info(
-                        1,
-                        Some(proto::guild::GuildFirstViewData {
-                            transport_info,
-                            ..initial()
-                        }),
-                    ),
-                )
-                .unwrap();
-            session
-                .ingest(GENERATION, &info(4, Some(Default::default())))
-                .unwrap();
-            assert!(session.take_ios_cursor(GENERATION).is_none());
-        }
+    fn retried_first_view_does_not_commit_an_abandoned_cursor_window() {
+        let session = started();
+        let round = |guild_id, cursor, last_pull_time: Option<u64>| {
+            info(
+                1,
+                Some(proto::guild::GuildFirstViewData {
+                    in_tab_nodes: vec![
+                        proto::guild::FirstViewGuildNode {
+                            guild_id: Some(guild_id),
+                            incremental_cursor: Some(cursor),
+                            ..Default::default()
+                        }
+                        .encode_to_vec()
+                        .into(),
+                    ],
+                    transport_info: last_pull_time.map(|value| {
+                        proto::guild::GuildFirstViewTransportInfo {
+                            last_pull_time: Some(value),
+                        }
+                        .encode_to_vec()
+                        .into()
+                    }),
+                    ..initial()
+                }),
+            )
+        };
+        session
+            .ingest(GENERATION, &round(10, 100, Some(123)))
+            .unwrap();
+        session.prepare_info_request(GENERATION, RANDOM, 1759);
+        session.ingest(GENERATION, &round(11, 70, None)).unwrap();
+        session
+            .ingest(GENERATION, &info(4, Some(Default::default())))
+            .unwrap();
+        let cursor = session.take_ios_cursor(GENERATION).unwrap();
+        assert_eq!(cursor.entries, BTreeMap::from([(11, 70)]));
+        assert_eq!(cursor.last_pull_time, Some(0));
     }
 }

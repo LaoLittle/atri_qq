@@ -1,6 +1,6 @@
-use super::{ACCESS_COMMAND, ESTABLISH_COMMAND, crypto};
+use super::{ACCESS_COMMAND, ESTABLISH_COMMAND, crypto, encode_access, merge_bytes};
 use crate::{Error, Result, proto::o3 as pb};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use prost::Message;
 use rand::TryRng;
 
@@ -142,14 +142,12 @@ impl Channel {
         if let State::Established(channel) = &self.state {
             if now < channel.expires_at {
                 let uuid = Bytes::copy_from_slice(&channel.uuid);
-                let encrypted_body = crypto::seal(&channel.key, &body)?;
-                let body = pb::SecureAccessRequest {
-                    method: Bytes::copy_from_slice(method.as_bytes()),
-                    encrypted_body,
-                    channel_uuid: uuid,
-                }
-                .encode_to_vec()
-                .into();
+                let body = encode_access(
+                    &channel.key,
+                    Bytes::copy_from_slice(method.as_bytes()),
+                    uuid,
+                    &body,
+                )?;
                 return Ok(Request {
                     command: ACCESS_COMMAND,
                     body,
@@ -291,20 +289,6 @@ impl Channel {
                 }
                 Ok(Reply { body, config: None })
             }
-        }
-    }
-}
-
-pub(super) fn merge_bytes(mut parts: Vec<Bytes>) -> Bytes {
-    match parts.len() {
-        0 => Bytes::new(),
-        1 => parts.pop().unwrap(),
-        _ => {
-            let mut output = BytesMut::with_capacity(parts.iter().map(Bytes::len).sum());
-            for part in parts {
-                output.extend_from_slice(&part);
-            }
-            output.freeze()
         }
     }
 }

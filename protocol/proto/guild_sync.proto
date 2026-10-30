@@ -1,5 +1,6 @@
 syntax = "proto2";
 package atri.qq.guild;
+import "guild.proto";
 
 message GuildSyncRequest {
   optional uint64 pull_scene = 2;
@@ -44,8 +45,12 @@ message FirstViewGuildNode {
 }
 message FirstViewChannelNode {
   optional uint64 channel_id = 1;
+  repeated bytes messages = 6;
   optional bytes name = 8;
   optional uint32 kind = 9;
+}
+message FirstViewRawMessage {
+  optional MessageHead head = 1;
 }
 message PushParams {
   optional GuildPushParameters guild = 6;

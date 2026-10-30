@@ -477,7 +477,15 @@ mod tests {
             let state = SessionState {
                 profile,
                 keystore: Keystore::default(),
-                machine_id: "synthetic-machine".into(),
+                platform: PlatformState::Ios {
+                    device: IosDevice {
+                        system_version: "18.0".into(),
+                        hardware_model: "iPhone17,1".into(),
+                        system_name: "iOS".into(),
+                    }
+                    .into(),
+                    device_name: "synthetic-device".into(),
+                },
                 online: false,
             };
             let mut codec = WtLogin::new().unwrap();
@@ -541,7 +549,9 @@ mod tests {
         SessionState {
             profile: Profile::linux(),
             keystore: Keystore::default(),
-            machine_id: "machine".into(),
+            platform: PlatformState::Linux {
+                machine_id: "machine".into(),
+            },
             online: false,
         }
     }

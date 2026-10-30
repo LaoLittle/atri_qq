@@ -4,6 +4,9 @@ use jce::JceStruct;
 use prost::Message;
 use std::net::IpAddr;
 
+pub mod ios_discovery;
+pub mod ios_probe;
+
 pub const GET_IP_DIRECT_COMMAND: &str = "ConfigPushSvc.GetIpDirect";
 pub const PUSH_REQUEST_COMMAND: &str = "ConfigPushSvc.PushReq";
 pub const PUSH_RESPONSE_COMMAND: &str = "ConfigPushSvc.PushResp";
@@ -168,12 +171,12 @@ impl SsoServerInfo {
     }
 
     pub(crate) fn connect_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(if self.timeout_seconds > 0 {
-            self.timeout_seconds as u64
-        } else {
-            8
-        })
+        connect_timeout(self.timeout_seconds)
     }
+}
+
+fn connect_timeout(seconds: i32) -> std::time::Duration {
+    std::time::Duration::from_secs(if seconds > 0 { seconds as u64 } else { 8 })
 }
 
 #[derive(Clone, JceStruct)]
@@ -275,11 +278,20 @@ pub struct SsoConfiguration {
 }
 
 pub fn decode_sso_configuration(body: Bytes) -> Result<SsoConfiguration> {
+    validate_sso_configuration(parse_sso_configuration(body)?)
+}
+
+fn parse_sso_configuration(body: Bytes) -> Result<SsoConfiguration> {
     if body.len() > wire::MAX_FRAME_SIZE {
         return Err(invalid("SSO configuration exceeds limit"));
     }
     let servers = SsoServerLists::decode(body.clone())
         .map_err(|error| wire::malformed(format!("Invalid SSO configuration: {error}")))?;
+    Ok(SsoConfiguration { servers, raw: body })
+}
+
+fn validate_sso_configuration(configuration: SsoConfiguration) -> Result<SsoConfiguration> {
+    let servers = &configuration.servers;
     for list in [
         &servers.list_1,
         &servers.list_3,
@@ -295,7 +307,7 @@ pub fn decode_sso_configuration(body: Bytes) -> Result<SsoConfiguration> {
             server.endpoint()?;
         }
     }
-    Ok(SsoConfiguration { servers, raw: body })
+    Ok(configuration)
 }
 
 pub enum ConfigPushBody {
@@ -310,19 +322,31 @@ pub struct ConfigPush {
 }
 
 pub fn decode_push(body: Bytes) -> Result<ConfigPush> {
+    decode_push_with_delivery(body).map(|(push, _)| push)
+}
+
+pub(crate) fn decode_push_with_delivery(body: Bytes) -> Result<(ConfigPush, bool)> {
     let push = wire::config_push::decode(body)?;
+    let mut consumed = false;
     let body = match push.kind {
-        1 => ConfigPushBody::SsoServers(decode_sso_configuration(push.configuration)),
+        1 => {
+            let parsed = parse_sso_configuration(push.configuration);
+            consumed = parsed.is_ok();
+            ConfigPushBody::SsoServers(parsed.and_then(validate_sso_configuration))
+        }
         kind => ConfigPushBody::Unknown {
             kind,
             raw: push.configuration,
         },
     };
-    Ok(ConfigPush {
-        sequence: push.sequence,
-        body,
-        acknowledgment: push.acknowledgment,
-    })
+    Ok((
+        ConfigPush {
+            sequence: push.sequence,
+            body,
+            acknowledgment: push.acknowledgment,
+        },
+        consumed,
+    ))
 }
 
 pub const LOGIN_NOTIFICATION_COMMAND: &str = "StatSvc.SvcReqMSFLoginNotify";

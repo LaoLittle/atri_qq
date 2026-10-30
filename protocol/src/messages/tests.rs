@@ -27,7 +27,9 @@ impl Mock {
             state: Mutex::new(SessionState {
                 profile: Profile::default(),
                 keystore,
-                machine_id: String::new(),
+                platform: crate::models::PlatformState::Linux {
+                    machine_id: String::new(),
+                },
                 online: true,
             }),
             calls: Mutex::new(vec![]),

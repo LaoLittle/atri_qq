@@ -42,7 +42,9 @@ async fn highway_fixed32_reply_produces_an_endpoint_and_account_scoped_cache() {
                 uin: 7,
                 ..Default::default()
             },
-            machine_id: "synthetic-machine".into(),
+            platform: crate::models::PlatformState::Linux {
+                machine_id: "synthetic-machine".into(),
+            },
             online: true,
         }),
         calls: AtomicU32::new(0),
@@ -472,7 +474,9 @@ async fn video_downloads_use_the_companion_index_without_rewriting_the_requested
             state: std::sync::Mutex::new(crate::models::SessionState {
                 profile: crate::models::Profile::linux(),
                 keystore: Default::default(),
-                machine_id: "synthetic-machine".into(),
+                platform: crate::models::PlatformState::Linux {
+                    machine_id: "synthetic-machine".into(),
+                },
                 online: true,
             }),
             requests: Default::default(),

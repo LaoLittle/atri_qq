@@ -1,9 +1,10 @@
 use atri_core::ApiError;
 use atri_extensions::Context;
 use atri_qq_protocol::{
-    ClientConfig, ClientPlatform, IosAccountRecord80, IosDevice, IosPushStatistics, IosRegistration, IosReservedTemplate,
-    IosTransportAccount, IosTransportResources, ios_device::IosVirtualConfig, proto::auth::InfoSyncRequest,
-    signing::IosSigningResources,
+    ClientConfig, ClientPlatform, IosAccountRecord80, IosConfig, IosDevice, IosPushStatistics,
+    IosRegistration, IosReservedTemplate, IosSnapshotConfig, IosTransportAccount,
+    IosTransportResources, PlatformConfig, ios_device::IosVirtualConfig,
+    proto::auth::InfoSyncRequest, signing::IosSigningResources,
 };
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -23,29 +24,44 @@ pub(crate) enum MobileConfig {
 impl MobileConfig {
     pub(crate) fn validate(&self, platform: ClientPlatform) -> Result<(), ApiError> {
         if !platform.is_ios() {
-            return Err(invalid("iOS configuration requires an iPhone or iPad profile"));
+            return Err(invalid(
+                "iOS configuration requires an iPhone or iPad profile",
+            ));
         }
         match self {
             Self::Snapshot(snapshot) => snapshot.validate(),
-            Self::Virtual { device } => device.application.heartbeat_resources().map(|_| ()).map_err(crate::adapter::protocol_error),
+            Self::Virtual { device } => device
+                .application
+                .heartbeat_resources()
+                .map(|_| ())
+                .map_err(crate::adapter::protocol_error),
         }
     }
 
-    pub(crate) async fn apply(&self, ctx: &Context, config: &mut ClientConfig) -> Result<(), ApiError> {
-        match self {
+    pub(crate) async fn apply(
+        &self,
+        ctx: &Context,
+        config: &mut ClientConfig,
+    ) -> Result<(), ApiError> {
+        self.validate(config.profile.platform)?;
+        config.platform = Some(PlatformConfig::Ios(match self {
             Self::Snapshot(snapshot) => {
                 let resources = snapshot.load(ctx).await?;
-                config.ios_device = Some(snapshot.device.clone());
-                config.ios_signing = Some(resources.signing);
-                config.ios_transport = Some(resources.transport);
-                config.ios_registration = Some(resources.registration);
+                IosConfig::Snapshot(IosSnapshotConfig {
+                    device: snapshot.device.clone(),
+                    signing: resources.signing,
+                    transport: resources.transport,
+                    registration: resources.registration,
+                })
             }
-            Self::Virtual { device } => config.ios_virtual = Some(device.clone()),
-        }
+            Self::Virtual { device } => IosConfig::Virtual(device.clone()),
+        }));
         Ok(())
     }
 
-    pub(crate) fn heartbeat_snapshot(&self) -> Option<&atri_qq_api::signing::IosHeartbeatResources> {
+    pub(crate) fn heartbeat_snapshot(
+        &self,
+    ) -> Option<&atri_qq_api::signing::IosHeartbeatResources> {
         match self {
             Self::Snapshot(snapshot) => Some(&snapshot.heartbeat),
             Self::Virtual { .. } => None,

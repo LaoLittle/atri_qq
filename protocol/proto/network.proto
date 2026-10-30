@@ -29,3 +29,61 @@ message ServerAddress {
   optional string host = 1;
   optional uint32 port = 2;
 }
+
+enum IosDispatchPushType {
+  IOS_DISPATCH_PUSH_TYPE_UNSPECIFIED = 0;
+  IOS_DISPATCH_PUSH_TYPE_SSO_SERVERS = 1;
+  IOS_DISPATCH_PUSH_TYPE_FIELD_2 = 2;
+  IOS_DISPATCH_PUSH_TYPE_DOMAINS = 3;
+}
+
+message IosDispatchPush {
+  optional IosDispatchPushType push_type = 1;
+  optional uint64 sequence = 2;
+  optional bytes buffer = 3;
+}
+
+message IosDispatchAddress {
+  optional string host = 1;
+  optional uint32 port = 2;
+}
+
+message IosDispatchServer {
+  optional IosDispatchAddress address = 1;
+  optional int32 field_2 = 2;
+  optional bool field_3 = 3;
+  optional string field_4 = 4;
+  optional string field_5 = 5;
+  optional uint32 field_6 = 6;
+  optional bool field_7 = 7;
+}
+
+message IosDispatchServerList {
+  repeated IosDispatchServer field_1 = 1;
+  repeated IosDispatchServer field_2 = 2;
+}
+
+message IosDispatchServerConfiguration {
+  optional IosDispatchServerList field_1 = 1;
+  optional IosDispatchServerList field_2 = 2;
+  optional bool field_3 = 3;
+  optional bool field_4 = 4;
+  optional int32 field_5 = 5;
+  optional int32 field_6 = 6;
+  optional string field_7 = 7;
+  optional bool field_8 = 8;
+}
+
+message IosDispatchDomainServer {
+  optional IosDispatchAddress address = 1;
+}
+
+message IosDispatchDomain {
+  optional string domain = 1;
+  repeated IosDispatchDomainServer ipv4 = 2;
+  repeated IosDispatchDomainServer ipv6 = 3;
+}
+
+message IosDispatchDomainConfiguration {
+  repeated IosDispatchDomain domains = 1;
+}

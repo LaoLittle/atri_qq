@@ -5,16 +5,41 @@ use ::signing::ios::{
     proto::SecurityExtra,
 };
 
-pub(super) fn config(profile: Profile) -> ClientConfig {
+pub(crate) fn config(profile: Profile) -> ClientConfig {
     ClientConfig {
         profile,
-        ios_device: Some(IosDevice {
-            system_version: "18.0".into(),
-            hardware_model: "synthetic-test-hardware".into(),
-            system_name: "iOS".into(),
+        platform: Some(PlatformConfig::Ios(IosConfig::Snapshot(
+            IosSnapshotConfig {
+                device: IosDevice {
+                    system_version: "18.0".into(),
+                    hardware_model: "synthetic-test-hardware".into(),
+                    system_name: "iOS".into(),
+                },
+                signing: resources(),
+                transport: transport_resources(),
+                registration: IosRegistration {
+                    initial: registration_template("native-guid-text", 1033, 1),
+                    reconnect: registration_template("native-reconnect-guid-text", 1028, 2),
+                },
+            },
+        ))),
+        ..Default::default()
+    }
+}
+
+fn registration_template(guid: &str, locale: u32, notify: u32) -> auth::InfoSyncRequest {
+    auth::InfoSyncRequest {
+        sync_flag: Some(1759),
+        register: Some(auth::RegisterInfo {
+            guid: Some(guid.into()),
+            locale: Some(locale),
+            mute: Some(1),
+            business: Some(auth::RegisterBusiness {
+                notify_switch: Some(notify),
+                bound_uin_notify_switch: None,
+            }),
+            ..Default::default()
         }),
-        ios_signing: Some(resources()),
-        ios_transport: Some(transport_resources()),
         ..Default::default()
     }
 }
@@ -59,23 +84,17 @@ fn transport_resources() -> IosTransportResources {
 }
 
 pub(super) fn reserved(frame: Bytes) -> crate::proto::sso::Reserved {
-    let mut frame = Reader::new(frame);
-    frame.u32().unwrap();
-    assert_eq!(frame.u32().unwrap(), RequestType::D2 as u32);
-    assert_eq!(frame.u8().unwrap(), Encryption::D2 as u8);
-    frame.p32().unwrap();
-    frame.u8().unwrap();
-    frame.p32().unwrap();
-    let mut payload = Reader::new(crate::crypto::tea_decrypt(&frame.rest(), &[0; 16]).unwrap());
-    let mut header = Reader::new(payload.p32().unwrap());
-    header.i32().unwrap();
-    header.skip(20).unwrap();
-    header.p32().unwrap();
-    header.p32().unwrap();
-    header.p32().unwrap();
-    header.p32().unwrap();
-    header.p32().unwrap();
-    header.pref(2, true).unwrap();
+    let (protocol, _, _, mut header, _) = request_parts(frame, &[0; 16]);
+    if protocol == RequestType::D2 as u32 {
+        header.skip(24).unwrap();
+        for _ in 0..5 {
+            header.p32().unwrap();
+        }
+        header.pref(2, true).unwrap();
+    } else {
+        header.p32().unwrap();
+        header.p32().unwrap();
+    }
     crate::proto::decode(header.p32().unwrap()).unwrap()
 }
 
@@ -136,15 +155,7 @@ fn mobile_client_never_starts_desktop_o3_work() {
     let client = Client::new(config(Profile::iphone()), Keystore::default()).unwrap();
     client.start_signing_work(0, crate::o3::Channel::new());
     assert!(client.tasks.lock().unwrap().is_empty());
-    assert!(
-        client
-            .inner
-            .lock()
-            .unwrap()
-            .o3
-            .transport_generation
-            .is_none()
-    );
+    assert!(client.inner.lock().unwrap().linux_o3().is_none());
     client.begin_signing_login().unwrap();
     client.inner.lock().unwrap().state.keystore.uin = 1234;
     client.mark_signing_ticket_complete().unwrap();
@@ -157,11 +168,11 @@ fn mobile_client_never_starts_desktop_o3_work() {
     assert!(client.set_signing_resources(None, None, None).is_err());
     assert!(client.answer_signing_property_challenge(&[]).is_err());
     let mut missing = config(Profile::iphone());
-    missing.ios_signing = None;
+    missing.platform = None;
     assert!(Client::new(missing, Keystore::default()).is_err());
 }
 
-pub(super) fn request_parts(frame: Bytes, key: &[u8]) -> (u32, u8, Bytes, Reader, Bytes) {
+pub(crate) fn request_parts(frame: Bytes, key: &[u8]) -> (u32, u8, Bytes, Reader, Bytes) {
     let length = frame.len();
     let mut outer = Reader::new(frame);
     assert_eq!(outer.u32().unwrap() as usize, length);
@@ -276,15 +287,21 @@ fn mobile_trim_and_account_updates_do_not_invent_an_account_conversion() {
         inner.connection_cookie = Bytes::from_static(b"connection-cookie");
         for uin in [0, 246813579] {
             inner.state.keystore.uin = uin;
-            let (_, frame) = client
-                .prepare_frame(
-                    &mut inner,
-                    "not.a.signed.command",
-                    Bytes::new(),
-                    RequestType::Simple,
-                    Encryption::Empty,
-                )
-                .unwrap();
+            let frame = wire::encode_sso(
+                "not.a.signed.command",
+                inner.sequence,
+                Bytes::new(),
+                RequestType::Simple,
+                Encryption::Empty,
+                &inner.state,
+                None,
+                Some((&inner.ios().unwrap().transport, &inner.connection_cookie)),
+                None,
+                true,
+                None,
+                false,
+            )
+            .unwrap();
             let (protocol, account_type, account, mut head, body) = request_parts(frame, &[0; 16]);
             assert_eq!(protocol, 13);
             assert_eq!(account_type, 0);
@@ -324,26 +341,14 @@ fn mobile_trim_and_account_updates_do_not_invent_an_account_conversion() {
 }
 
 #[test]
-fn mobile_missing_resources_and_push_statistics_fail_explicitly() {
-    let mut missing = config(Profile::iphone());
-    missing.ios_transport = None;
-    let client = Client::new(missing, Keystore::default()).unwrap();
-    {
-        let mut inner = client.inner.lock().unwrap();
-        assert!(matches!(
-            client.prepare_frame(
-                &mut inner,
-                "not.a.signed.command",
-                Bytes::new(),
-                RequestType::D2,
-                Encryption::Empty,
-            ),
-            Err(Error::Authentication(_))
-        ));
-    }
-    client
-        .set_ios_transport_resources(transport_resources())
-        .unwrap();
+fn mobile_invalid_resources_and_missing_push_statistics_fail_explicitly() {
+    let mut invalid = config(Profile::iphone());
+    invalid.ios_snapshot_mut().unwrap().transport.account = IosTransportAccount::Explicit {
+        account_type: 3,
+        text: Bytes::new(),
+    };
+    assert!(Client::new(invalid, Keystore::default()).is_err());
+    let client = Client::new(config(Profile::iphone()), Keystore::default()).unwrap();
     let mut inner = client.inner.lock().unwrap();
     assert!(matches!(
         client.prepare_frame(
@@ -356,9 +361,9 @@ fn mobile_missing_resources_and_push_statistics_fail_explicitly() {
         Err(Error::Authentication(_))
     ));
     inner
-        .ios_transport
-        .as_mut()
+        .ios_mut()
         .unwrap()
+        .transport
         .push_service_get_statistics = Some(IosPushStatistics {
         count: 7,
         elapsed: 123456789,
@@ -486,16 +491,22 @@ fn mobile_reserved_template_keeps_unknown_bytes_and_rejects_stale_dynamic_fields
     transport.reserved = IosReservedTemplate::new(template.clone()).unwrap();
     let client = Client::new(config(Profile::iphone()), Keystore::default()).unwrap();
     client.set_ios_transport_resources(transport).unwrap();
-    let mut inner = client.inner.lock().unwrap();
-    let (_, frame) = client
-        .prepare_frame(
-            &mut inner,
-            "not.a.signed.command",
-            Bytes::new(),
-            RequestType::Simple,
-            Encryption::Empty,
-        )
-        .unwrap();
+    let inner = client.inner.lock().unwrap();
+    let frame = wire::encode_sso(
+        "not.a.signed.command",
+        inner.sequence,
+        Bytes::new(),
+        RequestType::Simple,
+        Encryption::Empty,
+        &inner.state,
+        None,
+        Some((&inner.ios().unwrap().transport, &inner.connection_cookie)),
+        None,
+        true,
+        None,
+        false,
+    )
+    .unwrap();
     let (_, _, _, mut head, _) = request_parts(frame, &[0; 16]);
     head.p32().unwrap();
     head.p32().unwrap();
@@ -518,7 +529,8 @@ fn linux_complete_wire_does_not_adopt_mobile_resources_or_cookies() {
     );
     let mut inner = client.inner.lock().unwrap();
     assert!(inner.state.keystore.ios_msf_imei.is_empty());
-    inner.ios_transport = Some(transport_resources());
+    assert!(inner.ios().is_none());
+    assert!(inner.linux_o3().is_some());
     inner.connection_cookie = Bytes::from_static(b"mobile-cookie");
     let (_, frame) = client
         .prepare_frame(
@@ -660,13 +672,25 @@ fn mobile_transport_rejects_invalid_effective_native_flags() {
 #[tokio::test]
 async fn successful_mobile_registration_does_not_become_first_registration_on_reauthentication() {
     tokio::time::timeout(Duration::from_secs(10), async {
-        let client = Client::new(ClientConfig {
-            profile: Profile::ipad(),
-            ios_virtual: Some(Arc::new(crate::ios_device::IosVirtualConfig::default())),
-            ..Default::default()
-        }, Keystore { uin: 42, ..Default::default() }).unwrap();
+        let client = Client::new(
+            ClientConfig {
+                profile: Profile::ipad(),
+                platform: Some(PlatformConfig::Ios(IosConfig::Virtual(Arc::new(
+                    crate::ios_device::IosVirtualConfig::default(),
+                )))),
+                ..Default::default()
+            },
+            Keystore {
+                uin: 42,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let (sender, mut queue) = mpsc::channel::<Outgoing>(16);
-        client.inner.lock().unwrap().connection = Some(Connection { generation: 0, sender });
+        client.inner.lock().unwrap().connection = Some(Connection {
+            generation: 0,
+            sender,
+        });
         for (reconnect, first_register, scene) in [(false, 0, 7), (false, 1, 7), (true, 1, 4)] {
             let task = {
                 let client = client.clone();
@@ -674,7 +698,8 @@ async fn successful_mobile_registration_does_not_become_first_registration_on_re
             };
             let outgoing = queue.recv().await.unwrap();
             assert_eq!(outgoing.command, crate::message_sync::INFO_COMMAND);
-            let request = auth::InfoSyncRequest::decode(request_parts(outgoing.frame, &[0; 16]).4).unwrap();
+            let request =
+                auth::InfoSyncRequest::decode(request_parts(outgoing.frame, &[0; 16]).4).unwrap();
             let register = request.register.unwrap();
             assert_eq!(register.first_register, Some(first_register));
             assert_eq!(register.scene, Some(scene));
@@ -686,9 +711,21 @@ async fn successful_mobile_registration_does_not_become_first_registration_on_re
                 }),
                 ..Default::default()
             };
-            client.receive(tests::incoming(outgoing.sequence, &outgoing.command, &response.encode_to_vec(), Some(&[0; 16])), 0).unwrap();
+            client
+                .receive(
+                    tests::incoming(
+                        outgoing.sequence,
+                        &outgoing.command,
+                        &response.encode_to_vec(),
+                        Some(&[0; 16]),
+                    ),
+                    0,
+                )
+                .unwrap();
             task.await.unwrap().unwrap();
         }
         client.terminate("registration test completed".into());
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 }

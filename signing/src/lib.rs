@@ -7,6 +7,8 @@ pub mod metadata;
 pub mod proto;
 pub mod token;
 
+pub use digest::derive_xwid;
+
 use command_policy::CommandPolicyState;
 use extra::{ExtraEntropy, ExtraState};
 use metadata::{MetadataResources, MetadataState};

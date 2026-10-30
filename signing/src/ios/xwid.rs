@@ -1,7 +1,6 @@
-use base64::{Engine, engine::general_purpose::STANDARD};
+use crate::derive_xwid;
 use bytes::Bytes;
-use md5::{Digest, Md5};
-use sha1::Sha1;
+use sha1::{Digest, Sha1};
 
 pub use super::xwid_resource::ResourceSample;
 
@@ -143,15 +142,6 @@ pub(super) fn nibble(byte: u8) -> u8 {
         b'A'..=b'F' => byte - b'A' + 10,
         _ => 0xff,
     }
-}
-
-pub fn derive_xwid(raw_xwid: &[u8]) -> [u8; 12] {
-    let digest = Md5::digest(raw_xwid);
-    let mut output = [0; 12];
-    STANDARD
-        .encode_slice(&digest[..9], &mut output)
-        .expect("nine input bytes encode to exactly twelve Base64 bytes");
-    output
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -423,12 +413,6 @@ mod tests {
             &secure_material(&material, 4_294_967_297, &[17, 3, 3, 34, 255]),
             b"B111030322FF472B49752D800B3309F919E1F5B1488F563541329359262EE472CB2A15EA1809"
         );
-    }
-
-    #[test]
-    fn derivative_uses_first_nine_digest_bytes_and_standard_base64() {
-        assert_eq!(&derive_xwid(b"abc"), b"kAFQmDzST7DW");
-        assert_eq!(&derive_xwid(b""), b"1B2M2Y8AsgTp");
     }
 
     #[test]

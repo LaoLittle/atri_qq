@@ -82,9 +82,23 @@ impl IosVirtualNetwork {
 
 impl IosVirtualConfig {
     pub(crate) fn transport_resources(&self) -> Result<IosTransportResources> {
+        let carrier = self
+            .carrier
+            .as_ref()
+            .filter(|carrier| !carrier.mobile_network_code.is_empty());
+        let carrier_mcc = carrier.map_or("000", |carrier| carrier.mobile_country_code.as_str());
+        let carrier_mnc = carrier.map_or("000", |carrier| carrier.mobile_network_code.as_str());
+        let numeric_carrier = carrier_mcc
+            .bytes()
+            .chain(carrier_mnc.bytes())
+            .take_while(u8::is_ascii_digit)
+            .fold(Wrapping(0u32), |value, digit| {
+                value * Wrapping(10) + Wrapping(u32::from(digit - b'0'))
+            })
+            .0;
         let reserved = sso::Reserved {
             locale_id: Some(self.registration_locale()),
-            imsi: Some(0),
+            imsi: Some(numeric_carrier),
             network_type: Some(u32::from(self.network.network_type())),
             nt_core_version: Some(100),
             ..Default::default()
@@ -95,16 +109,8 @@ impl IosVirtualConfig {
             network_type: self.network.network_type(),
             effective_flags: flags,
             account_record_0x80: IosAccountRecord80(Bytes::new()),
-            carrier_mcc: self
-                .carrier
-                .as_ref()
-                .map(|carrier| carrier.mobile_country_code.clone())
-                .unwrap_or_default(),
-            carrier_mnc: self
-                .carrier
-                .as_ref()
-                .map(|carrier| carrier.mobile_network_code.clone())
-                .unwrap_or_default(),
+            carrier_mcc: carrier_mcc.to_owned(),
+            carrier_mnc: carrier_mnc.to_owned(),
             cf_bundle_version: self.bundle_version.clone(),
             account: IosTransportAccount::Uin { account_type: 0 },
             reserved: IosReservedTemplate::new(reserved.encode_to_vec().into())?,

@@ -144,7 +144,9 @@ async fn renewal_keeps_request_identity_and_old_reply_key_coherent() {
     let mut new = old.clone();
     new.keystore.uin = 987654;
     new.keystore.d2_key = vec![17; 16];
-    new.machine_id = "new-machine".into();
+    new.platform = PlatformState::Linux {
+        machine_id: "new-machine".into(),
+    };
     client.replace_state(new).await;
     client
         .receive(
@@ -1125,7 +1127,10 @@ async fn ticket_and_registration_telemetry_preserve_real_token_acquisition() {
 fn configured_property_challenges_work_before_connect_or_login() {
     let client = Client::new(
         ClientConfig {
-            machine_id: "prelogin-device".into(),
+            platform: Some(PlatformConfig::Linux(LinuxConfig {
+                machine_id: "prelogin-device".into(),
+                ..Default::default()
+            })),
             ..Default::default()
         },
         Keystore::default(),
@@ -1743,6 +1748,77 @@ async fn server_clock_discards_timed_out_and_replaced_transport_samples() {
         .receive(incoming(sequence, &command, &1u32.to_be_bytes(), None), 0)
         .unwrap();
     assert!(client.server_time_seconds().unwrap() >= 2_000_000_000);
+}
+
+#[tokio::test(start_paused = true)]
+async fn mobile_clock_retries_rejections_and_timeouts_but_stops_on_bad_samples_or_cancel() {
+    enum Outcome {
+        Timeout,
+        Rejected,
+        Malformed,
+        Cancelled,
+    }
+    for outcome in [
+        Outcome::Timeout,
+        Outcome::Rejected,
+        Outcome::Malformed,
+        Outcome::Cancelled,
+    ] {
+        let client = Client::new(
+            super::ios_signing_tests::config(Profile::iphone()),
+            Keystore::default(),
+        )
+        .unwrap();
+        let (sender, mut queue) = mpsc::channel(8);
+        client.inner.lock().unwrap().connection = Some(Connection {
+            generation: 0,
+            sender,
+        });
+        client.start_ios_correct_time();
+        let attempts = if matches!(outcome, Outcome::Timeout | Outcome::Rejected) {
+            3
+        } else {
+            1
+        };
+        for _ in 0..attempts {
+            let outgoing = queue.recv().await.unwrap();
+            let (protocol, _, _, mut header, body) =
+                super::ios_signing_tests::request_parts(outgoing.frame, &[0; 16]);
+            assert_eq!(protocol, RequestType::D2 as u32);
+            let sequence = header.i32().unwrap();
+            header.skip(20).unwrap();
+            header.p32().unwrap();
+            assert_eq!(header.p32().unwrap().as_ref(), b"Client.CorrectTime");
+            assert_eq!(body.as_ref(), &[0, 0, 0, 4]);
+            match outcome {
+                Outcome::Timeout => tokio::time::advance(Duration::from_secs(60)).await,
+                Outcome::Rejected => {
+                    client
+                        .receive(
+                            incoming_status(sequence, "Client.CorrectTime", &[], None, 1, ""),
+                            0,
+                        )
+                        .unwrap();
+                }
+                Outcome::Malformed => {
+                    client
+                        .receive(
+                            incoming(sequence, "Client.CorrectTime", &[1, 2, 3], None),
+                            0,
+                        )
+                        .unwrap();
+                }
+                Outcome::Cancelled => client.terminate("synthetic clock generation ended".into()),
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(!matches!(
+            timeout(Duration::from_secs(61), queue.recv()).await,
+            Ok(Some(_))
+        ));
+        assert!(client.inner.lock().unwrap().pending.is_empty());
+        client.close().await;
+    }
 }
 
 #[tokio::test(start_paused = true)]

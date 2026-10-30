@@ -17,14 +17,20 @@ message NtAccountRequest { optional string uin = 1; }
 message NtClient { optional string os = 1; optional string device_name = 2; optional uint32 platform = 3; optional bytes guid = 4; }
 message NtApp { optional string kernel = 1; optional uint32 app_id = 2; optional string package_name = 3; optional string qua = 5; }
 message NtCookie { optional bytes cookie = 1; }
-message NtError { optional uint64 code = 1; optional string title = 2; optional string message = 3; optional string jump_word = 4; optional string jump_url = 5; }
+message NtError { optional uint64 code = 1; optional string title = 2; optional string message = 3; optional string jump_word = 4; optional string jump_url = 5; optional NtErrorDetail detail = 6; repeated NtErrorButton buttons = 7; optional bool unknown8 = 8; }
+message NtErrorButton { optional string wording = 1; optional string url = 2; }
+message NtErrorDetail { optional NtErrorNewDevice need_new_device = 1; optional NtErrorText unregistered = 2; optional NtErrorForbidden forbidden = 3; optional NtErrorText nice_account_expired = 4; optional NtErrorText sms_check = 5; }
+message NtErrorNewDevice { optional bool value = 1; }
+message NtErrorText { optional string value = 1; }
+message NtErrorForbidden { optional int32 area = 1; }
 message NtSecurity { optional uint32 mode = 1; }
 message NtRequestHead { optional NtAccountRequest account = 1; optional NtClient client = 2; optional NtApp app = 3; optional NtCookie cookie = 5; optional NtSecurity security = 7; optional NtCookie long_cookie = 8; }
 message NtRequest { optional NtRequestHead head = 1; optional bytes body = 2; }
-message NtLoginBody { optional bytes a1 = 1; optional NtCaptcha captcha = 2; }
+message NtLoginBody { optional bytes a1 = 1; optional NtCaptcha captcha = 2; optional bytes device_check_succeed_sig = 3; optional NtLoginProcess login_process = 5; }
+message NtLoginProcess { optional bool need_remind_cancellated_status = 1; }
 message NtRefreshTicketBody { optional bytes a1 = 1; }
 message NtUnusualLoginBody { optional bytes a1 = 1; optional bytes one_click_succeed_sig = 2; }
-message NtCaptcha { optional string ticket = 1; optional string random = 2; optional string sid = 3; }
+message NtCaptcha { optional bytes ticket = 1; optional bytes random = 2; optional bytes sid = 3; }
 message NtNewDeviceBody { optional string success_token = 1; }
 // The common envelope carries an RPC-specific body.
 message NtResponse { optional NtResponseHead head = 1; optional bytes body = 2; }

@@ -814,7 +814,9 @@ mod tests {
                 state: RwLock::new(SessionState {
                     profile: Profile::default(),
                     keystore,
-                    machine_id: "admin-test".into(),
+                    platform: crate::models::PlatformState::Linux {
+                        machine_id: "admin-test".into(),
+                    },
                     online: true,
                 }),
                 replies: Mutex::new(

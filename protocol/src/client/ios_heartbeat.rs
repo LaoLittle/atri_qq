@@ -4,17 +4,20 @@ use crate::heartbeat::{IosResources, IosSource};
 impl Client {
     pub fn set_ios_heartbeat_source(&self, source: Option<Arc<dyn IosSource>>) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        if !inner.state.profile.platform.is_ios() {
-            return Err(Error::Unsupported(
-                "iOS heartbeat resources require an iPhone or iPad client".into(),
-            ));
-        }
-        inner.ios_heartbeat_source = source;
+        let ios = inner.ios_mut().ok_or_else(|| {
+            Error::Unsupported("iOS heartbeat resources require an iPhone or iPad client".into())
+        })?;
+        ios.heartbeat_source = source;
         Ok(())
     }
 
     pub(super) fn ios_heartbeat_time(&self) -> Result<u64> {
-        let source = self.inner.lock().unwrap().ios_heartbeat_source.clone();
+        let source = self
+            .inner
+            .lock()
+            .unwrap()
+            .ios()
+            .and_then(|ios| ios.heartbeat_source.clone());
         match source
             .and_then(|source| source.clock_millis())
             .filter(|millis| *millis != 0)
@@ -27,11 +30,7 @@ impl Client {
     pub(super) fn heartbeat_body(&self, trigger_time: u64) -> Bytes {
         let source = {
             let inner = self.inner.lock().unwrap();
-            if inner.state.profile.platform.is_ios() {
-                inner.ios_heartbeat_source.clone()
-            } else {
-                None
-            }
+            inner.ios().and_then(|ios| ios.heartbeat_source.clone())
         };
         let resources = source
             .map(|source| source.resources())

@@ -401,7 +401,7 @@ impl Coordinator {
                     body.register = None;
                 }
                 self.guild
-                    .set_request_random(binding.generation, round.random);
+                    .prepare_info_request(binding.generation, round.random, flag);
                 Some(Request::Info { body })
             }
             ActionKind::Group { revision, request } => {

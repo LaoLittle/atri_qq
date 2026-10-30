@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::digest::{md5, md5_parts};
+use crate::digest::{derive_xwid, md5_parts};
 use crate::proto::{DeviceProperty, IssuedTokenReply, append_bytes_field, encoded_bytes_len};
 
 pub type DeviceProperties = BTreeMap<i32, Vec<u8>>;
@@ -206,22 +206,12 @@ impl TokenState {
     }
 
     pub fn complete_xwid(&mut self, acquisition: XwidAcquisition) {
-        const ALPHABET: &[u8; 64] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         self.xwid = acquisition.xwid;
         self.xwid_acquisition_milliseconds = acquisition.elapsed_nanoseconds / 1_000_000;
         if !self.xwid.is_empty() {
-            let digest = md5(&self.xwid);
+            let token = derive_xwid(&self.xwid);
             self.xwid_token.clear();
-            self.xwid_token.reserve(12);
-            for chunk in digest[..9].chunks_exact(3) {
-                let bits =
-                    (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
-                self.xwid_token.push(ALPHABET[((bits >> 18) & 63) as usize]);
-                self.xwid_token.push(ALPHABET[((bits >> 12) & 63) as usize]);
-                self.xwid_token.push(ALPHABET[((bits >> 6) & 63) as usize]);
-                self.xwid_token.push(ALPHABET[(bits & 63) as usize]);
-            }
+            self.xwid_token.extend_from_slice(&token);
         }
         self.auxiliary = acquisition.auxiliary;
         self.xwid_timestamp = acquisition.started_at;

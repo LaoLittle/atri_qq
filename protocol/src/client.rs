@@ -24,17 +24,21 @@ use tokio::{
 use tokio_util::{codec::Framed, sync::CancellationToken};
 
 mod file_transfer;
-mod ios_heartbeat;
+mod ios_discovery;
 mod ios_guild;
+mod ios_header;
+mod ios_heartbeat;
 mod ios_network;
 mod ios_o3;
+mod ios_probe;
+mod ios_response;
 mod message_sync;
 mod network;
 mod personal_events;
 mod robot_ranges;
 
 #[cfg(test)]
-mod ios_signing_tests;
+pub(crate) mod ios_signing_tests;
 
 #[cfg(test)]
 mod ios_heartbeat_tests;
@@ -82,6 +86,7 @@ struct Pending {
     reply: oneshot::Sender<Result<Bytes>>,
     cancel: CancellationToken,
     ios: Option<ios_network::RequestTiming>,
+    replay: Option<ios_header::Replay>,
     message_sync: Option<(
         Arc<crate::message_sync::Binding>,
         Arc<crate::message_sync::Request>,
@@ -89,6 +94,10 @@ struct Pending {
 }
 enum RequestBinding<'a> {
     Connection(u64),
+    IosControl {
+        generation: u64,
+        source: &'a CancellationToken,
+    },
     Online(u64),
     FriendStatus(&'a Arc<crate::lifecycle::status::Binding>),
     Credentials(&'a Arc<credentials::Session>),
@@ -102,6 +111,7 @@ enum RequestBinding<'a> {
 struct Outgoing {
     command: String,
     sequence: i32,
+    attempt: u64,
     frame: Bytes,
     deadline: Instant,
     cancel: CancellationToken,
@@ -117,21 +127,34 @@ struct Connection {
     generation: u64,
     sender: mpsc::Sender<Outgoing>,
 }
+enum PlatformRuntime {
+    Linux(crate::o3::Session),
+    Ios(IosRuntime),
+}
+struct IosRuntime {
+    transport: IosTransportResources,
+    network: Option<crate::ios_device::network::IosNetworkSession>,
+    header: ios_header::State,
+    response: ios_response::State,
+    block_check: ios_network::BlockCheck,
+    heartbeat_source: Option<Arc<dyn crate::heartbeat::IosSource>>,
+    first_register: bool,
+    channel: Option<crate::o3::ios::Channel>,
+    discovery: ios_discovery::State,
+    probes: ios_probe::State,
+}
 struct Inner {
     state: SessionState,
     signer: SessionSigner,
-    ios_transport: Option<IosTransportResources>,
-    ios_network: Option<crate::ios_device::network::IosNetworkSession>,
-    ios_heartbeat_source: Option<Arc<dyn crate::heartbeat::IosSource>>,
+    platform: PlatformRuntime,
     connection_cookie: Bytes,
-    o3: crate::o3::Session,
-    ios_o3: Option<crate::o3::ios::Channel>,
     clock: crate::clock::ServerClock,
     sequence: i32,
     next_id: u64,
     generation: u64,
     connection: Option<Connection>,
     cancel: CancellationToken,
+    transport_cancel: CancellationToken,
     pending: HashMap<i32, Pending>,
     previous_keys: Vec<Vec<u8>>,
     last_activity: Instant,
@@ -157,6 +180,37 @@ struct Inner {
     file_transfer_worker: Option<Arc<credentials::file_transfer::Binding>>,
     robot_ranges: crate::contacts::robot_ranges::State,
 }
+impl Inner {
+    fn ios(&self) -> Option<&IosRuntime> {
+        match &self.platform {
+            PlatformRuntime::Ios(runtime) => Some(runtime),
+            PlatformRuntime::Linux(_) => None,
+        }
+    }
+    fn ios_mut(&mut self) -> Option<&mut IosRuntime> {
+        match &mut self.platform {
+            PlatformRuntime::Ios(runtime) => Some(runtime),
+            PlatformRuntime::Linux(_) => None,
+        }
+    }
+    fn linux_o3(&self) -> Option<&crate::o3::Session> {
+        match &self.platform {
+            PlatformRuntime::Linux(session) => Some(session),
+            PlatformRuntime::Ios(_) => None,
+        }
+    }
+    fn linux_o3_mut(&mut self) -> Option<&mut crate::o3::Session> {
+        match &mut self.platform {
+            PlatformRuntime::Linux(session) => Some(session),
+            PlatformRuntime::Ios(_) => None,
+        }
+    }
+}
+pub(crate) struct PendingSecurity {
+    pub challenge: IosLoginSecurityChallenge,
+    pub reply: oneshot::Sender<IosLoginSecurityAction>,
+}
+
 pub struct Client {
     pub(crate) config: ClientConfig,
     pub(crate) guild_session: Arc<crate::guild::Session>,
@@ -171,6 +225,8 @@ pub struct Client {
     pub(crate) login_gate: tokio::sync::Mutex<()>,
     pub(crate) codecs: tokio::sync::Mutex<Option<login::LoginCodecs>>,
     pub(crate) captcha: Mutex<Option<oneshot::Sender<(String, String)>>>,
+    pub(crate) device_verification: Mutex<Option<oneshot::Sender<IosDeviceVerificationResult>>>,
+    pub(crate) security: Mutex<Option<PendingSecurity>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     events: broadcast::Sender<LoginEvent>,
     packets: broadcast::Sender<IncomingPacket>,
@@ -195,66 +251,136 @@ impl Client {
                 "Device GUID, random key and D2 key must each be sixteen bytes",
             ));
         }
-        if config.machine_id.is_empty()
-            || config.profile.qua.is_empty()
-            || config.machine_id.contains('\0')
-            || config.profile.qua.contains('\0')
-        {
-            return Err(wire::malformed(
-                "Explicit machine ID and QUA must be nonempty C strings",
-            ));
+        if config.profile.qua.is_empty() || config.profile.qua.contains('\0') {
+            return Err(wire::malformed("Explicit QUA must be a nonempty C string"));
         }
-        if config.profile.platform.is_ios() {
-            keystore.ensure_ios_identity()?;
-        }
-        let (virtual_device, ios_heartbeat_source, ios_network) = if let Some(model) = &config.ios_virtual {
-            if config.ios_device.is_some() || config.ios_signing.is_some() || config.ios_transport.is_some() || config.ios_registration.is_some() {
-                return Err(wire::malformed("Virtual iOS mode owns device, signing, transport and registration resources; do not mix snapshot resources"));
+        match (&config.platform, config.profile.platform.is_ios()) {
+            (None, false) => config.platform = Some(PlatformConfig::Linux(LinuxConfig::default())),
+            (Some(PlatformConfig::Linux(_)), false) | (Some(PlatformConfig::Ios(_)), true) => {}
+            _ => {
+                return Err(wire::malformed(
+                    "Client platform resources do not match its profile",
+                ));
             }
-            let heartbeat = model.application.heartbeat_resources()?;
-            let now_micros = u64::try_from(signing_engine::ios::source::SystemSource.unix_micros()?)
-                .map_err(|_| wire::malformed("Virtual iOS device creation precedes Unix epoch"))?;
-            let (device, identity) = crate::ios_device::IosVirtualRuntime::initialize(
-                model.clone(), &config.profile, &mut keystore, now_micros,
-            )?;
-            config.ios_device = Some(identity);
-            config.ios_signing = Some(device.signing_resources(keystore.ios_virtual_state.as_ref().unwrap()));
-            config.ios_transport = Some(model.transport_resources()?);
-            let network = crate::ios_device::network::IosNetworkSession::new(model, (now_micros / 1000) as i64);
-            (Some(device), Some(Arc::new(heartbeat) as Arc<dyn crate::heartbeat::IosSource>), Some(network))
-        } else {
-            (None, None, None)
-        };
-        // A new client cannot resume another NT manager's challenge/session state.
+        }
         keystore.qr_sig.clear();
         keystore.key_exchange_session = None;
         keystore.login_cookie.clear();
+        let (state, signer, platform) = match config.platform.as_ref().unwrap() {
+            PlatformConfig::Linux(linux) => {
+                if linux.machine_id.is_empty() || linux.machine_id.contains('\0') {
+                    return Err(wire::malformed(
+                        "Explicit machine ID must be a nonempty C string",
+                    ));
+                }
+                let state = SessionState {
+                    profile: config.profile.clone(),
+                    platform: PlatformState::Linux {
+                        machine_id: linux.machine_id.clone(),
+                    },
+                    keystore,
+                    online: false,
+                };
+                let signer = SessionSigner::for_linux(linux.application_uuid.clone(), &state)?;
+                (
+                    state,
+                    signer,
+                    PlatformRuntime::Linux(crate::o3::Session::default()),
+                )
+            }
+            PlatformConfig::Ios(ios) => {
+                keystore.ensure_ios_identity()?;
+                let (
+                    device,
+                    device_name,
+                    signing,
+                    transport,
+                    network,
+                    heartbeat_source,
+                    virtual_device,
+                ) = match ios {
+                    IosConfig::Virtual(model) => {
+                        let heartbeat = model.application.heartbeat_resources()?;
+                        let now_micros =
+                            u64::try_from(signing_engine::ios::source::SystemSource.unix_micros()?)
+                                .map_err(|_| {
+                                    wire::malformed(
+                                        "Virtual iOS device creation precedes Unix epoch",
+                                    )
+                                })?;
+                        let (runtime, identity) = crate::ios_device::IosVirtualRuntime::initialize(
+                            model.clone(),
+                            &config.profile,
+                            &mut keystore,
+                            now_micros,
+                        )?;
+                        let signing =
+                            runtime.signing_resources(keystore.ios_virtual_state.as_ref().unwrap());
+                        let network = crate::ios_device::network::IosNetworkSession::new(
+                            model,
+                            (now_micros / 1000) as i64,
+                        );
+                        (
+                            identity,
+                            model.device_name(config.profile.platform).to_owned(),
+                            signing,
+                            model.transport_resources()?,
+                            Some(network),
+                            Some(Arc::new(heartbeat) as Arc<dyn crate::heartbeat::IosSource>),
+                            Some(runtime),
+                        )
+                    }
+                    IosConfig::Snapshot(snapshot) => (
+                        snapshot.device.clone(),
+                        keystore.device_name.clone(),
+                        snapshot.signing.clone(),
+                        snapshot.transport.clone(),
+                        None,
+                        None,
+                        None,
+                    ),
+                };
+                device.validate()?;
+                transport.validate()?;
+                let state = SessionState {
+                    profile: config.profile.clone(),
+                    platform: PlatformState::Ios {
+                        device: device.into(),
+                        device_name: device_name.into(),
+                    },
+                    keystore,
+                    online: false,
+                };
+                let mut signer = SessionSigner::for_ios(&state, signing)?;
+                if let Some(device) = virtual_device {
+                    signer.enable_ios_virtual(device)?;
+                }
+                (
+                    state,
+                    signer,
+                    PlatformRuntime::Ios(IosRuntime {
+                        transport,
+                        network,
+                        header: ios_header::State::default(),
+                        response: ios_response::State::default(),
+                        block_check: ios_network::BlockCheck::default(),
+                        heartbeat_source,
+                        first_register: true,
+                        channel: None,
+                        discovery: ios_discovery::State::default(),
+                        probes: ios_probe::State::default(),
+                    }),
+                )
+            }
+        };
         let (events, _) = broadcast::channel(128);
         let (packets, _) = broadcast::channel(256);
         let (login_notifications, _) = broadcast::channel(64);
         let (ticket_refresh_schedule, _) =
             watch::channel(crate::ticket_refresh::Schedule::default());
-        let state = SessionState {
-            profile: config.profile.clone(),
-            machine_id: config.machine_id.clone(),
-            keystore,
-            online: false,
-        };
-        let mut signer = SessionSigner::for_client(
-            config.application_uuid.clone(),
-            &state,
-            config.ios_signing.clone(),
-        )?;
-        if let Some(device) = virtual_device {
-            signer.enable_ios_virtual(device)?;
-        }
-        let ios_transport = config.ios_transport.clone();
-        if config.profile.platform.is_ios() {
-            if let Some(resources) = &ios_transport {
-                resources.validate()?;
-            }
-        }
         let guild_session = Arc::new(crate::guild::Session::default());
+        let cancel = CancellationToken::new();
+        let transport_cancel = cancel.child_token();
         Ok(Arc::new_cyclic(|weak| Self {
             config,
             guild_session: guild_session.clone(),
@@ -266,18 +392,15 @@ impl Client {
             inner: Mutex::new(Inner {
                 state,
                 signer,
-                ios_transport,
-                ios_network,
-                ios_heartbeat_source,
+                platform,
                 connection_cookie: Bytes::new(),
-                o3: crate::o3::Session::default(),
-                ios_o3: None,
                 clock: crate::clock::ServerClock::default(),
                 sequence: rand::random::<u32>().wrapping_rem(4_900_001) as i32 + 5_000_000,
                 next_id: 0,
                 generation: 0,
                 connection: None,
-                cancel: CancellationToken::new(),
+                cancel,
+                transport_cancel,
                 pending: HashMap::new(),
                 previous_keys: vec![],
                 last_activity: Instant::now(),
@@ -307,6 +430,8 @@ impl Client {
             login_gate: tokio::sync::Mutex::new(()),
             codecs: tokio::sync::Mutex::new(None),
             captcha: Mutex::new(None),
+            device_verification: Mutex::new(None),
+            security: Mutex::new(None),
             tasks: Mutex::new(vec![]),
             events,
             packets,
@@ -342,9 +467,23 @@ impl Client {
         self.replace_state_locked(&mut inner, state);
     }
     fn replace_state_locked(&self, inner: &mut Inner, mut state: SessionState) {
-        if inner.kick_reason.is_some() {
+        if inner.kick_reason.is_some()
+            || !matches!(
+                (
+                    &inner.platform,
+                    &state.platform,
+                    state.profile.platform.is_ios()
+                ),
+                (
+                    PlatformRuntime::Linux(_),
+                    PlatformState::Linux { .. },
+                    false
+                ) | (PlatformRuntime::Ios(_), PlatformState::Ios { .. }, true)
+            )
+        {
             return;
         }
+        state.keystore.ios_server_lists = inner.state.keystore.ios_server_lists.clone();
         if inner.signer.has_ios_virtual_device()
             && state.keystore.ios_virtual_state != inner.state.keystore.ios_virtual_state
         {
@@ -352,9 +491,14 @@ impl Client {
         }
         let account_changed = inner.state.keystore.uin != state.keystore.uin
             || inner.state.keystore.uid != state.keystore.uid;
+        if inner.state.keystore.uin != state.keystore.uin {
+            if let Some(ios) = inner.ios_mut() {
+                ios.first_register = true;
+            }
+        }
         if inner.state.profile.platform.is_ios()
             && (account_changed
-                || inner.state.machine_id != state.machine_id
+                || inner.state.platform != state.platform
                 || inner.state.profile.qua != state.profile.qua
                 || inner.state.profile.platform != state.profile.platform
                 || inner.state.keystore.guid != state.keystore.guid)
@@ -462,7 +606,9 @@ impl Client {
             }
             if signer.has_ios_virtual_device() {
                 let mut uin = itoa::Buffer::new();
-                if let Err(error) = signer.update_ios_logged_accounts(state, &[uin.format(state.keystore.uin)]) {
+                if let Err(error) =
+                    signer.update_ios_logged_accounts(state, &[uin.format(state.keystore.uin)])
+                {
                     tracing::warn!(%error, "Mobile authenticated-account token collection failed");
                 }
             }
@@ -521,8 +667,67 @@ impl Client {
             inner.clock.unix_seconds().map(u64::from)
         }
     }
+    pub(crate) fn start_ios_correct_time(&self) {
+        let (generation, cancel) = {
+            let inner = self.inner.lock().unwrap();
+            if inner.ios().is_none() || inner.connection.is_none() || inner.cancel.is_cancelled() {
+                return;
+            }
+            (inner.generation, inner.transport_cancel.clone())
+        };
+        let weak = self.weak.clone();
+        let task = tokio::spawn(async move {
+            for attempt in 0..3 {
+                let Some(client) = weak.upgrade() else { return };
+                let result = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return,
+                    result = client.correct_time_for_generation(generation, true, &cancel) => result,
+                };
+                match result {
+                    Ok(()) => return,
+                    Err(Error::Timeout) if attempt < 2 && !cancel.is_cancelled() => {}
+                    Err(Error::Server { code, .. })
+                        if attempt < 2
+                            && !cancel.is_cancelled()
+                            && ios_response::Action::classify(code)
+                                == ios_response::Action::Failure => {}
+                    Err(error) => {
+                        if !cancel.is_cancelled() {
+                            tracing::warn!(target: "atri_qq_protocol::login", %error, generation, "Server clock correction unavailable");
+                        }
+                        return;
+                    }
+                }
+            }
+        });
+        let mut tasks = self.tasks.lock().unwrap();
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task);
+    }
+
     pub(crate) async fn correct_time(&self) -> Result<()> {
-        let generation = self.connection_generation();
+        let (generation, ios, source) = {
+            let inner = self.inner.lock().unwrap();
+            (
+                inner.generation,
+                inner.state.profile.platform.is_ios(),
+                inner.transport_cancel.clone(),
+            )
+        };
+        self.correct_time_for_generation(generation, ios, &source)
+            .await
+    }
+
+    async fn correct_time_for_generation(
+        &self,
+        generation: u64,
+        ios: bool,
+        source: &CancellationToken,
+    ) -> Result<()> {
+        if source.is_cancelled() {
+            return Err(Error::Disconnected);
+        }
         let started = Instant::now();
         let response = self
             .request_inner(
@@ -530,8 +735,12 @@ impl Client {
                 Bytes::from_static(&[0, 0, 0, 4]),
                 RequestType::Simple,
                 Encryption::None,
-                Duration::from_secs(7),
-                Some(RequestBinding::Connection(generation)),
+                Duration::from_secs(if ios { 60 } else { 7 }),
+                Some(if ios {
+                    RequestBinding::IosControl { generation, source }
+                } else {
+                    RequestBinding::Connection(generation)
+                }),
             )
             .await?;
         if started.elapsed() > Duration::from_secs(7) {
@@ -549,6 +758,7 @@ impl Client {
         if inner.generation != generation
             || inner.connection.is_none()
             || inner.cancel.is_cancelled()
+            || source.is_cancelled()
         {
             return Err(Error::Disconnected);
         }
@@ -661,7 +871,7 @@ impl Client {
         }
         if inner.state.keystore != *expected
             || inner.state.profile != updated.profile
-            || inner.state.machine_id != updated.machine_id
+            || inner.state.platform != updated.platform
             || expected.uin != updated.keystore.uin
             || expected.uid != updated.keystore.uid
             || !updated.online
@@ -944,6 +1154,9 @@ impl Client {
             .retain(|task| !task.is_finished());
         let (generation, cancel) = {
             let mut i = self.inner.lock().unwrap();
+            if i.ios().is_some_and(|ios| ios.response.reconnecting) {
+                return Err(Error::Disconnected);
+            }
             if i.connection.is_some() {
                 return Ok(());
             }
@@ -951,19 +1164,60 @@ impl Client {
                 i.cancel = CancellationToken::new()
             }
             i.signing_ready = false;
+            if let Some(ios) = i.ios_mut() {
+                ios.discovery.cancel_pending();
+            }
             i.generation = i.generation.checked_add(1).ok_or_else(|| {
                 Error::Unsupported("Connection generation space exhausted".into())
             })?;
             i.connection_cookie = Bytes::new();
+            let generation = i.generation;
+            if let Some(ios) = i.ios_mut() {
+                ios.header.reset(generation);
+            }
             self.prepare_ios_connection(&mut i)?;
             (i.generation, i.cancel.clone())
         };
+        self.start_ios_discovery(generation, false);
         let socket = tokio::select! {
             _=cancel.cancelled()=>return Err(Error::Disconnected),
-            result=tokio::time::timeout(self.config.timeout,self.connect_socket())=>result.map_err(|_|Error::Timeout)??,
+            result=tokio::time::timeout(self.config.timeout,self.connect_socket())=>match result {
+                Ok(Ok(socket)) => socket,
+                result => {
+                    self.start_ios_discovery(generation, true);
+                    return Err(match result { Ok(Err(error)) => error, _ => Error::Timeout });
+                }
+            },
+        };
+        self.install_transport(socket, generation)?;
+        self.start_background_work(generation);
+        if self.inner.lock().unwrap().linux_o3().is_some() {
+            self.start_signing_work(generation, crate::o3::Channel::new());
+        } else {
+            self.start_ios_signing_work(generation);
+        }
+        self.start_ios_network_work(generation);
+        Ok(())
+    }
+    fn install_transport(&self, socket: TcpStream, generation: u64) -> Result<()> {
+        let cancel = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.generation != generation
+                || inner.cancel.is_cancelled()
+                || inner.kick_reason.is_some()
+            {
+                return Err(Error::Disconnected);
+            }
+            inner.transport_cancel.cancel();
+            inner.transport_cancel = inner.cancel.child_token();
+            inner.transport_cancel.clone()
         };
         socket.set_nodelay(true)?;
-        let ios_peer = self.config.ios_virtual.as_ref().map(|_| socket.peer_addr()).transpose()?;
+        let ios_peer = self
+            .config
+            .ios_virtual()
+            .map(|_| socket.peer_addr())
+            .transpose()?;
         let framed = Framed::new(socket, SsoFrameCodec);
         let (mut sink, mut source) = framed.split();
         let (sender, mut queue) = mpsc::channel::<Outgoing>(512);
@@ -972,10 +1226,13 @@ impl Client {
             if i.generation != generation || cancel.is_cancelled() {
                 return Err(Error::Disconnected);
             }
-            if let (Some(network), Some(peer)) = (&mut i.ios_network, ios_peer) {
+            if let (Some(network), Some(peer)) =
+                (i.ios_mut().and_then(|ios| ios.network.as_mut()), ios_peer)
+            {
                 network.connected(peer, crate::ios_device::network::wall_millis()?);
             }
             i.connection = Some(Connection { generation, sender });
+            self.start_ios_probe_worker(&mut i);
         }
         let weak = self.weak.clone();
         let read_cancel = cancel.clone();
@@ -985,20 +1242,28 @@ impl Client {
                 match next {
                     Some(Ok(frame)) => {
                         let Some(client) = weak.upgrade() else { return };
-                        if let Err(error) = client.receive(frame, generation) {
+                        if let Err(error) =
+                            client.receive_from_transport(frame, generation, Some(&read_cancel))
+                        {
                             tracing::warn!(target: "atri_qq_protocol::packet", %error,
                                 "Ignored incoming QQ packet; keeping the transport open");
                         }
                     }
                     Some(Err(error)) => {
                         if let Some(client) = weak.upgrade() {
-                            client.terminate_generation(generation, error.to_string())
+                            client.record_ios_connection_failure(generation, &read_cancel);
+                            client.terminate_transport(generation, &read_cancel, error.to_string())
                         }
                         return;
                     }
                     None => {
                         if let Some(client) = weak.upgrade() {
-                            client.terminate_generation(generation, "TCP peer closed".into())
+                            client.record_ios_connection_failure(generation, &read_cancel);
+                            client.terminate_transport(
+                                generation,
+                                &read_cancel,
+                                "TCP peer closed".into(),
+                            )
                         }
                         return;
                     }
@@ -1024,8 +1289,9 @@ impl Client {
                 if Instant::now() >= item.deadline {
                     if item.required_control {
                         if let Some(client) = weak.upgrade() {
-                            client.terminate_generation(
+                            client.terminate_transport(
                                 generation,
+                                &write_cancel,
                                 "Required control response expired in the write queue".into(),
                             );
                         }
@@ -1037,8 +1303,13 @@ impl Client {
                 // A successful response can precede sink.flush completion; it never cancels this write.
                 item.trace(generation);
                 if let Some(client) = weak.upgrade() {
-                    if let Err(error) = client.mark_ios_send_started(generation, item.sequence) {
-                        client.terminate_generation(generation, error.to_string());
+                    if let Err(error) = client.mark_ios_send_started(
+                        generation,
+                        item.sequence,
+                        item.attempt,
+                        &write_cancel,
+                    ) {
+                        client.terminate_transport(generation, &write_cancel, error.to_string());
                         return;
                     }
                 }
@@ -1046,20 +1317,36 @@ impl Client {
                 match result {
                     Ok(Ok(())) => {
                         if let Some(client) = weak.upgrade() {
-                            if let Err(error) = client.mark_activity(generation, item.sequence, &item.command) {
-                                client.terminate_generation(generation, error.to_string());
+                            if let Err(error) = client.mark_activity(
+                                generation,
+                                item.sequence,
+                                &item.command,
+                                item.attempt,
+                                &write_cancel,
+                            ) {
+                                client.terminate_transport(
+                                    generation,
+                                    &write_cancel,
+                                    error.to_string(),
+                                );
                                 return;
                             }
                             if item.terminal {
-                                client.terminate_generation(generation, String::new());
+                                client.terminate_transport(
+                                    generation,
+                                    &write_cancel,
+                                    String::new(),
+                                );
                                 return;
                             }
                         }
                     }
                     Ok(Err(error)) => {
                         if let Some(client) = weak.upgrade() {
-                            client.terminate_generation(
+                            client.record_ios_connection_failure(generation, &write_cancel);
+                            client.terminate_transport(
                                 generation,
+                                &write_cancel,
                                 format!("TCP write failed: {error}"),
                             )
                         }
@@ -1067,8 +1354,10 @@ impl Client {
                     }
                     Err(_) => {
                         if let Some(client) = weak.upgrade() {
-                            client.terminate_generation(
+                            client.record_ios_connection_failure(generation, &write_cancel);
+                            client.terminate_transport(
                                 generation,
+                                &write_cancel,
                                 "TCP write deadline expired; frame transmission uncertain".into(),
                             )
                         }
@@ -1077,16 +1366,25 @@ impl Client {
                 }
             }
         });
-        self.tasks.lock().unwrap().extend([reader, writer]);
-        self.start_background_work(generation);
-        self.start_signing_work(generation, crate::o3::Channel::new());
-        self.start_ios_network_work(generation);
+        let mut tasks = self.tasks.lock().unwrap();
+        tasks.retain(|task| !task.is_finished());
+        tasks.extend([reader, writer]);
         Ok(())
     }
+    #[cfg(test)]
     fn receive(&self, frame: Bytes, generation: u64) -> Result<()> {
+        self.receive_from_transport(frame, generation, None)
+    }
+    fn receive_from_transport(
+        &self,
+        frame: Bytes,
+        generation: u64,
+        source: Option<&CancellationToken>,
+    ) -> Result<()> {
         let mut i = self.inner.lock().unwrap();
         if i.generation != generation
             || i.connection.as_ref().map(|c| c.generation) != Some(generation)
+            || source.is_some_and(CancellationToken::is_cancelled)
         {
             tracing::debug!(target: "atri_qq_protocol::packet_trace", direction = "receive", stage = "wire", command = "<unavailable>", generation, decode_error = "stale connection generation", length = frame.len(), raw_hex = %hex::encode(&frame), "QQ packet");
             return Ok(());
@@ -1110,22 +1408,114 @@ impl Client {
         }
         tracing::debug!(target: "atri_qq_protocol::packet_trace", direction = "receive", stage = "wire", command = packet.command, sequence = packet.sequence, generation, length = frame.len(), raw_hex = %hex::encode(&frame), "QQ packet");
         tracing::debug!(target: "atri_qq_protocol::packet_trace", direction = "receive", stage = "decoded", generation, command = packet.command, sequence = packet.sequence, return_code = packet.return_code, extra, packet = ?packet, body_hex = %hex::encode(&packet.body), "QQ packet");
-        if packet.return_code != 0 {
+        let action = if i.ios().is_some() {
+            ios_response::Action::classify(packet.return_code)
+        } else if packet.return_code == 0 {
+            ios_response::Action::Deliver
+        } else {
+            ios_response::Action::Failure
+        };
+        if action == ios_response::Action::Failure {
             crate::diagnostics::log_transport_error(&packet, &extra, &frame);
         }
         i.last_activity = Instant::now();
         self.activity.notify_one();
-        if i.ios_network.is_some() {
-            let (created, sent) = i.pending.get(&packet.sequence)
+        let reserve = i.ios().and_then(|_| {
+            (!packet.header.server_reserve.is_empty())
+                .then(|| {
+                    crate::proto::sso::Reserved::decode(packet.header.server_reserve.clone()).ok()
+                })
+                .flatten()
+        });
+        if matches!(
+            action,
+            ios_response::Action::Deliver | ios_response::Action::DeliverStatus
+        ) && let (Some(ios), Some(reserve)) = (i.ios_mut(), reserve.as_ref())
+        {
+            ios.response.signature.accept(reserve);
+        }
+        if i.ios().is_some_and(|ios| ios.network.is_some()) {
+            let (created, sent) = i
+                .pending
+                .get(&packet.sequence)
                 .filter(|request| request.command == packet.command)
                 .and_then(|request| request.ios.as_ref())
                 .map(|timing| (Some(timing.created), timing.sent))
                 .unwrap_or((None, None));
-            let correction = crate::proto::sso::Reserved::decode(packet.header.server_reserve.as_ref())
-                .ok().and_then(|reserve| reserve.rtt_correction_ms).map(|value| value as i32);
-            i.ios_network.as_mut().unwrap().response(
-                &packet.command, created, sent, correction, crate::ios_device::network::wall_millis()?,
+            let correction = reserve
+                .as_ref()
+                .and_then(|reserve| reserve.rtt_correction_ms)
+                .map(|value| value as i32);
+            i.ios_mut().unwrap().network.as_mut().unwrap().response(
+                &packet.command,
+                created,
+                sent,
+                correction,
+                crate::ios_device::network::wall_millis()?,
             );
+        }
+        if i.kick_reason.is_some() {
+            return Ok(());
+        }
+        let matched = i
+            .pending
+            .get(&packet.sequence)
+            .is_some_and(|pending| pending.command == packet.command);
+        let accepted = matches!(
+            action,
+            ios_response::Action::Deliver | ios_response::Action::DeliverStatus
+        );
+        let config_push =
+            (!matched && accepted && packet.command == crate::network::PUSH_REQUEST_COMMAND)
+                .then(|| crate::network::decode_push_with_delivery(packet.body.clone()));
+        if accepted
+            && reserve.is_some()
+            && i.ios().is_some()
+            && ios_response::host_delivered(
+                &packet,
+                matched,
+                config_push
+                    .as_ref()
+                    .is_some_and(|result| result.as_ref().is_ok_and(|(_, consumed)| *consumed)),
+            )
+        {
+            i.ios_mut()
+                .unwrap()
+                .response
+                .signature
+                .host_delivery(reserve.as_ref().unwrap());
+        }
+        match action {
+            ios_response::Action::Full => {
+                return if matched {
+                    self.resend_ios(&mut i, packet.sequence, generation, true)
+                } else {
+                    Ok(())
+                };
+            }
+            ios_response::Action::Ability => {
+                i.ios_mut().unwrap().response.disabled_abilities |= 1;
+                return if matched {
+                    self.resend_ios(&mut i, packet.sequence, generation, false)
+                } else {
+                    Ok(())
+                };
+            }
+            ios_response::Action::Reconnect => {
+                self.reconnect_ios_transport(
+                    &mut i,
+                    generation,
+                    matched.then_some(packet.sequence),
+                );
+                return Ok(());
+            }
+            ios_response::Action::Consume => {
+                if matched {
+                    self.consume_ios_response(&mut i, packet.sequence);
+                }
+                return Ok(());
+            }
+            _ => {}
         }
         if packet.command == "trpc.qq_new_tech.status_svc.StatusService.KickNT"
             && packet.return_code != 0
@@ -1138,9 +1528,6 @@ impl Client {
             self.terminate_generation(generation, format!("Kicked: {error}"));
             return Ok(());
         }
-        if i.kick_reason.is_some() {
-            return Ok(());
-        }
         if packet.command == "trpc.qq_new_tech.status_svc.StatusService.KickNT" {
             let kick = crate::proto::decode::<auth::Kick>(packet.body.clone())?;
             drop(i);
@@ -1151,9 +1538,27 @@ impl Client {
             .get(&packet.sequence)
             .is_some_and(|p| p.command == packet.command)
         {
+            let eligible = i.pending[&packet.sequence]
+                .replay
+                .as_ref()
+                .is_some_and(|replay| replay.eligible);
+            if let Some(ios) = i.ios_mut() {
+                ios.header.response(eligible);
+            }
             let pending = i.pending.remove(&packet.sequence).unwrap();
+            self.accept_ios_block_check(&mut i, &pending);
             // Deliberately do not cancel pending.cancel on a matching response.
-            let result = if packet.return_code == 0 {
+            let result = if action == ios_response::Action::DeliverStatus {
+                let body = packet.body.clone();
+                if !pending
+                    .replay
+                    .as_ref()
+                    .is_some_and(|replay| replay.internal_control)
+                {
+                    let _ = self.packets.send(packet);
+                }
+                Ok(body)
+            } else if action == ios_response::Action::Deliver {
                 Ok(packet.body)
             } else {
                 Err(Error::Server {
@@ -1163,6 +1568,7 @@ impl Client {
             };
             if let Some((binding, request)) = pending.message_sync {
                 let actions = self.message_sync.direct(&binding, &request, result);
+                self.record_ios_registration(&mut i, &binding);
                 let _ = pending.reply.send(Ok(Bytes::new()));
                 drop(i);
                 self.sync_ios_guild_cursor(generation);
@@ -1172,12 +1578,15 @@ impl Client {
             let _ = pending.reply.send(result);
             return Ok(());
         }
-        let sync = if packet.return_code == 0 {
+        let sync = if accepted {
             self.message_sync
                 .ingest(generation, &i.state, &packet.command, packet.body.clone())
         } else {
             Ok((false, None, Vec::new()))
         };
+        if let Ok((_, Some(binding), _)) = &sync {
+            self.record_ios_registration(&mut i, binding);
+        }
         drop(i);
         match sync {
             Ok((accepted, binding, actions)) => {
@@ -1195,7 +1604,7 @@ impl Client {
             }
         }
         self.sync_ios_guild_cursor(generation);
-        if packet.return_code != 0 {
+        if action == ios_response::Action::Failure {
             return Err(Error::Server {
                 code: packet.return_code,
                 message: extra,
@@ -1217,8 +1626,9 @@ impl Client {
         let control_reply = match packet.command.as_str() {
             "trpc.msg.olpush.OlPushService.MsgPush" => wire::encode_push_ack(packet.body.clone())?
                 .map(|body| ("trpc.msg.olpush.OlPushService.SsoPushAck", body)),
-            "ConfigPushSvc.PushReq" => self
-                .apply_network_push(generation, packet.body.clone())
+            "ConfigPushSvc.PushReq" => config_push
+                .unwrap()
+                .and_then(|(push, _)| self.apply_network_push(generation, push))
                 .inspect_err(|_| {
                     let _ = self.packets.send(packet.clone());
                 })?
@@ -1316,6 +1726,7 @@ impl Client {
             let outgoing = Outgoing {
                 command: command.into(),
                 sequence,
+                attempt: 0,
                 frame,
                 deadline,
                 cancel: inner.cancel.clone(),
@@ -1359,7 +1770,16 @@ impl Client {
         request_type: RequestType,
         encryption: Encryption,
     ) -> Result<(i32, Bytes)> {
-        self.prepare_frame_from(inner, command, body, request_type, encryption, true)
+        self.prepare_frame_from(
+            inner,
+            command,
+            body,
+            request_type,
+            encryption,
+            true,
+            false,
+            None,
+        )
     }
     fn prepare_frame_from(
         &self,
@@ -1369,13 +1789,16 @@ impl Client {
         request_type: RequestType,
         encryption: Encryption,
         is_nt_request: bool,
+        ios_internal_control: bool,
+        replay: Option<&mut ios_header::Replay>,
     ) -> Result<(i32, Bytes)> {
-        if inner.state.profile.platform.is_ios() {
-            let resources = inner.ios_transport.as_ref().ok_or_else(|| {
-                Error::Authentication("iOS requests require actual transport resources".into())
-            })?;
+        if let Some(ios) = inner.ios() {
+            let resources = &ios.transport;
             resources.validate()?;
-            if command == "PushService.get" && resources.push_service_get_statistics.is_none() && inner.ios_network.is_none() {
+            if command == "PushService.get"
+                && resources.push_service_get_statistics.is_none()
+                && ios.network.is_none()
+            {
                 return Err(Error::Authentication(
                     "PushService.get requires actual iOS transport statistics".into(),
                 ));
@@ -1385,48 +1808,145 @@ impl Client {
             Error::Unsupported("SSO sequence space exhausted; reconnect required".into())
         })?;
         let sequence = inner.sequence;
-        let signing_generation = inner.signer.generation();
-        let signature = inner.signer.sign_shared(
+        let frame = self.prepare_frame_at(
+            inner,
             command,
+            body,
+            request_type,
+            encryption,
+            is_nt_request,
+            ios_internal_control,
             sequence,
-            body.clone(),
-            &inner.state,
-            self.config.randomize_signature_for_testing,
+            false,
+            replay,
         )?;
-        if inner.signer.generation() != signing_generation {
+        Ok((sequence, frame))
+    }
+    fn prepare_frame_at(
+        &self,
+        inner: &mut Inner,
+        command: &str,
+        body: Bytes,
+        request_type: RequestType,
+        encryption: Encryption,
+        is_nt_request: bool,
+        ios_internal_control: bool,
+        sequence: i32,
+        force_full: bool,
+        replay: Option<&mut ios_header::Replay>,
+    ) -> Result<Bytes> {
+        let is_replay = replay.as_ref().is_some_and(|replay| replay.attempt != 0);
+        let invokes_signer = !is_replay
+            && !ios_internal_control
+            && inner
+                .ios()
+                .is_none_or(|ios| ios.response.signature.invokes());
+        let signing_generation = invokes_signer.then(|| inner.signer.generation());
+        let signature = if is_replay {
+            replay.as_ref().and_then(|replay| replay.signature.clone())
+        } else if !invokes_signer {
+            None
+        } else {
+            inner
+                .signer
+                .sign_shared(
+                    command,
+                    sequence,
+                    body.clone(),
+                    &inner.state,
+                    self.config.randomize_signature_for_testing,
+                )?
+                .map(|security| crate::proto::sso::SecureInfo {
+                    sign: Some(Bytes::copy_from_slice(security.sign.as_ref())),
+                    token: Some(security.token.into()),
+                    extra: Some(security.extra.into()),
+                })
+        };
+        if !is_replay {
+            if let Some(replay) = replay {
+                replay.signature = signature.clone();
+            }
+        }
+        if signing_generation.is_some_and(|generation| inner.signer.generation() != generation) {
             inner.signing_cancel.cancel();
             inner.signing_cancel = CancellationToken::new();
         }
-        if signature.is_some() {
+        if signature.is_some() && !is_replay {
             self.signing_work.notify_one();
         }
+        let signature = if inner
+            .ios()
+            .is_some_and(|ios| !ios.response.signature.attaches())
+        {
+            None
+        } else {
+            signature
+        };
+        let Inner {
+            state,
+            platform,
+            connection_cookie,
+            generation,
+            ..
+        } = inner;
+        let ios = match platform {
+            PlatformRuntime::Ios(ios) => Some(ios),
+            PlatformRuntime::Linux(_) => None,
+        };
+        let mut ios = ios;
         if command == "PushService.get" {
-            if let (Some(network), Some(resources)) = (&mut inner.ios_network, &mut inner.ios_transport) {
-                resources.push_service_get_statistics = Some(network.take_push_statistics());
+            if let Some(ios) = ios.as_deref_mut() {
+                if let Some(network) = &mut ios.network {
+                    ios.transport.push_service_get_statistics =
+                        Some(network.take_push_statistics());
+                }
             }
         }
-        tracing::debug!(target: "atri_qq_protocol::packet_trace", direction = "send", stage = "prepared", command, sequence, generation = inner.generation, request_type = ?request_type, encryption = ?encryption, body_hex = %hex::encode(&body), "QQ packet");
+        let request_type = if let Some(ios) = ios.as_deref_mut() {
+            ios.header.select(
+                *generation,
+                command,
+                &ios.transport,
+                &state.keystore,
+                force_full,
+            )
+        } else {
+            request_type
+        };
+        let encryption = if ios_internal_control {
+            Encryption::None
+        } else {
+            encryption
+        };
+        tracing::debug!(target: "atri_qq_protocol::packet_trace", direction = "send", stage = "prepared", command, sequence, generation = *generation, request_type = ?request_type, encryption = ?encryption, body_hex = %hex::encode(&body), "QQ packet");
+        let (transport, network, qimei) = match ios.as_deref_mut() {
+            Some(ios) => (
+                Some((&ios.transport, connection_cookie.as_ref())),
+                ios.network.as_ref(),
+                Some(&mut ios.header.qimei_materialized),
+            ),
+            None => (None, None, None),
+        };
         let frame = wire::encode_sso(
             command,
             sequence,
             body,
             request_type,
             encryption,
-            &inner.state,
+            state,
             signature,
-            inner
-                .ios_transport
-                .as_ref()
-                .map(|resources| (resources, inner.connection_cookie.as_ref())),
-            inner.ios_network.as_ref(),
+            transport,
+            network,
             is_nt_request,
+            qimei,
+            ios_internal_control,
         );
-        if inner.state.profile.platform.is_ios() && command == "PushService.get" {
-            if let Some(resources) = &mut inner.ios_transport {
-                resources.push_service_get_statistics = Some(IosPushStatistics::default());
+        if command == "PushService.get" {
+            if let Some(ios) = ios {
+                ios.transport.push_service_get_statistics = Some(IosPushStatistics::default());
             }
         }
-        Ok((sequence, frame?))
+        frame
     }
     async fn send_only(&self, command: &str, body: Bytes, generation: u64) -> Result<()> {
         let deadline = Instant::now()
@@ -1434,7 +1954,10 @@ impl Client {
             .ok_or_else(|| wire::malformed("Send deadline overflow"))?;
         let (sender, sequence, frame, cancel) = {
             let mut inner = self.inner.lock().unwrap();
-            if inner.generation != generation || inner.kick_reason.is_some() {
+            if inner.generation != generation
+                || inner.kick_reason.is_some()
+                || inner.ios().is_some_and(|ios| ios.response.reconnecting)
+            {
                 return Err(Error::Disconnected);
             }
             let sender = inner
@@ -1452,6 +1975,7 @@ impl Client {
             sender.send(Outgoing {
                 command: command.to_owned(),
                 sequence,
+                attempt: 0,
                 frame,
                 deadline,
                 cancel,
@@ -1527,6 +2051,9 @@ impl Client {
             let current = match binding {
                 None => true,
                 Some(RequestBinding::Connection(generation)) => i.generation == generation,
+                Some(RequestBinding::IosControl { generation, source }) => {
+                    i.generation == generation && !source.is_cancelled()
+                }
                 Some(RequestBinding::IosO3(binding)) => binding.is_current(&i),
                 Some(RequestBinding::Online(generation)) => {
                     i.generation == generation && i.state.online
@@ -1550,7 +2077,10 @@ impl Client {
                             == Some(i.state.keystore.uin)
                 }
             };
-            if !current || i.kick_reason.is_some() {
+            if !current
+                || i.kick_reason.is_some()
+                || i.ios().is_some_and(|ios| ios.response.reconnecting)
+            {
                 return Err(Error::Disconnected);
             }
             let sender = i
@@ -1565,11 +2095,35 @@ impl Client {
                 ));
             }
             let ios = ios_network::RequestTiming::new(&i)?;
-            let is_nt_request = !matches!(binding,
-                Some(RequestBinding::Connection(_) | RequestBinding::IosO3(_) | RequestBinding::Credentials(_))
+            let is_nt_request = !matches!(
+                binding,
+                Some(
+                    RequestBinding::Connection(_)
+                        | RequestBinding::IosControl { .. }
+                        | RequestBinding::IosO3(_)
+                        | RequestBinding::Credentials(_)
+                )
             );
-            let (sequence, frame) =
-                self.prepare_frame_from(&mut i, command, body, request_type, encryption, is_nt_request)?;
+            let ios_internal_control = matches!(binding, Some(RequestBinding::IosControl { .. }));
+            let mut replay = ios_header::Replay::new(
+                &i,
+                &body,
+                request_type,
+                encryption,
+                is_nt_request,
+                ios_internal_control,
+                deadline,
+            );
+            let (sequence, frame) = self.prepare_frame_from(
+                &mut i,
+                command,
+                body,
+                request_type,
+                encryption,
+                is_nt_request,
+                ios_internal_control,
+                replay.as_mut(),
+            )?;
             i.next_id = i
                 .next_id
                 .checked_add(1)
@@ -1592,9 +2146,11 @@ impl Client {
                     reply: tx,
                     cancel: cancel.clone(),
                     ios,
+                    replay,
                     message_sync: None,
                 },
             );
+            self.arm_ios_block_checks(&mut i);
             (sequence, id, sender, frame, cancel, rx)
         };
         let _guard = PendingGuard {
@@ -1607,6 +2163,7 @@ impl Client {
                 .send(Outgoing {
                     command: command.to_owned(),
                     sequence,
+                    attempt: 0,
                     frame,
                     deadline,
                     cancel,
@@ -1656,6 +2213,38 @@ impl Client {
             .take()
             .ok_or_else(|| Error::Authentication("No captcha challenge is active".into()))?
             .send((ticket, random))
+            .map_err(|_| Error::Disconnected)
+    }
+    pub async fn submit_device_verification(
+        &self,
+        result: IosDeviceVerificationResult,
+    ) -> Result<()> {
+        if result.signature.is_empty() && result.authentication_type == 0 {
+            return Err(Error::Authentication(
+                "Device verification requires the webpage's ntVerifySig or a nonzero authentication_type".into(),
+            ));
+        }
+        self.device_verification
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| {
+                Error::Authentication("No iOS device verification challenge is active".into())
+            })?
+            .send(result)
+            .map_err(|_| Error::Disconnected)
+    }
+    pub async fn submit_security_action(&self, action: IosLoginSecurityAction) -> Result<()> {
+        let mut pending = self.security.lock().unwrap();
+        let active = pending
+            .as_ref()
+            .ok_or_else(|| Error::Authentication("No iOS security challenge is active".into()))?;
+        active.challenge.validate_action(&action)?;
+        pending
+            .take()
+            .unwrap()
+            .reply
+            .send(action)
             .map_err(|_| Error::Disconnected)
     }
     fn unregister_body(kicked: bool) -> Bytes {
@@ -1718,21 +2307,37 @@ impl Client {
         self.terminate_generation(generation, reason)
     }
     fn terminate_generation(&self, generation: u64, reason: String) {
-        self.terminate_generation_with_policy(generation, reason, false);
+        self.terminate_generation_with_policy(generation, reason, false, None);
+    }
+    fn terminate_transport(&self, generation: u64, source: &CancellationToken, reason: String) {
+        self.terminate_generation_with_policy(
+            generation,
+            reason,
+            false,
+            Some(&|_| !source.is_cancelled()),
+        );
     }
     fn terminate_generation_with_policy(
         &self,
         generation: u64,
         reason: String,
         preserve_kick: bool,
+        condition: Option<&dyn Fn(&Inner) -> bool>,
     ) {
         {
             let mut i = self.inner.lock().unwrap();
-            if i.generation != generation || (preserve_kick && i.kick_reason.is_some()) {
+            if i.generation != generation
+                || (preserve_kick && i.kick_reason.is_some())
+                || condition.is_some_and(|condition| !condition(&i))
+            {
                 return;
             }
             let reason = i.kick_reason.take().unwrap_or(reason);
             i.cancel.cancel();
+            if let Some(ios) = i.ios_mut() {
+                ios.discovery.cancel_pending();
+                ios.probes.clear();
+            }
             i.maintenance_cancel.cancel();
             i.maintenance_started = false;
             i.credentials.invalidate(true);
@@ -1742,8 +2347,13 @@ impl Client {
             i.friend_statuses.clear();
             let connected = i.connection.take().is_some();
             i.connection_cookie = Bytes::new();
-            if let Some(network) = &mut i.ios_network {
-                network.disconnect();
+            if let Some(ios) = i.ios_mut() {
+                ios.header.reset(generation);
+                ios.response.reconnecting = false;
+                ios.block_check = ios_network::BlockCheck::default();
+                if let Some(network) = &mut ios.network {
+                    network.disconnect();
+                }
             }
             let online = i.state.online;
             i.state.online = false;
@@ -1761,15 +2371,39 @@ impl Client {
         self.personal_events.cancel();
         self.media_keys.close(generation);
         self.captcha.lock().unwrap().take();
+        self.device_verification.lock().unwrap().take();
+        self.security.lock().unwrap().take();
     }
-    fn mark_activity(&self, generation: u64, sequence: i32, command: &str) -> Result<()> {
+    fn mark_activity(
+        &self,
+        generation: u64,
+        sequence: i32,
+        command: &str,
+        attempt: u64,
+        source: &CancellationToken,
+    ) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        if inner.generation == generation && inner.connection.is_some() {
-            if let Some(network) = &mut inner.ios_network {
+        if inner.generation == generation && inner.connection.is_some() && !source.is_cancelled() {
+            if let Some(network) = inner.ios_mut().and_then(|ios| ios.network.as_mut()) {
                 network.sent(command);
-                if let Some(timing) = inner.pending.get_mut(&sequence).and_then(|request| request.ios.as_mut()) {
-                    timing.sent = Some(crate::ios_device::network::wall_millis()?);
+                if let Some(request) = inner.pending.get_mut(&sequence).filter(|request| {
+                    request
+                        .replay
+                        .as_ref()
+                        .is_none_or(|replay| replay.attempt == attempt)
+                }) {
+                    if let Some(timing) = &mut request.ios {
+                        timing.sent = Some(crate::ios_device::network::wall_millis()?);
+                    }
                 }
+            }
+            if let Some(replay) = inner
+                .pending
+                .get_mut(&sequence)
+                .and_then(|request| request.replay.as_mut())
+                .filter(|replay| replay.attempt == attempt)
+            {
+                replay.phase = ios_header::Phase::Awaiting(Instant::now());
             }
             inner.last_activity = Instant::now();
             self.activity.notify_one();
@@ -1779,6 +2413,10 @@ impl Client {
     pub(crate) fn start_alive(self: &Arc<Self>) {
         let (generation, cancel) = {
             let mut inner = self.inner.lock().unwrap();
+            if inner.state.profile.platform.is_ios() {
+                self.arm_ios_block_checks(&mut inner);
+                return;
+            }
             inner.alive_cancel.cancel();
             inner.alive_cancel = inner.cancel.child_token();
             (inner.generation, inner.alive_cancel.clone())
@@ -1935,17 +2573,19 @@ impl Client {
                 return;
             }
             if inner
-                .o3
+                .linux_o3()
+                .unwrap()
                 .transport_generation
                 .is_some_and(|previous| previous != generation)
             {
                 inner.signer.cancel_token_reports();
             }
-            inner.o3.transport_generation = Some(generation);
-            if inner.o3.scope.is_none() {
-                inner.o3.channel = channel;
-            } else if inner.o3.channel.is_establishing() {
-                inner.o3.channel.reset();
+            let o3 = inner.linux_o3_mut().unwrap();
+            o3.transport_generation = Some(generation);
+            if o3.scope.is_none() {
+                o3.channel = channel;
+            } else if o3.channel.is_establishing() {
+                o3.channel.reset();
             }
         }
         let weak = self.weak.clone();
@@ -1969,10 +2609,11 @@ impl Client {
                     }
                     if inner.signing_ready {
                         let binding = (inner.signer.generation(), inner.state.keystore.uin);
-                        if inner.o3.scope != Some(binding) {
-                            inner.o3.channel.reset();
-                            inner.o3.heartbeat.reset();
-                            inner.o3.scope = Some(binding);
+                        let o3 = inner.linux_o3_mut().unwrap();
+                        if o3.scope != Some(binding) {
+                            o3.channel.reset();
+                            o3.heartbeat.reset();
+                            o3.scope = Some(binding);
                         }
                         if let Err(error) = inner.signer.poll_token() {
                             tracing::warn!(%error, "O3 token refresh could not be queued");
@@ -1992,8 +2633,14 @@ impl Client {
                     let mut inner = client.inner.lock().unwrap();
                     if inner.signing_ready && inner.generation == generation {
                         let Inner {
-                            state, o3, signer, ..
+                            state,
+                            platform,
+                            signer,
+                            ..
                         } = &mut *inner;
+                        let PlatformRuntime::Linux(o3) = platform else {
+                            return;
+                        };
                         match o3.heartbeat.take_due(state) {
                             Ok(Some(body)) => match signer.channel_report("heartbeat", body) {
                                 Ok(report) => queued.push_back(crate::o3::Work::Report(report)),
@@ -2024,7 +2671,7 @@ impl Client {
                                         .map(|connection| connection.generation)
                                         != Some(generation)
                                     || !inner.signing_ready
-                                    || inner.o3.scope != Some(task_scope)
+                                    || inner.linux_o3().unwrap().scope != Some(task_scope)
                                     || inner.state.keystore.uin != task_scope.1
                                     || !inner.signer.report_is_current(task_report.binding())
                                     || inner.signing_cancel.is_cancelled()
@@ -2059,7 +2706,9 @@ impl Client {
                                 && inner.signer.generation() == signing_generation
                                 && inner.state.keystore.uin == account
                             {
-                                if let Err(error) = inner.o3.channel.rotate_peer(&material) {
+                                if let Err(error) =
+                                    inner.linux_o3_mut().unwrap().channel.rotate_peer(&material)
+                                {
                                     tracing::warn!(%error, "O3 peer rotation rejected");
                                 } else {
                                     tracing::debug!(target: "atri_qq_protocol::packet_trace", stage = "o3_state", generation, phase = "peer_rotated", "QQ O3 state");
@@ -2080,14 +2729,18 @@ impl Client {
                         {
                             continue;
                         }
-                        if inner.o3.channel.is_establishing() {
+                        if inner.linux_o3().unwrap().channel.is_establishing() {
                             queued.push_front(crate::o3::Work::Report(report));
                             break;
                         }
                         let body = Bytes::from(std::mem::take(&mut report.body));
-                        let request = match crate::o3::unix_seconds()
-                            .and_then(|now| inner.o3.channel.prepare(&report.method, body, now))
-                        {
+                        let request = match crate::o3::unix_seconds().and_then(|now| {
+                            inner
+                                .linux_o3_mut()
+                                .unwrap()
+                                .channel
+                                .prepare(&report.method, body, now)
+                        }) {
                             Ok(request) => request,
                             Err(error) => {
                                 if report.method == "getToken" {
@@ -2126,7 +2779,14 @@ impl Client {
                     }));
                 }
                 let heartbeat_deadline = if active_scope.is_some() {
-                    client.inner.lock().unwrap().o3.heartbeat.deadline()
+                    client
+                        .inner
+                        .lock()
+                        .unwrap()
+                        .linux_o3()
+                        .unwrap()
+                        .heartbeat
+                        .deadline()
                 } else {
                     None
                 };
@@ -2143,7 +2803,7 @@ impl Client {
                                 if inner.generation != generation
                                     || inner.connection.as_ref().map(|connection| connection.generation) != Some(generation)
                                     || !inner.signing_ready
-                                    || inner.o3.scope != Some(task_scope)
+                                    || inner.linux_o3().unwrap().scope != Some(task_scope)
                                     || inner.state.keystore.uin != task_scope.1
                                     || inner.signer.generation() != task_scope.0
                                     || report_cancel.is_cancelled()
@@ -2173,21 +2833,21 @@ impl Client {
                         let command = request.command;
                         let result = match response {
                             Ok(response) => crate::o3::unix_seconds()
-                                .and_then(|now| inner.o3.channel.complete(request, response, now)),
+                                .and_then(|now| inner.linux_o3_mut().unwrap().channel.complete(request, response, now)),
                             Err(error) => {
-                                inner.o3.channel.failed(&request);
+                                inner.linux_o3_mut().unwrap().channel.failed(&request);
                                 Err(error)
                             }
                         };
                         match result {
                             Ok(reply) => {
-                                tracing::debug!(target: "atri_qq_protocol::packet_trace", stage = "o3_state", generation, method = report.method, command, phase = "authenticated_reply", channel_expires_at = ?inner.o3.channel.expires_at(), "QQ O3 state");
+                                tracing::debug!(target: "atri_qq_protocol::packet_trace", stage = "o3_state", generation, method = report.method, command, phase = "authenticated_reply", channel_expires_at = ?inner.linux_o3().unwrap().channel.expires_at(), "QQ O3 state");
                                 if let Some(config) = reply.config {
                                     if let Err(error) = inner.signer.apply_channel_config(&config) {
                                         tracing::warn!(%error, "O3 configuration signing scope rejected");
                                         continue;
                                     }
-                                    inner.o3.heartbeat.configure(config.option4 != 0);
+                                    inner.linux_o3_mut().unwrap().heartbeat.configure(config.option4 != 0);
                                     tracing::debug!(target: "atri_qq_protocol::packet_trace", stage = "o3_state", generation, phase = "configuration_applied", heartbeat_enabled = config.option4 != 0, sign_enabled = config.option2 != 0, xwid_selector = config.option6, "QQ O3 state");
                                     if inner.state.keystore.o3_xwid_switch != Some(config.option6) {
                                         inner.state.keystore.o3_xwid_switch = Some(config.option6);
@@ -2208,7 +2868,8 @@ impl Client {
                                     let (token_length, token_expires_at) = inner.signer.token_status();
                                     tracing::debug!(target: "atri_qq_protocol::packet_trace", stage = "o3_state", generation, phase = "token_completion", token_length, token_expires_at = ?token_expires_at, "QQ O3 state");
                                 } else {
-                                    let Inner { state, signer, o3, .. } = &mut *inner;
+                                    let Inner { state, signer, platform, .. } = &mut *inner;
+                                    let PlatformRuntime::Linux(o3) = platform else { return };
                                     match o3.heartbeat.complete(reply.body, state, signer) {
                                         Ok(reports) => queued.extend(reports),
                                         Err(error) => tracing::warn!(%error, method = report.method, "O3 task response rejected"),
@@ -2243,7 +2904,7 @@ impl Client {
     fn start_background_work(&self, generation: u64) {
         let weak = self.weak.clone();
         let notify = self.background_work.clone();
-        let cancel = self.cancellation();
+        let cancel = self.inner.lock().unwrap().transport_cancel.clone();
         let task = tokio::spawn(async move {
             loop {
                 let notified = notify.notified();
@@ -2280,6 +2941,7 @@ impl Client {
                                 generation,
                                 format!("Required control response failed: {error}"),
                                 true,
+                                Some(&|_| !cancel.is_cancelled()),
                             );
                         }
                         return;
@@ -2384,12 +3046,11 @@ impl Client {
     pub fn set_ios_transport_resources(&self, resources: IosTransportResources) -> Result<()> {
         resources.validate()?;
         let mut inner = self.inner.lock().unwrap();
-        if !inner.state.profile.platform.is_ios() {
-            return Err(Error::Unsupported(
-                "iOS transport resources require an iPhone or iPad client".into(),
-            ));
-        }
-        inner.ios_transport = Some(resources);
+        let ios = inner.ios_mut().ok_or_else(|| {
+            Error::Unsupported("iOS transport resources require an iPhone or iPad client".into())
+        })?;
+        ios.transport = resources;
+        self.start_ios_probe_worker(&mut inner);
         Ok(())
     }
     pub fn take_signing_token_error(&self) -> Option<::signing::token::TokenError> {
@@ -2477,6 +3138,176 @@ impl ServiceClient for Client {
 #[cfg(test)]
 #[path = "client_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+
+    #[test]
+    fn desktop_defaults_only_initialize_linux_resources() {
+        let store = Keystore::default();
+        let client = Client::new(ClientConfig::default(), store.clone()).unwrap();
+        let inner = client.inner.lock().unwrap();
+        assert!(inner.ios().is_none());
+        assert!(inner.linux_o3().is_some());
+        let Some(PlatformConfig::Linux(config)) = &client.config.platform else {
+            panic!()
+        };
+        assert!(!config.machine_id.is_empty());
+        assert!(!config.application_uuid.is_empty());
+        assert_eq!(
+            inner.state.linux_machine_id(),
+            Some(config.machine_id.as_str())
+        );
+        assert!(inner.state.keystore.ios_virtual_state == store.ios_virtual_state);
+        assert_eq!(inner.state.keystore.ios_msf_imei, store.ios_msf_imei);
+    }
+
+    #[test]
+    fn platform_resources_must_match_profile() {
+        for profile in [Profile::iphone(), Profile::ipad()] {
+            assert!(
+                Client::new(
+                    ClientConfig {
+                        profile: profile.clone(),
+                        ..Default::default()
+                    },
+                    Keystore::default()
+                )
+                .is_err()
+            );
+            assert!(
+                Client::new(
+                    ClientConfig {
+                        profile: profile.clone(),
+                        platform: Some(PlatformConfig::Linux(LinuxConfig::default())),
+                        ..Default::default()
+                    },
+                    Keystore::default()
+                )
+                .is_err()
+            );
+            let mut snapshot = ios_signing_tests::config(profile);
+            snapshot.profile = Profile::linux();
+            assert!(Client::new(snapshot, Keystore::default()).is_err());
+        }
+        assert!(
+            Client::new(
+                ClientConfig {
+                    platform: Some(PlatformConfig::Ios(IosConfig::Virtual(Arc::new(
+                        crate::ios_device::IosVirtualConfig::default(),
+                    )))),
+                    ..Default::default()
+                },
+                Keystore::default()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn ios_sources_own_runtime_and_session_identity() {
+        for profile in [Profile::iphone(), Profile::ipad()] {
+            let store = Keystore {
+                device_name: "snapshot-device".into(),
+                ..Default::default()
+            };
+            let client = Client::new(ios_signing_tests::config(profile.clone()), store).unwrap();
+            let inner = client.inner.lock().unwrap();
+            assert!(inner.linux_o3().is_none());
+            assert!(inner.state.linux_machine_id().is_none());
+            assert_eq!(inner.state.device_name(), "snapshot-device");
+            assert!(inner.ios().unwrap().network.is_none());
+            assert!(inner.ios().unwrap().heartbeat_source.is_none());
+            drop(inner);
+            let model = Arc::new(crate::ios_device::IosVirtualConfig::default());
+            let client = Client::new(
+                ClientConfig {
+                    profile: profile.clone(),
+                    platform: Some(PlatformConfig::Ios(IosConfig::Virtual(model.clone()))),
+                    ..Default::default()
+                },
+                Keystore {
+                    device_name: "desktop-name".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let inner = client.inner.lock().unwrap();
+            assert!(inner.linux_o3().is_none());
+            assert!(inner.state.linux_machine_id().is_none());
+            assert_eq!(
+                inner.state.device_name(),
+                model.device_name(profile.platform)
+            );
+            assert_eq!(inner.state.keystore.device_name, "desktop-name");
+            assert!(inner.ios().unwrap().network.is_some());
+            assert!(inner.ios().unwrap().heartbeat_source.is_some());
+            assert!(inner.signer.has_ios_virtual_device());
+        }
+    }
+
+    #[tokio::test]
+    async fn state_replacement_cannot_change_runtime_branch() {
+        let linux = Client::new(ClientConfig::default(), Keystore::default()).unwrap();
+        let ios = Client::new(
+            ios_signing_tests::config(Profile::ipad()),
+            Keystore::default(),
+        )
+        .unwrap();
+        let linux_state = linux.snapshot().await;
+        let ios_state = ios.snapshot().await;
+        linux.replace_state(ios_state.clone()).await;
+        ios.replace_state(linux_state.clone()).await;
+        assert_eq!(linux.snapshot().await.platform, linux_state.platform);
+        assert_eq!(ios.snapshot().await.platform, ios_state.platform);
+        let mut invalid = ios_state.clone();
+        invalid.profile = Profile::linux();
+        ios.replace_state(invalid).await;
+        assert_eq!(ios.snapshot().await.profile, ios_state.profile);
+    }
+
+    #[test]
+    fn ios_maintenance_rejects_changed_device_or_name() {
+        let client = Client::new(
+            ios_signing_tests::config(Profile::ipad()),
+            Keystore::default(),
+        )
+        .unwrap();
+        let (sender, _receiver) = mpsc::channel(1);
+        let original = {
+            let mut inner = client.inner.lock().unwrap();
+            inner.generation = 7;
+            inner.connection = Some(Connection {
+                generation: 7,
+                sender,
+            });
+            inner.state.keystore.uin = 42;
+            inner.state.online = true;
+            inner.state.clone()
+        };
+        for change_device in [false, true] {
+            let mut updated = original.clone();
+            let PlatformState::Ios {
+                device,
+                device_name,
+            } = &mut updated.platform
+            else {
+                panic!()
+            };
+            if change_device {
+                Arc::make_mut(device).hardware_model.push_str("-changed");
+            } else {
+                *device_name = format!("{device_name}-changed").into();
+            }
+            assert!(
+                client
+                    .commit_nt_maintenance_state(7, &original.keystore, updated)
+                    .is_err()
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod ticket_refresh_tests {
@@ -2637,7 +3468,10 @@ mod ticket_refresh_tests {
                 .is_err()
         );
         let mut wrong_machine = updated.clone();
-        wrong_machine.machine_id.push_str("-changed");
+        let PlatformState::Linux { machine_id } = &mut wrong_machine.platform else {
+            panic!()
+        };
+        machine_id.push_str("-changed");
         assert!(
             client
                 .commit_nt_maintenance_state(7, &updated.keystore, wrong_machine)

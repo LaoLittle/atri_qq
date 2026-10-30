@@ -12,7 +12,8 @@ use atri_qq_api::sdk_share::SDK_SHARE_SERVICE;
 use atri_qq_api::signing::{SIGNING_METHODS, SIGNING_SERVICE};
 use atri_qq_api::{CONTACTS_SERVICE, FRIENDS_METHOD, FriendInfo, FriendsResponse};
 use atri_qq_protocol::{
-    Client, Error, LoginChallenge, LoginEvent, ServiceClient,
+    Client, Error, IosDeviceVerificationResult, IosLoginSecurityAction, LoginChallenge, LoginEvent,
+    ServiceClient,
     admin::{ADMIN_METHODS, Admin},
     contacts::{CONTACT_METHODS, Operations},
     guild::{GUILD_METHODS, Guild},
@@ -113,6 +114,8 @@ impl Extension for QQExtension {
                     "status",
                     "login",
                     "submit_captcha",
+                    "submit_device_verification",
+                    "submit_security_action",
                     "refresh_tickets",
                     "logout",
                 ],
@@ -145,16 +148,26 @@ impl Extension for QQExtension {
         let config = config::Config::load(&ctx).await?;
         let client_config = config.client_config(&ctx).await?;
         let keystore = config.keystore(&ctx).await?;
-        let persist_virtual_device = client_config.ios_virtual.is_some();
+        let persist_virtual_device = client_config.ios_virtual().is_some();
         let client = Client::new(client_config, keystore).map_err(protocol_error)?;
         if persist_virtual_device {
-            ctx.storage().write("data", "keystore.cbor", &encode(&client.snapshot().await.keystore)?).await?;
+            ctx.storage()
+                .write(
+                    "data",
+                    "keystore.cbor",
+                    &encode(&client.snapshot().await.keystore)?,
+                )
+                .await?;
         }
-        if !config.platform.is_ios() {
-            signing::apply_initial(&client, config.signing.unwrap_or_default())?;
-        }
-        if let Some(heartbeat) = config.ios.as_ref().and_then(|mobile| mobile.heartbeat_snapshot()) {
-            signing::apply_ios_heartbeat(&client, heartbeat)?;
+        match config.platform {
+            config::PlatformConfig::Linux(linux) => {
+                signing::apply_initial(&client, linux.signing.unwrap_or_default())?;
+            }
+            config::PlatformConfig::IPhone { ios } | config::PlatformConfig::IPad { ios } => {
+                if let Some(heartbeat) = ios.heartbeat_snapshot() {
+                    signing::apply_ios_heartbeat(&client, heartbeat)?;
+                }
+            }
         }
         let transport: Arc<dyn ServiceClient> = client.clone();
         let operations = Arc::new(Operations::new(transport.clone()));
@@ -220,6 +233,19 @@ impl Extension for QQExtension {
                         let (title, url) = match challenge {
                             LoginChallenge::Captcha { url } => ("QQ captcha — submit ticket/random through qq.login/submit_captcha", url),
                             LoginChallenge::NewDevice { url } => ("QQ new-device confirmation — complete verification in your browser", url),
+                            LoginChallenge::IosDeviceVerification { url } => ("QQ iOS device verification — submit the webpage's real ntVerifySig as signature_hex and its authType as authentication_type through qq.login/submit_device_verification", url),
+                            LoginChallenge::IosSecurity(challenge) => {
+                                event_ctx.interaction(InteractionRequest {
+                                    kind: "qq.login.security".into(),
+                                    title: challenge.title.clone().filter(|title| !title.is_empty()).unwrap_or_else(|| "QQ iOS security notice".into()),
+                                    content: format!(
+                                        "{challenge:#?}\nqq.login/submit_security_action arguments:\n{{\"action\":\"continue\",\"button_index\":<original button index>}}\n{{\"action\":\"web_verified\",\"button_index\":<original button index or null for head.jump_url>,\"authentication_type\":<actual webpage authType>}}\n{{\"action\":\"cancel\"}}\nOnly native://continue_login supports Continue. WebVerified requires a server HTTP(S) URL and the webpage's real nonzero authType. Native SMS/phone actions are unsupported. Actions require an active password challenge; Easy notices do not resume login."
+                                    ),
+                                    account: current_account.clone(),
+                                    secret: true,
+                                }).await?;
+                                continue;
+                            }
                         };
                         event_ctx.interaction(InteractionRequest {
                             kind: "url".into(), title: title.into(),
@@ -355,6 +381,40 @@ impl Extension for QQExtension {
                     services
                         .client
                         .submit_captcha(args.ticket, args.random)
+                        .await
+                        .map_err(protocol_error)?;
+                    Ok(Value::Null)
+                }
+                "submit_device_verification" => {
+                    #[derive(Deserialize)]
+                    struct DeviceVerification {
+                        #[serde(default)]
+                        signature_hex: String,
+                        #[serde(default)]
+                        authentication_type: u32,
+                    }
+                    let args: DeviceVerification = from_value(&call.args)?;
+                    let signature = hex::decode(&args.signature_hex).map_err(|_| {
+                        ApiError::new(
+                            "invalid_argument",
+                            "signature_hex must contain hexadecimal bytes",
+                        )
+                    })?;
+                    services
+                        .client
+                        .submit_device_verification(IosDeviceVerificationResult {
+                            signature: signature.into(),
+                            authentication_type: args.authentication_type,
+                        })
+                        .await
+                        .map_err(protocol_error)?;
+                    Ok(Value::Null)
+                }
+                "submit_security_action" => {
+                    let action: IosLoginSecurityAction = from_value(&call.args)?;
+                    services
+                        .client
+                        .submit_security_action(action)
                         .await
                         .map_err(protocol_error)?;
                     Ok(Value::Null)

@@ -206,7 +206,14 @@ impl Heartbeat {
         Ok(pb::HeartbeatHeader {
             field1: 1,
             account: state.keystore.uin.to_string().into_bytes().into(),
-            machine_id: Bytes::copy_from_slice(state.machine_id.as_bytes()),
+            machine_id: Bytes::copy_from_slice(
+                state
+                    .linux_machine_id()
+                    .ok_or_else(|| {
+                        Error::Malformed("O3 heartbeat requires Linux platform state".into())
+                    })?
+                    .as_bytes(),
+            ),
             identifier: self.identifier.clone().ok_or_else(|| {
                 Error::Authentication("O3 heartbeat identifier unavailable".into())
             })?,
@@ -383,7 +390,9 @@ mod tests {
                 uin: 1234,
                 ..Default::default()
             },
-            machine_id: "offline-o3-device".into(),
+            platform: crate::models::PlatformState::Linux {
+                machine_id: "offline-o3-device".into(),
+            },
             online: true,
         }
     }

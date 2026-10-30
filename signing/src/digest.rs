@@ -1,3 +1,4 @@
+use base64::{Engine, engine::general_purpose::STANDARD};
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use md5::{Digest, Md5};
 use rand_chacha::ChaCha12Rng;
@@ -14,6 +15,15 @@ pub(crate) fn md5_parts(parts: &[&[u8]]) -> [u8; 16] {
         digest.update(part);
     }
     digest.finalize().into()
+}
+
+pub fn derive_xwid(raw_xwid: &[u8]) -> [u8; 12] {
+    let digest = md5(raw_xwid);
+    let mut output = [0; 12];
+    STANDARD
+        .encode_slice(&digest[..9], &mut output)
+        .expect("nine input bytes encode to exactly twelve Base64 bytes");
+    output
 }
 
 pub(crate) fn prepare_sign(input_digest: &[u8; 16], clock_nanoseconds: i64) -> [u8; 21] {
@@ -87,4 +97,15 @@ fn chacha20_xor(key: &[u8; 32], nonce: u64, bytes: &mut [u8]) {
 
 fn crc32(bytes: &[u8]) -> u32 {
     crc32fast::hash(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derivative_uses_first_nine_digest_bytes_and_standard_base64() {
+        assert_eq!(&derive_xwid(b"abc"), b"kAFQmDzST7DW");
+        assert_eq!(&derive_xwid(b""), b"1B2M2Y8AsgTp");
+    }
 }

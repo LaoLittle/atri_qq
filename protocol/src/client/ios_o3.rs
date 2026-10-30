@@ -11,7 +11,7 @@ pub(super) struct Binding {
 
 impl Binding {
     fn capture(inner: &Inner) -> Result<Self> {
-        if !inner.state.profile.platform.is_ios() {
+        if inner.ios().is_none() {
             return Err(Error::Unsupported(
                 "Mobile O3 requires an iPhone or iPad client".into(),
             ));
@@ -32,7 +32,7 @@ impl Binding {
         !self.cancel.is_cancelled()
             && !inner.cancel.is_cancelled()
             && inner.connection.is_some()
-            && inner.state.profile.platform.is_ios()
+            && inner.ios().is_some()
             && inner.generation == self.generation
             && inner.signer.generation() == self.signing_generation
             && inner.state.keystore.uin == self.account
@@ -59,11 +59,18 @@ impl Client {
                 let Some(client) = weak.upgrade() else { return };
                 let requests = {
                     let mut inner = client.inner.lock().unwrap();
-                    if inner.generation != generation || inner.connection.is_none() || cancel.is_cancelled() {
+                    if inner.generation != generation
+                        || inner.connection.is_none()
+                        || cancel.is_cancelled()
+                    {
                         return;
                     }
-                    let Inner { state, signer, .. } = &mut *inner;
-                    signer.drain_ios_token_requests(state)
+                    if inner.ios().is_some_and(|ios| ios.response.reconnecting) {
+                        Vec::new()
+                    } else {
+                        let Inner { state, signer, .. } = &mut *inner;
+                        signer.drain_ios_token_requests(state)
+                    }
                 };
                 for request in requests {
                     let binding = {
@@ -71,7 +78,9 @@ impl Client {
                         if inner.signer.generation() != request.generation {
                             continue;
                         }
-                        let Ok(binding) = Binding::capture(&inner) else { continue };
+                        let Ok(binding) = Binding::capture(&inner) else {
+                            continue;
+                        };
                         binding
                     };
                     let weak = weak.clone();
@@ -113,7 +122,9 @@ impl Client {
                 return Err(Error::Disconnected);
             }
             inner
-                .ios_o3
+                .ios_mut()
+                .unwrap()
+                .channel
                 .get_or_insert_with(|| Channel::new(CheckMode::Sdk))
                 .prepare(method, body)?
         };
@@ -133,7 +144,7 @@ impl Client {
         if !binding.is_current(&inner) {
             return Err(Error::Disconnected);
         }
-        let channel = inner.ios_o3.as_mut().unwrap();
+        let channel = inner.ios_mut().unwrap().channel.as_mut().unwrap();
         let result = channel.complete(request, response);
         let update = channel.take_switch_update();
         if let Some(update) = &update {

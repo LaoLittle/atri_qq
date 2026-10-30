@@ -244,7 +244,10 @@ pub struct IosRegistration {
 }
 
 #[derive(Clone)]
-pub struct IosReservedTemplate(Bytes);
+pub struct IosReservedTemplate {
+    bytes: Bytes,
+    has_qimei: bool,
+}
 
 impl IosReservedTemplate {
     pub fn new(bytes: Bytes) -> crate::Result<Self> {
@@ -257,11 +260,21 @@ impl IosReservedTemplate {
                 "iOS reserved template must not contain dynamic trace, UID or secure info".into(),
             ));
         }
-        Ok(Self(bytes))
+        Ok(Self {
+            bytes,
+            has_qimei: reserved
+                .qimei
+                .as_ref()
+                .is_some_and(|value| !value.is_empty()),
+        })
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        &self.bytes
+    }
+
+    pub(crate) fn has_qimei(&self) -> bool {
+        self.has_qimei
     }
 }
 
@@ -311,15 +324,44 @@ impl IosTransportResources {
 }
 
 #[derive(Clone)]
-pub struct ClientConfig {
-    pub profile: Profile,
-    pub ios_device: Option<IosDevice>,
-    pub ios_virtual: Option<std::sync::Arc<crate::ios_device::IosVirtualConfig>>,
-    pub ios_signing: Option<crate::signing::IosSigningResources>,
-    pub ios_registration: Option<IosRegistration>,
-    pub ios_transport: Option<IosTransportResources>,
+pub struct LinuxConfig {
     pub machine_id: String,
     pub application_uuid: String,
+}
+
+impl Default for LinuxConfig {
+    fn default() -> Self {
+        Self {
+            machine_id: hex::encode(random_bytes(16)),
+            application_uuid: crate::o3::generate_application_uuid(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct IosSnapshotConfig {
+    pub device: IosDevice,
+    pub signing: crate::signing::IosSigningResources,
+    pub transport: IosTransportResources,
+    pub registration: IosRegistration,
+}
+
+#[derive(Clone)]
+pub enum IosConfig {
+    Virtual(std::sync::Arc<crate::ios_device::IosVirtualConfig>),
+    Snapshot(IosSnapshotConfig),
+}
+
+#[derive(Clone)]
+pub enum PlatformConfig {
+    Linux(LinuxConfig),
+    Ios(IosConfig),
+}
+
+#[derive(Clone)]
+pub struct ClientConfig {
+    pub profile: Profile,
+    pub platform: Option<PlatformConfig>,
     pub host: String,
     pub port: u16,
     pub server_selection: crate::network::ServerSelection,
@@ -332,28 +374,14 @@ impl std::fmt::Debug for ClientConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClientConfig")
             .field("profile", &self.profile)
-            .field("ios_device", &self.ios_device)
             .field(
-                "ios_virtual",
-                &self
-                    .ios_virtual
-                    .as_ref()
-                    .map(|_| "<explicit virtual device>"),
+                "platform",
+                &self.platform.as_ref().map(|platform| match platform {
+                    PlatformConfig::Linux(_) => "Linux",
+                    PlatformConfig::Ios(IosConfig::Virtual(_)) => "Ios::Virtual",
+                    PlatformConfig::Ios(IosConfig::Snapshot(_)) => "Ios::Snapshot",
+                }),
             )
-            .field(
-                "ios_signing",
-                &self.ios_signing.as_ref().map(|_| "<redacted>"),
-            )
-            .field(
-                "ios_registration",
-                &self.ios_registration.as_ref().map(|_| "<redacted>"),
-            )
-            .field(
-                "ios_transport",
-                &self.ios_transport.as_ref().map(|_| "<redacted>"),
-            )
-            .field("machine_id", &self.machine_id)
-            .field("application_uuid", &"<redacted>")
             .field("host", &self.host)
             .field("port", &self.port)
             .field("server_selection", &self.server_selection)
@@ -371,13 +399,7 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             profile: Profile::linux(),
-            ios_device: None,
-            ios_virtual: None,
-            ios_signing: None,
-            ios_registration: None,
-            ios_transport: None,
-            machine_id: hex::encode(random_bytes(16)),
-            application_uuid: crate::o3::generate_application_uuid(),
+            platform: None,
             host: "msfwifi.3g.qq.com".into(),
             port: 8080,
             server_selection: crate::network::ServerSelection::default(),
@@ -385,6 +407,36 @@ impl Default for ClientConfig {
             uin: 0,
             password: None,
             randomize_signature_for_testing: false,
+        }
+    }
+}
+
+impl ClientConfig {
+    pub fn ios(&self) -> Option<&IosConfig> {
+        match self.platform.as_ref()? {
+            PlatformConfig::Ios(config) => Some(config),
+            PlatformConfig::Linux(_) => None,
+        }
+    }
+
+    pub fn ios_virtual(&self) -> Option<&std::sync::Arc<crate::ios_device::IosVirtualConfig>> {
+        match self.ios()? {
+            IosConfig::Virtual(model) => Some(model),
+            IosConfig::Snapshot(_) => None,
+        }
+    }
+
+    pub fn ios_snapshot(&self) -> Option<&IosSnapshotConfig> {
+        match self.ios()? {
+            IosConfig::Snapshot(resources) => Some(resources),
+            IosConfig::Virtual(_) => None,
+        }
+    }
+
+    pub fn ios_snapshot_mut(&mut self) -> Option<&mut IosSnapshotConfig> {
+        match self.platform.as_mut()? {
+            PlatformConfig::Ios(IosConfig::Snapshot(resources)) => Some(resources),
+            _ => None,
         }
     }
 }
@@ -508,6 +560,8 @@ pub struct Keystore {
     pub guid: Vec<u8>,
     pub ios_msf_imei: String,
     pub ios_virtual_state: Option<crate::ios_device::IosVirtualState>,
+    #[serde(default)]
+    pub ios_server_lists: crate::network::ios_discovery::ServerListCaches,
     pub device_name: String,
     pub android_id: String,
     pub qimei: String,
@@ -619,6 +673,7 @@ impl Default for Keystore {
             guid: random_bytes(16),
             ios_msf_imei: String::new(),
             ios_virtual_state: None,
+            ios_server_lists: Default::default(),
             device_name: default_device_name(),
             android_id: hex::encode(random_bytes(8)),
             qimei: String::new(),
@@ -654,12 +709,39 @@ impl Default for Keystore {
         }
     }
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlatformState {
+    Linux {
+        machine_id: String,
+    },
+    Ios {
+        device: std::sync::Arc<IosDevice>,
+        device_name: std::sync::Arc<str>,
+    },
+}
+
 #[derive(Clone)]
 pub struct SessionState {
     pub profile: Profile,
     pub keystore: Keystore,
-    pub machine_id: String,
+    pub platform: PlatformState,
     pub online: bool,
+}
+
+impl SessionState {
+    pub fn linux_machine_id(&self) -> Option<&str> {
+        match &self.platform {
+            PlatformState::Linux { machine_id } => Some(machine_id),
+            PlatformState::Ios { .. } => None,
+        }
+    }
+
+    pub fn device_name(&self) -> &str {
+        match &self.platform {
+            PlatformState::Linux { .. } => &self.keystore.device_name,
+            PlatformState::Ios { device_name, .. } => device_name,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -739,10 +821,128 @@ impl TryFrom<u8> for QrState {
         })
     }
 }
+#[derive(Clone)]
+pub struct IosDeviceVerificationResult {
+    pub signature: Bytes,
+    pub authentication_type: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IosLoginSecurityButton {
+    pub wording: Option<String>,
+    pub url: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IosLoginSecurityNewDevice {
+    pub value: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IosLoginSecurityText {
+    pub value: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IosLoginSecurityForbidden {
+    pub area: Option<i32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IosLoginSecurityDetail {
+    pub need_new_device: Option<IosLoginSecurityNewDevice>,
+    pub unregistered: Option<IosLoginSecurityText>,
+    pub forbidden: Option<IosLoginSecurityForbidden>,
+    pub nice_account_expired: Option<IosLoginSecurityText>,
+    pub sms_check: Option<IosLoginSecurityText>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IosLoginSecurityChallenge {
+    pub code: Option<u64>,
+    pub title: Option<String>,
+    pub message: Option<String>,
+    pub jump_word: Option<String>,
+    pub jump_url: Option<String>,
+    pub detail: Option<IosLoginSecurityDetail>,
+    pub buttons: Vec<IosLoginSecurityButton>,
+    pub unknown8: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum IosLoginSecurityAction {
+    Continue {
+        button_index: usize,
+    },
+    WebVerified {
+        button_index: Option<usize>,
+        authentication_type: u32,
+    },
+    Cancel,
+}
+
+impl IosLoginSecurityChallenge {
+    fn action_url(&self, button_index: Option<usize>) -> crate::Result<&str> {
+        let url = match button_index {
+            Some(index) => self
+                .buttons
+                .get(index)
+                .ok_or_else(|| {
+                    crate::Error::Authentication("Security button index is out of range".into())
+                })?
+                .url
+                .as_deref(),
+            None => self.jump_url.as_deref(),
+        };
+        url.filter(|url| !url.is_empty())
+            .ok_or_else(|| crate::Error::Authentication("Security target URL is empty".into()))
+    }
+
+    fn web_target(url: &str) -> bool {
+        reqwest::Url::parse(url)
+            .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+    }
+
+    pub(crate) fn can_continue(&self) -> bool {
+        self.buttons.iter().any(|button| {
+            button
+                .url
+                .as_deref()
+                .is_some_and(|url| url == "native://continue_login" || Self::web_target(url))
+        }) || self.jump_url.as_deref().is_some_and(Self::web_target)
+    }
+
+    pub(crate) fn validate_action(&self, action: &IosLoginSecurityAction) -> crate::Result<()> {
+        let url = match action {
+            IosLoginSecurityAction::Cancel => return Ok(()),
+            IosLoginSecurityAction::Continue { button_index } => {
+                self.action_url(Some(*button_index))?
+            }
+            IosLoginSecurityAction::WebVerified { button_index, .. } => {
+                self.action_url(*button_index)?
+            }
+        };
+        if matches!(url, "native://sms_login" | "native://phone_login") {
+            return Err(crate::Error::Unsupported(
+                "Native iOS SMS/phone security login is not implemented".into(),
+            ));
+        }
+        match action {
+            IosLoginSecurityAction::Continue { .. } if url == "native://continue_login" => Ok(()),
+            IosLoginSecurityAction::WebVerified { authentication_type, .. }
+                if *authentication_type != 0 && Self::web_target(url) => Ok(()),
+            _ => Err(crate::Error::Authentication("Security action does not match an executable server target or has zero authentication_type".into())),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum LoginChallenge {
     Captcha { url: String },
     NewDevice { url: String },
+    IosDeviceVerification { url: String },
+    IosSecurity(IosLoginSecurityChallenge),
 }
 #[derive(Clone)]
 pub enum LoginEvent {

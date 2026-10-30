@@ -348,7 +348,9 @@ mod tests {
             SessionState {
                 profile: Default::default(),
                 keystore: Default::default(),
-                machine_id: "guild-query-test".into(),
+                platform: crate::models::PlatformState::Linux {
+                    machine_id: "guild-query-test".into(),
+                },
                 online: true,
             }
         }

@@ -1,7 +1,7 @@
 use super::{CheckMode, EstablishRequest};
 use crate::{
     Error, Result,
-    o3::{ACCESS_COMMAND, ESTABLISH_COMMAND, channel::merge_bytes, crypto},
+    o3::{ACCESS_COMMAND, ESTABLISH_COMMAND, crypto, encode_access, merge_bytes},
     proto::o3 as pb,
 };
 use bytes::Bytes;
@@ -181,14 +181,7 @@ impl Channel {
         let method = Bytes::copy_from_slice(method.as_bytes());
         let uuid = Bytes::copy_from_slice(&material.uuid);
         let (mode, body) = if current.authenticated {
-            let encrypted_body = crypto::seal(&material.key, &body)?;
-            let encoded = pb::SecureAccessRequest {
-                method: method.clone(),
-                encrypted_body,
-                channel_uuid: uuid,
-            }
-            .encode_to_vec()
-            .into();
+            let encoded = encode_access(&material.key, method.clone(), uuid, &body)?;
             (Mode::Access, encoded)
         } else {
             let plaintext = pb::ChannelPlaintext {

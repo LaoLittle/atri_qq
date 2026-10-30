@@ -11,7 +11,7 @@ use bytes::Bytes;
 use prost::Message;
 use serde::Deserialize;
 use std::{
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::oneshot;
@@ -23,43 +23,48 @@ use nt::{NtLogin, NtResponseKind, NtResult};
 mod risk_tests;
 use wt::{Tlv, WtLogin};
 
+enum PlatformLoginCodecs {
+    Linux(WtLogin),
+    Ios,
+}
+
 pub(crate) struct LoginCodecs {
-    wt: WtLogin,
+    platform: PlatformLoginCodecs,
     nt: NtLogin,
     registered_session: bool,
 }
+
 impl LoginCodecs {
     #[cfg(test)]
     fn new() -> Result<Self> {
+        Self::for_config(&ClientConfig::default())
+    }
+
+    fn for_config(config: &ClientConfig) -> Result<Self> {
+        let ios = config.profile.platform.is_ios();
+        if ios != config.ios().is_some() {
+            return Err(Error::Authentication(
+                "Login profile and platform resources do not match".into(),
+            ));
+        }
         Ok(Self {
-            wt: WtLogin::new()?,
+            platform: if ios {
+                PlatformLoginCodecs::Ios
+            } else {
+                PlatformLoginCodecs::Linux(WtLogin::new()?)
+            },
             nt: NtLogin::new()?,
             registered_session: false,
         })
     }
-    fn for_config(config: &ClientConfig) -> Result<Self> {
-        if config.profile.platform.is_ios() {
-            config
-                .ios_device
-                .as_ref()
-                .ok_or_else(|| {
-                    Error::Authentication("iOS login requires actual IosDevice resources".into())
-                })?
-                .validate()?;
+
+    fn wt(&mut self) -> Result<&mut WtLogin> {
+        match &mut self.platform {
+            PlatformLoginCodecs::Linux(codec) => Ok(codec),
+            PlatformLoginCodecs::Ios => Err(Error::Unsupported(
+                "Desktop WT login is unavailable for iOS".into(),
+            )),
         }
-        let nt = if let Some(model) = &config.ios_virtual {
-            NtLogin::with_device_name(
-                config.ios_device.clone(),
-                Some(model.device_name(config.profile.platform).to_owned()),
-            )?
-        } else {
-            NtLogin::with_device(config.ios_device.clone())?
-        };
-        Ok(Self {
-            wt: WtLogin::new()?,
-            nt,
-            registered_session: false,
-        })
     }
 }
 pub(super) fn unix_seconds() -> u32 {
@@ -74,8 +79,7 @@ struct LoginGuard<'a> {
 impl Drop for LoginGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            self.client
-                .terminate("Login canceled or failed".into())
+            self.client.terminate("Login canceled or failed".into())
         }
     }
 }
@@ -94,8 +98,7 @@ pub(crate) async fn login(client: &Arc<Client>) -> Result<UserInfo> {
             &state,
             false,
             &client.config,
-            SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| malformed("iOS registration clock precedes Unix epoch"))?.as_secs(),
-            client.ios_background_since(),
+            client.ios_registration_context()?,
         )?;
         if state.keystore.a1.is_empty()
             && client.config.password.as_deref().is_none_or(str::is_empty)
@@ -112,7 +115,9 @@ pub(crate) async fn login(client: &Arc<Client>) -> Result<UserInfo> {
     client.connect().await?;
     client.begin_signing_login()?;
     client.start_alive();
-    if let Err(error) = client.correct_time().await {
+    if state.profile.platform.is_ios() {
+        client.start_ios_correct_time();
+    } else if let Err(error) = client.correct_time().await {
         tracing::warn!(target: "atri_qq_protocol::login", %error, "Server clock correction unavailable");
     }
     let mut codecs = client.codecs.lock().await;
@@ -157,13 +162,25 @@ async fn run_login(client: &Arc<Client>, codecs: &mut LoginCodecs) -> Result<()>
             "SsoNTLoginEasyLogin",
             &auth::NtLoginBody {
                 a1: Some(original_a1.clone()),
-                captcha: None,
+                ..Default::default()
             },
             NtResponseKind::Easy,
         )
         .await?;
         if result.code == 0 {
             return require_online(client).await;
+        }
+        if state.profile.platform.is_ios() {
+            if result.code == 140022011 {
+                client.emit(LoginEvent::Challenge(result.security_challenge()));
+                return Err(ios_easy_security_unsupported(&result));
+            }
+            if client.config.password.as_deref().is_none_or(str::is_empty) {
+                return Err(Error::Unsupported(format!(
+                    "iOS native A1 login was rejected (stage=easy, code={}); no password is configured and native local QR login is not established",
+                    result.code,
+                )));
+            }
         }
         tracing::info!(target: "atri_qq_protocol::login",
             stage = "easy", code = result.code,
@@ -558,11 +575,11 @@ async fn qr_login(client: &Client, codecs: &mut LoginCodecs, mode: QrLoginMode) 
         QrLoginMode::Normal => None,
         QrLoginMode::Verification { signature, .. } => Some(signature.as_ref()),
     };
-    let request = codecs.wt.qr(0x31, unusual, &state)?;
+    let request = codecs.wt()?.qr(0x31, unusual, &state)?;
     let response = client
         .call("wtlogin.trans_emp", request, Encryption::Empty)
         .await?;
-    let (command, decoded) = codecs.wt.decode_qr(response, &state.keystore)?;
+    let (command, decoded) = codecs.wt()?.decode_qr(response, &state.keystore)?;
     if command != 0x31 {
         return Err(malformed("QR acquisition command mismatch"));
     }
@@ -596,11 +613,11 @@ async fn qr_login(client: &Client, codecs: &mut LoginCodecs, mode: QrLoginMode) 
     });
     loop {
         state = client.snapshot().await;
-        let query = codecs.wt.qr(0x12, None, &state)?;
+        let query = codecs.wt()?.qr(0x12, None, &state)?;
         let response = client
             .call("wtlogin.trans_emp", query, Encryption::Empty)
             .await?;
-        let (command, decoded) = codecs.wt.decode_qr(response, &state.keystore)?;
+        let (command, decoded) = codecs.wt()?.decode_qr(response, &state.keystore)?;
         if command != 0x12 {
             return Err(malformed("QR query command mismatch"));
         }
@@ -624,7 +641,7 @@ async fn qr_login(client: &Client, codecs: &mut LoginCodecs, mode: QrLoginMode) 
                         state.keystore.no_pic_sig = no_pic_sig.to_vec();
                         state.keystore.a1 = a1.to_vec();
                         client.replace_state(state).await;
-                        wt_login(client, &mut codecs.wt).await?;
+                        wt_login(client, codecs.wt()?).await?;
                     }
                     QrConfirmation::Verification {
                         kind,
@@ -697,6 +714,62 @@ async fn wt_login(client: &Client, codec: &mut WtLogin) -> Result<()> {
     client.mark_signing_ticket_complete()?;
     Ok(())
 }
+enum PasswordVerification {
+    Captcha(auth::NtCaptcha),
+    Device(IosDeviceVerificationResult),
+}
+
+struct LoginChallengeWait<'a, T>(&'a Mutex<Option<T>>);
+
+impl<T> Drop for LoginChallengeWait<'_, T> {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().take();
+    }
+}
+
+async fn wait_for_login_challenge<T>(
+    client: &Client,
+    pending: &Mutex<Option<oneshot::Sender<T>>>,
+    challenge: LoginChallenge,
+) -> Result<T> {
+    let cancel = client.cancellation();
+    let (tx, rx) = oneshot::channel();
+    *pending.lock().unwrap() = Some(tx);
+    let _wait = LoginChallengeWait(pending);
+    client.emit(LoginEvent::Challenge(challenge));
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(Error::Disconnected),
+        answer = rx => answer.map_err(|_| Error::Disconnected),
+    }
+}
+async fn wait_for_security_challenge(
+    client: &Client,
+    result: &NtResult,
+) -> Result<IosLoginSecurityAction> {
+    let cancel = client.cancellation();
+    let (tx, rx) = oneshot::channel();
+    *client.security.lock().unwrap() = Some(crate::client::PendingSecurity {
+        challenge: result.security.clone(),
+        reply: tx,
+    });
+    let _wait = LoginChallengeWait(&client.security);
+    client.emit(LoginEvent::Challenge(result.security_challenge()));
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(Error::Disconnected),
+        answer = rx => answer.map_err(|_| Error::Disconnected),
+    }
+}
+
+fn ios_easy_security_unsupported(result: &NtResult) -> Error {
+    Error::Unsupported(format!(
+        "iOS Easy security continuation callbacks are not established (stage=easy, code={}, jump_url_present={}); ordinary Password callbacks and desktop WT QR cannot be applied to Easy",
+        result.code,
+        !result.jump_url.is_empty(),
+    ))
+}
+
 async fn password_login(client: &Client, codecs: &mut LoginCodecs, password: &str) -> Result<()> {
     let mut state = client.snapshot().await;
     if client.config.uin > 0 {
@@ -710,18 +783,33 @@ async fn password_login(client: &Client, codecs: &mut LoginCodecs, password: &st
     state.keystore.login_cookie.clear();
     client.replace_state(state).await;
     let password_digest = crypto::md5(password.as_bytes());
-    let mut captcha: Option<(String, String, String)> = None;
+    let ios = client.config.profile.platform.is_ios();
+    let mut verification = None;
+    let mut need_remind_cancellated_status = true;
     loop {
-        let a1 = NtLogin::password_a1(&password_digest, &client.snapshot().await)?;
+        let device_retry = ios && matches!(&verification, Some(PasswordVerification::Device(_)));
+        let a1 = if device_retry {
+            Bytes::new()
+        } else {
+            NtLogin::password_a1(&password_digest, &client.snapshot().await)?
+        };
         let body = auth::NtLoginBody {
-            a1: Some(a1.clone()),
-            captcha: captcha
-                .as_ref()
-                .map(|(ticket, random, sid)| auth::NtCaptcha {
-                    ticket: Some(ticket.clone()),
-                    random: Some(random.clone()),
-                    sid: Some(sid.clone()),
-                }),
+            a1: (!device_retry).then(|| a1.clone()),
+            captcha: match &verification {
+                Some(PasswordVerification::Captcha(captcha)) => Some(captcha.clone()),
+                _ => None,
+            },
+            device_check_succeed_sig: match &verification {
+                Some(PasswordVerification::Device(result))
+                    if ios && !result.signature.is_empty() =>
+                {
+                    Some(result.signature.clone())
+                }
+                _ => None,
+            },
+            login_process: ios.then_some(auth::NtLoginProcess {
+                need_remind_cancellated_status: Some(need_remind_cancellated_status),
+            }),
         };
         let result = nt_call(
             client,
@@ -746,15 +834,51 @@ async fn password_login(client: &Client, codecs: &mut LoginCodecs, password: &st
                     .map(|(_, v)| v.into_owned())
                     .filter(|v| !v.is_empty())
                     .ok_or_else(|| malformed("Captcha URL has no SID"))?;
-                let (tx, rx) = oneshot::channel();
-                *client.captcha.lock().unwrap() = Some(tx);
-                client.emit(LoginEvent::Challenge(LoginChallenge::Captcha { url }));
-                let cancel = client.cancellation();
-                let (ticket, random) = tokio::select! {_ = cancel.cancelled()=>return Err(Error::Disconnected),answer=rx=>answer.map_err(|_|Error::Disconnected)?};
-                captcha = Some((ticket, random, sid));
+                let (ticket, random) = wait_for_login_challenge(
+                    client,
+                    &client.captcha,
+                    LoginChallenge::Captcha { url },
+                )
+                .await?;
+                verification = Some(PasswordVerification::Captcha(auth::NtCaptcha {
+                    ticket: Some(ticket.into()),
+                    random: Some(random.into()),
+                    sid: Some(sid.into()),
+                }));
+            }
+            140022010 if ios => {
+                if result.jump_url.is_empty() {
+                    return Err(malformed("iOS device verification URL missing"));
+                }
+                let verification_result = wait_for_login_challenge(
+                    client,
+                    &client.device_verification,
+                    LoginChallenge::IosDeviceVerification {
+                        url: result.jump_url,
+                    },
+                )
+                .await?;
+                verification = Some(PasswordVerification::Device(verification_result));
             }
             140022010 => return new_device_login(client, &mut codecs.nt, &result.jump_url).await,
             140022011 => {
+                if ios {
+                    if !result.security.can_continue() {
+                        client.emit(LoginEvent::Challenge(result.security_challenge()));
+                        return result.require_success();
+                    }
+                    match wait_for_security_challenge(client, &result).await? {
+                        IosLoginSecurityAction::Continue { .. } => {
+                            need_remind_cancellated_status = false;
+                        }
+                        IosLoginSecurityAction::WebVerified { .. } => {}
+                        IosLoginSecurityAction::Cancel => {
+                            return result.require_success();
+                        }
+                    }
+                    verification = None;
+                    continue;
+                }
                 let signature = result
                     .unusual_signature
                     .filter(|v| !v.is_empty())
@@ -811,38 +935,39 @@ pub(crate) fn registration_confirmed(response: &auth::InfoSyncResponse) -> bool 
         .and_then(|p| p.message.as_deref())
         == Some("register success")
 }
-#[cfg(test)]
-pub(crate) fn info_sync_for_config(
-    state: &SessionState,
-    reconnect: bool,
-    config: &ClientConfig,
-) -> Result<auth::InfoSyncRequest> {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| malformed("iOS registration clock precedes Unix epoch"))?.as_secs();
-    info_sync_for_config_at(state, reconnect, config, now, None)
-}
 
 pub(crate) fn info_sync_for_config_at(
     state: &SessionState,
     reconnect: bool,
     config: &ClientConfig,
-    now_seconds: u64,
-    background_since: Option<u64>,
+    context: crate::ios_device::registration::Context,
 ) -> Result<auth::InfoSyncRequest> {
-    if let Some(model) = &config.ios_virtual {
-        return crate::ios_device::registration::build(state, reconnect, model, now_seconds, background_since);
-    }
     if !state.profile.platform.is_ios() {
+        if !matches!(state.platform, PlatformState::Linux { .. }) || config.ios().is_some() {
+            return Err(malformed(
+                "Desktop registration requires Linux platform resources",
+            ));
+        }
         return Ok(info_sync(state, reconnect));
     }
-    let device = config.ios_device.as_ref().ok_or_else(|| {
-        Error::Authentication("iOS registration requires actual IosDevice resources".into())
-    })?;
+    let PlatformState::Ios { device, .. } = &state.platform else {
+        return Err(Error::Authentication(
+            "iOS registration requires iOS platform state".into(),
+        ));
+    };
     device.validate()?;
-    let resources = config.ios_registration.as_ref().ok_or_else(|| {
-        Error::Unsupported(
-            "Snapshot iOS registration requires native initial/reconnect InfoSync resources".into(),
-        )
-    })?;
+    if let Some(model) = config.ios_virtual() {
+        return crate::ios_device::registration::build(state, reconnect, model, context);
+    }
+    let resources = &config
+        .ios_snapshot()
+        .ok_or_else(|| {
+            Error::Unsupported(
+                "Snapshot iOS registration requires native initial/reconnect InfoSync resources"
+                    .into(),
+            )
+        })?
+        .registration;
     let mut request = if reconnect {
         resources.reconnect.clone()
     } else {
@@ -865,7 +990,7 @@ pub(crate) fn info_sync_for_config_at(
     }
     register.version = Some(state.profile.version.clone());
     register.device = Some(auth::RegisterDevice {
-        name: Some(state.keystore.device_name.clone()),
+        name: Some(state.device_name().to_owned()),
         kernel: Some(device.hardware_model.clone()),
         os_version: Some(device.system_version.clone()),
         brand: Some("apple".into()),
@@ -1005,7 +1130,7 @@ async fn new_device_login(client: &Client, codec: &mut NtLogin, jump: &str) -> R
         .timeout(client.config.timeout)
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()?;
-    let device_name = client.config.ios_virtual.as_ref().map_or(state.keystore.device_name.as_str(), |model| model.device_name(state.profile.platform));
+    let device_name = state.device_name();
     let acquired=new_device_request(client,&http,&endpoint,serde_json::json!({"str_dev_auth_token":sig,"str_uin_token":uin_token,"str_dev_type":state.profile.os,"str_dev_name":device_name,"uint32_flag":1,"uint32_url_type":0})).await?;
     let url = acquired
         .url
@@ -1062,19 +1187,27 @@ mod tests {
                     device_name: "actual-device-name".into(),
                     ..Default::default()
                 },
-                machine_id: "synthetic-machine".into(),
+                platform: PlatformState::Ios {
+                    device: IosDevice {
+                        system_version: "18.1".into(),
+                        hardware_model: "actual-uname-machine".into(),
+                        system_name: "actual-system-name".into(),
+                    }
+                    .into(),
+                    device_name: "actual-device-name".into(),
+                },
                 online: false,
             };
             let mut config = ClientConfig {
                 profile,
-                ios_device: Some(IosDevice {
-                    system_version: "18.1".into(),
-                    hardware_model: "actual-uname-machine".into(),
-                    system_name: "actual-system-name".into(),
-                }),
                 ..Default::default()
             };
-            assert!(info_sync_for_config(&state, false, &config).is_err());
+            let context = crate::ios_device::registration::Context {
+                now_seconds: 0,
+                background_since: None,
+                first_register: true,
+            };
+            assert!(info_sync_for_config_at(&state, false, &config, context).is_err());
             let template = |guid: &str, locale, notify| auth::InfoSyncRequest {
                 sync_flag: Some(1759),
                 register: Some(auth::RegisterInfo {
@@ -1089,12 +1222,18 @@ mod tests {
                 }),
                 ..Default::default()
             };
-            config.ios_registration = Some(IosRegistration {
+            let PlatformState::Ios { device, .. } = &state.platform else {
+                unreachable!()
+            };
+            config = crate::client::ios_signing_tests::config(config.profile.clone());
+            let snapshot = config.ios_snapshot_mut().unwrap();
+            snapshot.device = device.as_ref().clone();
+            snapshot.registration = IosRegistration {
                 initial: template("native-guid-text", 1033, 1),
                 reconnect: template("native-reconnect-guid-text", 1028, 2),
-            });
+            };
             for reconnect in [false, true] {
-                let request = info_sync_for_config(&state, reconnect, &config).unwrap();
+                let request = info_sync_for_config_at(&state, reconnect, &config, context).unwrap();
                 let request: auth::InfoSyncRequest =
                     proto::decode(Bytes::from(request.encode_to_vec())).unwrap();
                 let register = request.register.unwrap();
@@ -1126,10 +1265,15 @@ mod tests {
                 assert!(register.flags.is_none());
                 assert!(register.vendor_type.is_none());
             }
-            config.ios_registration.as_mut().unwrap().initial.sync_flag = Some(1);
-            assert!(info_sync_for_config(&state, false, &config).is_err());
-            config.ios_device = None;
-            assert!(info_sync_for_config(&state, true, &config).is_err());
+            config
+                .ios_snapshot_mut()
+                .unwrap()
+                .registration
+                .initial
+                .sync_flag = Some(1);
+            assert!(info_sync_for_config_at(&state, false, &config, context).is_err());
+            config.platform = None;
+            assert!(info_sync_for_config_at(&state, true, &config, context).is_err());
         }
     }
     #[test]

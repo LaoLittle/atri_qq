@@ -808,7 +808,8 @@ async fn background_peer_rotation_preserves_ack_and_applies_interval_at_next_wor
         .inner
         .lock()
         .unwrap()
-        .o3
+        .linux_o3()
+        .unwrap()
         .heartbeat
         .deadline()
         .unwrap();

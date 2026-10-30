@@ -37,14 +37,11 @@ impl Client {
             {
                 return Err(Error::Disconnected);
             }
-            let now = if inner.state.profile.platform.is_ios() {
-                u64::try_from(crate::ios_device::network::wall_millis()? / 1000)
-                    .map_err(|_| wire::malformed("iOS registration precedes Unix epoch"))?
-            } else {
-                0
-            };
             let template = login::info_sync_for_config_at(
-                &inner.state, reconnect, &self.config, now, inner.signer.ios_background_since(),
+                &inner.state,
+                reconnect,
+                &self.config,
+                inner.ios_registration_context()?,
             )?;
             let (binding, action) =
                 self.message_sync
@@ -70,6 +67,14 @@ impl Client {
             return Err(Error::Disconnected);
         }
         self.confirm_online_locked(&mut inner, binding.generation)
+    }
+
+    pub(super) fn record_ios_registration(&self, inner: &mut Inner, binding: &Arc<Binding>) {
+        if matches!(self.message_sync.registration(binding), Ok(Some(Ok(_)))) {
+            if let Some(ios) = inner.ios_mut() {
+                ios.first_register = false;
+            }
+        }
     }
 
     pub(crate) fn spawn_message_sync_actions(&self, binding: Arc<Binding>, actions: Vec<Action>) {
@@ -192,8 +197,25 @@ async fn exchange(
         }
         let sender = inner.connection.as_ref().unwrap().sender.clone();
         let ios = ios_network::RequestTiming::new(&inner)?;
-        let (sequence, frame) =
-            client.prepare_frame(&mut inner, command, body, RequestType::D2, Encryption::D2)?;
+        let mut replay = ios_header::Replay::new(
+            &inner,
+            &body,
+            RequestType::D2,
+            Encryption::D2,
+            true,
+            false,
+            deadline,
+        );
+        let (sequence, frame) = client.prepare_frame_from(
+            &mut inner,
+            command,
+            body,
+            RequestType::D2,
+            Encryption::D2,
+            true,
+            false,
+            replay.as_mut(),
+        )?;
         inner.next_id = inner
             .next_id
             .checked_add(1)
@@ -211,12 +233,15 @@ async fn exchange(
                 reply,
                 cancel: cancel.clone(),
                 ios,
+                replay,
                 message_sync: Some((binding.clone(), request)),
             },
         );
+        client.arm_ios_block_checks(&mut inner);
         let outgoing = Outgoing {
             command: command.into(),
             sequence,
+            attempt: 0,
             frame,
             deadline,
             cancel,

@@ -3,7 +3,6 @@ use crate::{
     models::*,
     proto::{self, auth, sso},
 };
-use ::signing as signing_engine;
 use bytes::{Buf, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
@@ -11,6 +10,12 @@ pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
 
 pub(crate) fn malformed(message: impl Into<String>) -> Error {
     Error::Malformed(message.into())
+}
+
+pub(crate) fn encode_jce_raw(value: &impl jce::JceStruct) -> Bytes {
+    let mut bytes = BytesMut::with_capacity(value.encoded_len());
+    value.encode_raw(&mut bytes);
+    bytes.freeze()
 }
 
 pub(crate) fn encode_push_ack(body: Bytes) -> Result<Option<Bytes>> {
@@ -40,8 +45,8 @@ pub(crate) mod config_push {
     use std::collections::HashMap;
 
     // Tars byte buffers use SIMPLE_LIST, not JCE string fields.
-    #[derive(Default)]
-    struct TarsBytes(Bytes);
+    #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+    pub(crate) struct TarsBytes(pub(crate) Bytes);
 
     impl JceType for TarsBytes {
         fn read<B: Buf>(
@@ -115,6 +120,12 @@ pub(crate) mod config_push {
     }
 
     #[derive(JceStruct)]
+    struct FlatData {
+        #[jce(tag = "0", required)]
+        entries: HashMap<String, TarsBytes>,
+    }
+
+    #[derive(JceStruct)]
     struct PushRequest {
         #[jce(tag = "1", required)]
         kind: i32,
@@ -158,12 +169,6 @@ pub(crate) mod config_push {
         configuration: TarsBytes,
     }
 
-    fn encode(value: &impl JceStruct) -> Bytes {
-        let mut buf = BytesMut::with_capacity(value.encoded_len());
-        value.encode_raw(&mut buf);
-        buf.freeze()
-    }
-
     fn wrap(value: &impl JceStruct) -> Bytes {
         let mut buf = BytesMut::with_capacity(value.encoded_len() + 2);
         value.write(&mut buf, 0);
@@ -180,21 +185,33 @@ pub(crate) mod config_push {
         function: &str,
         entry: &str,
         entry_type: &str,
+        allow_flat: bool,
     ) -> Result<(Packet, Bytes)> {
         if body.len() > MAX_FRAME_SIZE {
             return Err(malformed("JCE request exceeds limit"));
         }
         let mut packet = Packet::decode(body).map_err(invalid)?;
-        if packet.version != 2 || packet.servant != servant || packet.function != function {
+        if (!allow_flat && packet.version != 2)
+            || packet.servant != servant
+            || packet.function != function
+        {
             return Err(malformed("Unsupported JCE request envelope"));
         }
-        let mut data = Data::decode(std::mem::take(&mut packet.buffer.0)).map_err(invalid)?;
-        let body = data
-            .entries
-            .remove(entry)
-            .and_then(|mut entries| entries.remove(entry_type))
-            .ok_or_else(|| malformed("Missing JCE request body"))?
-            .0;
+        let buffer = std::mem::take(&mut packet.buffer.0);
+        let body = if packet.version == 2 {
+            Data::decode(buffer)
+                .map_err(invalid)?
+                .entries
+                .remove(entry)
+                .and_then(|mut entries| entries.remove(entry_type))
+        } else {
+            FlatData::decode(buffer)
+                .map_err(invalid)?
+                .entries
+                .remove(entry)
+        }
+        .ok_or_else(|| malformed("Missing JCE request body"))?
+        .0;
         if body.first() != Some(&0x0a) || body.last() != Some(&0x0b) {
             return Err(malformed("Invalid JCE request struct"));
         }
@@ -209,11 +226,20 @@ pub(crate) mod config_push {
         entry: &str,
         entry_type: &str,
     ) -> Result<Bytes> {
-        unpack(body, servant, function, entry, entry_type).map(|(_, body)| body)
+        unpack(body, servant, function, entry, entry_type, false).map(|(_, body)| body)
     }
 
-    #[cfg(test)]
-    pub(crate) fn payload_fixture(
+    pub(crate) fn compatible_payload(
+        body: Bytes,
+        servant: &str,
+        function: &str,
+        entry: &str,
+        entry_type: &str,
+    ) -> Result<Bytes> {
+        unpack(body, servant, function, entry, entry_type, true).map(|(_, body)| body)
+    }
+
+    pub(crate) fn encode_payload(
         servant: &str,
         function: &str,
         entry: &str,
@@ -224,15 +250,48 @@ pub(crate) mod config_push {
         wrapped.put_u8(0x0a);
         wrapped.put_slice(&body);
         wrapped.put_u8(0x0b);
-        encode(&Packet {
+        encode_jce_raw(&Packet {
             version: 2,
             servant: servant.into(),
             function: function.into(),
-            buffer: TarsBytes(encode(&Data {
+            buffer: TarsBytes(encode_jce_raw(&Data {
                 entries: HashMap::from([(
                     entry.into(),
                     HashMap::from([(entry_type.into(), TarsBytes(wrapped.freeze()))]),
                 )]),
+            })),
+            ..Default::default()
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn payload_fixture(
+        servant: &str,
+        function: &str,
+        entry: &str,
+        entry_type: &str,
+        body: Bytes,
+    ) -> Bytes {
+        encode_payload(servant, function, entry, entry_type, body)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn flat_payload_fixture(
+        servant: &str,
+        function: &str,
+        entry: &str,
+        body: Bytes,
+    ) -> Bytes {
+        let mut wrapped = BytesMut::with_capacity(body.len() + 2);
+        wrapped.put_u8(0x0a);
+        wrapped.extend_from_slice(&body);
+        wrapped.put_u8(0x0b);
+        encode_jce_raw(&Packet {
+            version: 3,
+            servant: servant.into(),
+            function: function.into(),
+            buffer: TarsBytes(encode_jce_raw(&FlatData {
+                entries: HashMap::from([(entry.into(), TarsBytes(wrapped.freeze()))]),
             })),
             ..Default::default()
         })
@@ -252,6 +311,7 @@ pub(crate) mod config_push {
             "PushReq",
             "PushReq",
             "ConfigPush.PushReq",
+            false,
         )?;
         let request = PushRequest::decode(request).map_err(invalid)?;
         if request.kind != 1 {
@@ -272,7 +332,7 @@ pub(crate) mod config_push {
             configuration: TarsBytes::default(),
         });
         packet.function = "PushRes".into();
-        packet.buffer = TarsBytes(encode(&Data {
+        packet.buffer = TarsBytes(encode_jce_raw(&Data {
             entries: HashMap::from([(
                 "PushResp".into(),
                 HashMap::from([("ConfigPush.PushResp".into(), TarsBytes(wrapped))]),
@@ -282,7 +342,7 @@ pub(crate) mod config_push {
             kind: request.kind,
             sequence: Some(sequence),
             configuration: request.configuration.0,
-            acknowledgment: Some(encode(&packet)),
+            acknowledgment: Some(encode_jce_raw(&packet)),
         })
     }
 
@@ -305,12 +365,12 @@ pub(crate) mod config_push {
 
     #[cfg(test)]
     fn packet_fixture(wrapped: Bytes, request_id: i32) -> Bytes {
-        encode(&Packet {
+        encode_jce_raw(&Packet {
             version: 2,
             request_id,
             servant: "QQService.ConfigPushSvc.MainServant".into(),
             function: "PushReq".into(),
-            buffer: TarsBytes(encode(&Data {
+            buffer: TarsBytes(encode_jce_raw(&Data {
                 entries: HashMap::from([(
                     "PushReq".into(),
                     HashMap::from([("ConfigPush.PushReq".into(), TarsBytes(wrapped))]),
@@ -571,10 +631,12 @@ pub(crate) fn encode_sso(
     kind: RequestType,
     encryption: Encryption,
     state: &SessionState,
-    signature: Option<signing_engine::SecureInfo>,
+    signature: Option<sso::SecureInfo>,
     ios_transport: Option<(&IosTransportResources, &[u8])>,
     ios_network: Option<&crate::ios_device::network::IosNetworkSession>,
     is_nt_request: bool,
+    ios_qimei_materialized: Option<&mut bool>,
+    ios_internal_control: bool,
 ) -> Result<Bytes> {
     use prost::Message;
     if body.len() > MAX_FRAME_SIZE - 4096 || command.len() > 1024 * 1024 {
@@ -601,16 +663,21 @@ pub(crate) fn encode_sso(
             hex::encode(random_bytes(16)),
             hex::encode(random_bytes(8))
         )),
-        uid: Some(store.uid.clone()),
-        secure_info: signature.map(|s| sso::SecureInfo {
-            sign: Some(Bytes::copy_from_slice(s.sign.as_ref())),
-            token: Some(s.token.into()),
-            extra: Some(s.extra.into()),
-        }),
+        uid: (!ios_internal_control).then(|| store.uid.clone()),
+        secure_info: signature,
         ..Default::default()
     };
     if let Some(network) = ios_network {
         network.apply_reserved(&mut reserve, is_nt_request, kind == RequestType::D2);
+    }
+    let automatic_header = ios_qimei_materialized.is_some();
+    if kind == RequestType::D2 {
+        if let (Some((resources, _)), Some(materialized)) = (ios_transport, ios_qimei_materialized)
+        {
+            if resources.reserved.has_qimei() {
+                *materialized = true;
+            }
+        }
     }
     let reserve = reserve.encode_to_vec();
     let payload = encode_sso_payload(
@@ -622,6 +689,8 @@ pub(crate) fn encode_sso(
         ios_transport,
         ios_network,
         &reserve,
+        automatic_header,
+        ios_internal_control,
     )?;
     let encrypted = match encryption {
         Encryption::None => payload,
@@ -639,16 +708,23 @@ pub(crate) fn encode_sso(
         })?,
         RequestType::Simple => envelope.i32(sequence),
     }
-    match ios_transport.map(|(resources, _)| &resources.account) {
-        Some(IosTransportAccount::Uin { account_type }) => {
+    match (
+        ios_internal_control,
+        ios_transport.map(|(resources, _)| &resources.account),
+    ) {
+        (true, _) => {
+            envelope.u8(0);
+            envelope.p32("0")?;
+        }
+        (false, Some(IosTransportAccount::Uin { account_type })) => {
             envelope.u8(*account_type);
             envelope.p32(store.uin.to_string())?;
         }
-        Some(IosTransportAccount::Explicit { account_type, text }) => {
+        (false, Some(IosTransportAccount::Explicit { account_type, text })) => {
             envelope.u8(*account_type);
             envelope.p32(text)?;
         }
-        None => {
+        (false, None) => {
             envelope.u8(0);
             envelope.p32(store.uin.to_string())?;
         }
@@ -671,6 +747,8 @@ fn encode_sso_payload(
     ios_transport: Option<(&IosTransportResources, &[u8])>,
     ios_network: Option<&crate::ios_device::network::IosNetworkSession>,
     reserve: &[u8],
+    automatic_header: bool,
+    ios_internal_control: bool,
 ) -> Result<Vec<u8>> {
     let store = &state.keystore;
     let mut head = Writer::new();
@@ -687,11 +765,19 @@ fn encode_sso_payload(
             } else {
                 head.bytes(resources.effective_flags);
             }
-            head.p32(&store.a2)?;
+            head.p32(if ios_internal_control {
+                &[][..]
+            } else {
+                &store.a2
+            })?;
             head.p32(command)?;
             head.p32(cookie)?;
             head.p32(store.ios_msf_imei.as_bytes())?;
-            head.p32(&resources.account_record_0x80.0)?;
+            head.p32(if ios_internal_control {
+                &[][..]
+            } else {
+                &resources.account_record_0x80.0
+            })?;
             let mut trailer = String::new();
             if command == "PushService.get" {
                 let statistics = resources.push_service_get_statistics.ok_or_else(|| {
@@ -737,7 +823,8 @@ fn encode_sso_payload(
         }
     }
     if let Some((resources, _)) = ios_transport {
-        let template = if ios_network.is_some() && kind == RequestType::Simple {
+        let template = if (ios_network.is_some() || automatic_header) && kind == RequestType::Simple
+        {
             &[][..]
         } else {
             resources.reserved.as_bytes()
@@ -916,7 +1003,15 @@ mod tests {
                     ios_msf_imei: "synthetic-imei".into(),
                     ..Default::default()
                 },
-                machine_id: "synthetic-machine".into(),
+                platform: PlatformState::Ios {
+                    device: IosDevice {
+                        system_version: "18.0".into(),
+                        hardware_model: "iPhone17,1".into(),
+                        system_name: "iOS".into(),
+                    }
+                    .into(),
+                    device_name: "synthetic-device".into(),
+                },
                 online: false,
             };
             let actual = encode_sso_payload(
@@ -928,6 +1023,8 @@ mod tests {
                 Some((&resources, b"\xff\0cookie")),
                 None,
                 &[],
+                false,
+                false,
             )
             .unwrap();
             if state.profile.platform == ClientPlatform::IPhone {
@@ -946,6 +1043,8 @@ mod tests {
                 Some((&resources, b"\xff\0cookie")),
                 None,
                 &[],
+                false,
+                false,
             )
             .unwrap();
             assert_eq!(actual_trim, expected_trim);

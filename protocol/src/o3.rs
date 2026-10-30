@@ -1,5 +1,6 @@
 use crate::{Error, Result, models::SessionState, proto};
 use ::signing::token::{DeviceProperties, TokenError};
+use bytes::{Bytes, BytesMut};
 use prost::Message;
 
 mod channel;
@@ -31,6 +32,30 @@ pub const ESTABLISH_COMMAND: &str = "trpc.o3.ecdh_access.EcdhAccess.SsoEstablish
 pub const ACCESS_COMMAND: &str = "trpc.o3.ecdh_access.EcdhAccess.SsoSecureAccess";
 const SDK_VERSION: &str = "0.0.20";
 const REPORT_ID: &str = "0df00071646";
+
+fn encode_access(key: &[u8; 32], method: Bytes, channel_uuid: Bytes, body: &[u8]) -> Result<Bytes> {
+    Ok(proto::o3::SecureAccessRequest {
+        method,
+        encrypted_body: crypto::seal(key, body)?,
+        channel_uuid,
+    }
+    .encode_to_vec()
+    .into())
+}
+
+fn merge_bytes(mut parts: Vec<Bytes>) -> Bytes {
+    match parts.len() {
+        0 => Bytes::new(),
+        1 => parts.pop().unwrap(),
+        _ => {
+            let mut output = BytesMut::with_capacity(parts.iter().map(Bytes::len).sum());
+            for part in parts {
+                output.extend_from_slice(&part);
+            }
+            output.freeze()
+        }
+    }
+}
 
 pub const CANONICAL_REPORT_MODULE_PATHS: &[&str] = &[
     "/opt/QQ/resources/app/app_launcher/index.js",
@@ -296,8 +321,14 @@ pub fn empty_token_telemetry(state: &SessionState) -> Vec<u8> {
     ])
 }
 
-pub fn verify_file_telemetry(state: &SessionState, module_paths: Option<&[String]>) -> Vec<u8> {
-    telemetry(vec![
+pub fn verify_file_telemetry(
+    state: &SessionState,
+    module_paths: Option<&[String]>,
+) -> Result<Vec<u8>> {
+    let machine_id = state.linux_machine_id().ok_or_else(|| {
+        Error::Malformed("Desktop telemetry requires Linux platform state".into())
+    })?;
+    Ok(telemetry(vec![
         state.profile.qua.clone(),
         SDK_VERSION.into(),
         "verify_file".into(),
@@ -308,9 +339,9 @@ pub fn verify_file_telemetry(state: &SessionState, module_paths: Option<&[String
         }
         .expect("serializing module path strings cannot fail"),
         "3".into(),
-        state.machine_id.clone(),
+        machine_id.to_owned(),
         "/opt/bin/qq".into(),
-    ])
+    ]))
 }
 
 pub fn complete_telemetry(response: &::signing::token::ReportResponse) -> Result<()> {

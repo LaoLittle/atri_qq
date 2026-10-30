@@ -21,7 +21,9 @@ impl ScriptedClient {
             state: RwLock::new(SessionState {
                 profile: Profile::default(),
                 keystore,
-                machine_id: "test-machine".into(),
+                platform: crate::models::PlatformState::Linux {
+                    machine_id: "test-machine".into(),
+                },
                 online: true,
             }),
             replies: StdMutex::new(

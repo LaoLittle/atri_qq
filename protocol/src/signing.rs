@@ -184,18 +184,21 @@ impl DesktopSigner {
         commands::SIGNED_COMMANDS.contains(&command)
     }
     pub fn initialize(&mut self, state: &SessionState) -> Result<()> {
+        let machine_id = state.linux_machine_id().ok_or_else(|| {
+            Error::Malformed("Desktop signing requires Linux platform state".into())
+        })?;
         let local_identity_changed =
             self.resources
                 .local_identity
                 .as_ref()
                 .is_none_or(|identity| {
-                    identity.machine_id != state.machine_id
+                    identity.machine_id != machine_id
                         || identity.guid.as_slice() != state.keystore.guid.as_slice()
                         || identity.device_name != state.keystore.device_name
                 });
         if local_identity_changed
             || self.signer.context().qua != state.profile.qua.as_bytes()
-            || self.signer.context().machine_id != state.machine_id.as_bytes()
+            || self.signer.context().machine_id != machine_id.as_bytes()
         {
             self.telemetry_deadline = None;
             self.resources.report_resources_generation =
@@ -205,12 +208,12 @@ impl DesktopSigner {
                 .retain(|report| report.method != o3::REPORT_COMMAND);
         }
         if local_identity_changed {
-            o3::validate_local_identity(&state.machine_id)?;
+            o3::validate_local_identity(machine_id)?;
             let guid = state.keystore.guid.as_slice().try_into().map_err(|_| {
                 Error::Malformed("Signing context requires a sixteen-byte device GUID".into())
             })?;
             self.resources.local_identity = Some(LocalDeviceIdentity {
-                machine_id: state.machine_id.clone(),
+                machine_id: machine_id.to_owned(),
                 guid,
                 device_name: state.keystore.device_name.clone(),
             });
@@ -223,13 +226,16 @@ impl DesktopSigner {
         let account = self.account.unwrap_or(0);
         if self.account.is_none()
             || self.signer.context().qua != state.profile.qua.as_bytes()
-            || self.signer.context().machine_id != state.machine_id.as_bytes()
+            || self.signer.context().machine_id != machine_id.as_bytes()
         {
             self.initialize_account(account, state)?;
         }
         Ok(())
     }
     fn initialize_account(&mut self, account: u64, state: &SessionState) -> Result<()> {
+        let machine_id = state.linux_machine_id().ok_or_else(|| {
+            Error::Malformed("Desktop signing requires Linux platform state".into())
+        })?;
         if self.account != Some(account) {
             self.resources.generation = self.resources.generation.wrapping_add(1);
             self.business_session_started = false;
@@ -240,7 +246,7 @@ impl DesktopSigner {
                 Context::new(
                     account.to_string().into_bytes(),
                     state.profile.qua.as_bytes().to_vec(),
-                    state.machine_id.as_bytes().to_vec(),
+                    machine_id.as_bytes().to_vec(),
                 ),
                 &mut self.resources,
             )
@@ -323,16 +329,19 @@ impl DesktopSigner {
     }
 
     fn telemetry_scope_matches(&self, state: &SessionState) -> bool {
+        let Some(machine_id) = state.linux_machine_id() else {
+            return false;
+        };
         state.keystore.uin != 0
             && self.account == Some(state.keystore.uin)
             && self.signer.context().qua == state.profile.qua.as_bytes()
-            && self.signer.context().machine_id == state.machine_id.as_bytes()
+            && self.signer.context().machine_id == machine_id.as_bytes()
             && self
                 .resources
                 .local_identity
                 .as_ref()
                 .is_some_and(|identity| {
-                    identity.machine_id == state.machine_id
+                    identity.machine_id == machine_id
                         && identity.guid.as_slice() == state.keystore.guid.as_slice()
                         && identity.device_name == state.keystore.device_name
                 })
@@ -378,7 +387,7 @@ impl DesktopSigner {
         self.resources.reports.push_back(SigningReport {
             method: o3::REPORT_COMMAND.into(),
             account: state.keystore.uin.to_string().into_bytes(),
-            body: o3::verify_file_telemetry(state, self.resources.report_module_paths.as_deref()),
+            body: o3::verify_file_telemetry(state, self.resources.report_module_paths.as_deref())?,
             generation: self.resources.generation,
             report_resources_generation: self.resources.report_resources_generation,
         });
@@ -582,7 +591,9 @@ mod tests {
                 uin,
                 ..Default::default()
             },
-            machine_id: "explicit-machine-id".into(),
+            platform: crate::models::PlatformState::Linux {
+                machine_id: "explicit-machine-id".into(),
+            },
             online: false,
         }
     }
@@ -784,7 +795,7 @@ mod tests {
         signer.set_resources(None, None, None).unwrap();
         signer.initialize(&state).unwrap();
         let restored = signer.resources.collect_properties().unwrap();
-        assert_eq!(restored[&16], state.machine_id.as_bytes());
+        assert_eq!(restored[&16], state.linux_machine_id().unwrap().as_bytes());
         assert_eq!(restored[&24], defaults[&24]);
         assert!(!restored.contains_key(&999));
     }
@@ -816,7 +827,9 @@ mod tests {
         session.keystore.uin = 5678;
         session.keystore.guid.fill(0x22);
         session.keystore.device_name = "replacement-device".into();
-        session.machine_id = "replacement-application-machine".into();
+        session.platform = crate::models::PlatformState::Linux {
+            machine_id: "replacement-application-machine".into(),
+        };
         signer
             .sign("wtlogin.login", 2, b"second", &session, false)
             .unwrap();
@@ -868,7 +881,10 @@ mod tests {
         let decoded = signing_engine::proto::TokenReport::decode(answer.as_slice()).unwrap();
         assert_eq!(decoded.properties.len(), 3);
         assert_eq!(decoded.properties[0].id, 16);
-        assert_eq!(decoded.properties[0].value, state.machine_id.as_bytes());
+        assert_eq!(
+            decoded.properties[0].value,
+            state.linux_machine_id().unwrap().as_bytes()
+        );
         assert_eq!(decoded.properties[2].id, 99);
         assert_eq!(decoded.properties[2].value, b"-1");
         assert!(signer.answer_property_challenge(&[0]).is_err());
@@ -1123,7 +1139,9 @@ mod tests {
         let status = signer.token_status();
         signer.registration_complete(&state).unwrap();
         let report = signer.drain_reports().pop().unwrap();
-        state.machine_id = "another-machine".into();
+        state.platform = crate::models::PlatformState::Linux {
+            machine_id: "another-machine".into(),
+        };
         signer.poll_telemetry(&state).unwrap();
         assert!(signer.telemetry_deadline().is_none());
         signer.initialize(&state).unwrap();

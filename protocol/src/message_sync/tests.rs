@@ -9,7 +9,9 @@ use prost::Message as _;
 fn session() -> SessionState {
     SessionState {
         profile: Profile::linux(),
-        machine_id: "synthetic-sync-device".into(),
+        platform: crate::models::PlatformState::Linux {
+            machine_id: "synthetic-sync-device".into(),
+        },
         keystore: Keystore {
             uin: 42,
             uid: "u_synthetic_self".into(),

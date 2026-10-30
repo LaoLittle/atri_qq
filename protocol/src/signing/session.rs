@@ -50,8 +50,8 @@ struct IosSession {
     channel_state: Option<[u8; 32]>,
     native_material: Option<[u8; 16]>,
     platform: ClientPlatform,
+    identity: crate::models::PlatformState,
     qua: Bytes,
-    machine_id: String,
     account: Option<u64>,
     generation: u64,
     virtual_device: Option<virtual_device::VirtualSdk>,
@@ -70,9 +70,8 @@ impl IosSession {
                 "Changing signing platform requires a new client".into(),
             ));
         }
-        if self.machine_id != state.machine_id || self.qua.as_ref() != state.profile.qua.as_bytes()
-        {
-            return Err(Error::Unsupported("Changing iOS device identity or QUA requires a new signing session with matching raw resources".into()));
+        if self.identity != state.platform || self.qua.as_ref() != state.profile.qua.as_bytes() {
+            return Err(Error::Unsupported("Changing iOS platform state or QUA requires a new signing session with matching raw resources".into()));
         }
         Ok(())
     }
@@ -229,45 +228,50 @@ impl Default for SessionSigner {
 }
 
 impl SessionSigner {
-    pub(crate) fn for_client(
-        application_uuid: String,
-        state: &SessionState,
-        ios: Option<IosSigningResources>,
-    ) -> Result<Self> {
-        let backend = if state.profile.platform.is_ios() {
-            let resources = ios.ok_or_else(|| Error::Malformed("iOS profile requires explicit signing snapshots or a configured virtual device".into()))?;
-            resources.validate()?;
-            let mut source = SystemSource;
-            let core = signer::Signer::new(&mut source).map_err(|error| {
-                Error::Crypto(format!("Native iOS signer initialization: {error}"))
-            })?;
-            Backend::Ios(IosSession {
-                sdk: sdk::SdkSigner::new(core, resources.command_policy),
-                source,
-                resource_provenance: resources.provenance,
-                token_state: IosSession::token_state(ios_token::TokenRecord {
-                    token: resources.raw_device_token,
-                    expires_at: resources.raw_device_token_expires_at,
-                    associated_uin: resources.raw_device_token_uin,
-                }),
-                raw_xwid: resources.raw_xwid,
-                channel_state: resources.channel_state,
-                native_material: None,
-                platform: state.profile.platform,
-                qua: Bytes::copy_from_slice(state.profile.qua.as_bytes()),
-                machine_id: state.machine_id.clone(),
-                account: None,
-                generation: 0,
-                virtual_device: None,
-            })
-        } else {
-            if ios.is_some() {
-                return Err(Error::Malformed(
-                    "iOS signing resources require an iPhone or iPad profile".into(),
-                ));
-            }
-            Backend::Desktop(DesktopSigner::with_application_uuid(application_uuid))
+    pub(crate) fn for_linux(application_uuid: String, state: &SessionState) -> Result<Self> {
+        if state.profile.platform.is_ios() || state.linux_machine_id().is_none() {
+            return Err(Error::Malformed(
+                "Linux signing requires a desktop profile and Linux platform state".into(),
+            ));
+        }
+        let mut session = Self {
+            backend: Backend::Desktop(DesktopSigner::with_application_uuid(application_uuid)),
         };
+        session.initialize(state)?;
+        Ok(session)
+    }
+
+    pub(crate) fn for_ios(state: &SessionState, resources: IosSigningResources) -> Result<Self> {
+        if !state.profile.platform.is_ios()
+            || !matches!(state.platform, crate::models::PlatformState::Ios { .. })
+        {
+            return Err(Error::Malformed(
+                "iOS signing requires an iPhone or iPad profile and iOS platform state".into(),
+            ));
+        }
+        resources.validate()?;
+        let mut source = SystemSource;
+        let core = signer::Signer::new(&mut source)
+            .map_err(|error| Error::Crypto(format!("Native iOS signer initialization: {error}")))?;
+        let backend = Backend::Ios(IosSession {
+            sdk: sdk::SdkSigner::new(core, resources.command_policy),
+            source,
+            resource_provenance: resources.provenance,
+            token_state: IosSession::token_state(ios_token::TokenRecord {
+                token: resources.raw_device_token,
+                expires_at: resources.raw_device_token_expires_at,
+                associated_uin: resources.raw_device_token_uin,
+            }),
+            raw_xwid: resources.raw_xwid,
+            channel_state: resources.channel_state,
+            native_material: None,
+            platform: state.profile.platform,
+            identity: state.platform.clone(),
+            qua: Bytes::copy_from_slice(state.profile.qua.as_bytes()),
+            account: None,
+            generation: 0,
+            virtual_device: None,
+        });
         let mut session = Self { backend };
         session.initialize(state)?;
         Ok(session)
@@ -711,7 +715,15 @@ mod tests {
     fn ios_state() -> SessionState {
         SessionState {
             profile: Profile::iphone(),
-            machine_id: "synthetic-ios-device".into(),
+            platform: crate::models::PlatformState::Ios {
+                device: crate::models::IosDevice {
+                    system_version: "18.0".into(),
+                    hardware_model: "iPhone17,1".into(),
+                    system_name: "iOS".into(),
+                }
+                .into(),
+                device_name: "synthetic-device".into(),
+            },
             keystore: Keystore::default(),
             online: false,
         }
@@ -720,20 +732,35 @@ mod tests {
     #[test]
     fn mobile_configuration_is_explicit_and_desktop_cannot_accept_it() {
         let state = ios_state();
-        assert!(SessionSigner::for_client("desktop-only".into(), &state, None).is_err());
+        assert!(SessionSigner::for_linux("desktop-only".into(), &state).is_err());
+        let mismatched = SessionState {
+            platform: crate::models::PlatformState::Linux {
+                machine_id: "desktop-machine".into(),
+            },
+            ..state.clone()
+        };
+        assert!(SessionSigner::for_ios(&mismatched, resources()).is_err());
         let mut missing_source = resources();
         missing_source.provenance.clear();
-        assert!(
-            SessionSigner::for_client("desktop-only".into(), &state, Some(missing_source)).is_err()
-        );
+        assert!(SessionSigner::for_ios(&state, missing_source).is_err());
         let desktop = SessionState {
             profile: Profile::default(),
+            platform: crate::models::PlatformState::Linux {
+                machine_id: "desktop-machine".into(),
+            },
             ..state
         };
-        assert!(
-            SessionSigner::for_client("desktop-only".into(), &desktop, Some(resources())).is_err()
-        );
+        assert!(SessionSigner::for_ios(&desktop, resources()).is_err());
         assert!(SessionSigner::default().initialize(&ios_state()).is_err());
+        let original = ios_state();
+        let mut session = SessionSigner::for_ios(&original, resources()).unwrap();
+        let mut changed = original.clone();
+        let crate::models::PlatformState::Ios { device, .. } = &mut changed.platform else {
+            unreachable!()
+        };
+        std::sync::Arc::make_mut(device).system_version = "18.1".into();
+        assert!(session.initialize(&changed).is_err());
+        assert!(session.initialize(&original).is_ok());
     }
 
     #[test]
@@ -741,8 +768,7 @@ mod tests {
         let state = ios_state();
         let mut resources = resources();
         resources.command_policy.set_switch(SIGN_SWITCH, 1);
-        let mut session =
-            SessionSigner::for_client("not-used".into(), &state, Some(resources.clone())).unwrap();
+        let mut session = SessionSigner::for_ios(&state, resources.clone()).unwrap();
         assert!(!session.uses_desktop_maintenance());
         assert!(!session.requires_signature("not.a.signed.command"));
         assert!(
@@ -807,8 +833,7 @@ mod tests {
         let mut resources = resources();
         resources.command_policy.set_switch(SIGN_SWITCH, 1);
         resources.command_policy.set_switch(COMMAND_MODE_SWITCH, 1);
-        let mut session =
-            SessionSigner::for_client("not-used".into(), &state, Some(resources.clone())).unwrap();
+        let mut session = SessionSigner::for_ios(&state, resources.clone()).unwrap();
         session
             .sign("AvatarInfoSvr.QQHeadUrlReq", 1, b"body", &state, false)
             .unwrap();

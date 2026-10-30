@@ -1,7 +1,6 @@
 use std::{error::Error, fmt};
 
 use bytes::Bytes;
-use md5::{Digest, Md5};
 
 use super::extra::{ExtraError, build_extra};
 
@@ -60,12 +59,8 @@ pub fn prepare(input: Inputs<'_>) -> Result<Prepared, PrepareError> {
         None,
     )
     .map_err(PrepareError::Extra)?;
-    let mut hash = Md5::new();
-    hash.update(&input.device_token);
-    hash.update(&extra);
-    hash.update(&input.body);
     Ok(Prepared {
-        digest: hash.finalize().into(),
+        digest: crate::digest::md5_parts(&[&input.device_token, &extra, &input.body]),
         extra,
         device_token: input.device_token,
     })

@@ -572,7 +572,9 @@ mod tests {
             SessionState {
                 profile: Profile::default(),
                 keystore: Keystore::default(),
-                machine_id: String::new(),
+                platform: crate::models::PlatformState::Linux {
+                    machine_id: String::new(),
+                },
                 online: true,
             }
         }

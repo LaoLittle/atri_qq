@@ -7,13 +7,24 @@ use crate::{
 use bytes::Bytes;
 use rand::RngExt;
 
+#[derive(Clone, Copy)]
+pub(crate) struct Context {
+    pub now_seconds: u64,
+    pub background_since: Option<u64>,
+    pub first_register: bool,
+}
+
 pub(crate) fn build(
     state: &SessionState,
     reconnect: bool,
     model: &IosVirtualConfig,
-    now_seconds: u64,
-    background_since: Option<u64>,
+    context: Context,
 ) -> Result<auth::InfoSyncRequest> {
+    let Context {
+        now_seconds,
+        background_since,
+        first_register,
+    } = context;
     let device = model.device(&state.profile)?;
     let application = &model.application;
     let resources = application.heartbeat_resources()?;
@@ -27,7 +38,7 @@ pub(crate) fn build(
         })?;
         now_seconds.saturating_sub(since) as u32
     };
-    let effective_trigger = application.user_trigger && !reconnect;
+    let effective_trigger = application.user_trigger && first_register;
     let saved = state.keystore.ios_virtual_state.as_ref().ok_or_else(|| {
         Error::Malformed("Virtual iOS registration requires initialized device state".into())
     })?;
@@ -128,15 +139,20 @@ mod tests {
                 .unwrap();
         let config = ClientConfig {
             profile: profile.clone(),
-            ios_virtual: Some(model),
-            ios_device: Some(device),
+            platform: Some(crate::models::PlatformConfig::Ios(
+                crate::models::IosConfig::Virtual(model.clone()),
+            )),
             ..Default::default()
         };
+        let device_name = model.device_name(profile.platform).to_owned();
         (
             SessionState {
                 profile,
                 keystore,
-                machine_id: "unused-desktop-machine".into(),
+                platform: crate::models::PlatformState::Ios {
+                    device: device.into(),
+                    device_name: device_name.into(),
+                },
                 online: false,
             },
             config,
@@ -149,10 +165,14 @@ mod tests {
         for profile in [Profile::iphone(), Profile::ipad()] {
             let (mut state, config, runtime) =
                 initialize(profile, Arc::new(IosVirtualConfig::default()));
-            let model = config.ios_virtual.as_ref().unwrap();
+            let model = config.ios_virtual().unwrap();
+            let context = Context {
+                now_seconds: 1030,
+                background_since: runtime.background_since(),
+                first_register: true,
+            };
             for _ in 0..2 {
-                let request =
-                    build(&state, false, model, 1030, runtime.background_since()).unwrap();
+                let request = build(&state, false, model, context).unwrap();
                 assert_eq!(request.register.unwrap().first_register, Some(0));
                 assert_eq!(request.guild_sync.unwrap().pull_scene, Some(0));
             }
@@ -172,14 +192,23 @@ mod tests {
                     .unwrap()
                     .confirm_registration(123456)
             );
-            let restarted = build(&state, false, model, 1030, None).unwrap();
+            let restarted = build(&state, false, model, context).unwrap();
             assert_eq!(restarted.register.unwrap().user_trigger, Some(1));
             assert_eq!(restarted.guild_sync.unwrap().pull_scene, Some(2));
-            let reconnected = build(&state, true, model, 1030, None).unwrap();
+            let reconnected = build(
+                &state,
+                true,
+                model,
+                Context {
+                    first_register: false,
+                    ..context
+                },
+            )
+            .unwrap();
             assert_eq!(reconnected.register.unwrap().user_trigger, Some(0));
             state.keystore.uin = 654321;
             assert_eq!(
-                build(&state, false, model, 1030, None)
+                build(&state, false, model, context)
                     .unwrap()
                     .guild_sync
                     .unwrap()
@@ -188,7 +217,7 @@ mod tests {
             );
             state.keystore.uin = 123456;
             assert_eq!(
-                build(&state, false, model, 1030, None)
+                build(&state, false, model, context)
                     .unwrap()
                     .guild_sync
                     .unwrap()
@@ -205,8 +234,13 @@ mod tests {
         model.application.foreground = false;
         let model = Arc::new(model);
         let (state, _, runtime) = initialize(Profile::ipad(), model.clone());
+        let context = Context {
+            now_seconds: 1031,
+            background_since: runtime.background_since(),
+            first_register: true,
+        };
         for reconnect in [false, true] {
-            let register = build(&state, reconnect, &model, 1031, runtime.background_since())
+            let register = build(&state, reconnect, &model, context)
                 .unwrap()
                 .register
                 .unwrap();
@@ -214,21 +248,48 @@ mod tests {
             assert_eq!(register.user_trigger, Some(0));
             assert_eq!(register.background_time, Some(31));
         }
-        assert!(build(&state, false, &model, 1031, None).is_err());
+        assert!(
+            build(
+                &state,
+                false,
+                &model,
+                Context {
+                    background_since: None,
+                    ..context
+                }
+            )
+            .is_err()
+        );
         assert_eq!(
-            build(&state, false, &model, 999, Some(1000))
-                .unwrap()
-                .register
-                .unwrap()
-                .background_time,
+            build(
+                &state,
+                false,
+                &model,
+                Context {
+                    now_seconds: 999,
+                    ..context
+                }
+            )
+            .unwrap()
+            .register
+            .unwrap()
+            .background_time,
             Some(0)
         );
         assert_eq!(
-            build(&state, false, &model, 1000 + (1_u64 << 32) + 5, Some(1000))
-                .unwrap()
-                .register
-                .unwrap()
-                .background_time,
+            build(
+                &state,
+                false,
+                &model,
+                Context {
+                    now_seconds: 1000 + (1_u64 << 32) + 5,
+                    ..context
+                }
+            )
+            .unwrap()
+            .register
+            .unwrap()
+            .background_time,
             Some(5)
         );
         let (runtime, _) = IosVirtualRuntime::initialize(
@@ -243,6 +304,6 @@ mod tests {
             profile: Profile::default(),
             ..state
         };
-        assert!(build(&desktop, false, &model, 1031, Some(1000)).is_err());
+        assert!(build(&desktop, false, &model, context).is_err());
     }
 }
